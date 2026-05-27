@@ -21,11 +21,9 @@ export default function TitleBar({ symbol, account }) {
   useEffect(() => {
     const tick = () => {
       const now = new Date()
-      const h  = String(now.getHours()).padStart(2,'0')
-      const m  = String(now.getMinutes()).padStart(2,'0')
-      const s  = String(now.getSeconds()).padStart(2,'0')
-      const tz = now.toLocaleTimeString('en-US',{timeZoneName:'short'}).split(' ').pop()
-      setTime(`${h}:${m}:${s} ${tz}`)
+      const tz  = now.toLocaleTimeString('en-US', { timeZoneName: 'short' }).split(' ').pop()
+      const t   = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true })
+      setTime(`${t} ${tz}`)
     }
     tick(); const id = setInterval(tick, 1000); return () => clearInterval(id)
   }, [])

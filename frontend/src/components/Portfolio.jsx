@@ -6,7 +6,7 @@ export default function Portfolio({ account, onReset }) {
   const [msg,       setMsg]       = useState('')
 
   async function handleReset() {
-    if (!window.confirm('Liquidate all positions and cancel all open orders?\n\nNote: To reset cash back to $100k, visit paper.alpaca.markets → Account → Reset.')) return
+    if (!window.confirm('Reset account to $100,000 and clear all positions and trade history?')) return
     setResetting(true)
     setMsg('')
     try {

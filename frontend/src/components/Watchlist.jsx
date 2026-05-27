@@ -48,6 +48,11 @@ export default function Watchlist({ active, onSelect, socket }) {
           >
             <span className="wl-sym">{it.symbol}</span>
             <span className="wl-price mono">{it.price ? `$${Number(it.price).toFixed(2)}` : '—'}</span>
+            {it.price && it.change_pct !== undefined && (
+              <span className={`wl-chg ${it.change_pct >= 0 ? 'ok' : 'err'}`}>
+                {it.change_pct >= 0 ? '+' : ''}{Number(it.change_pct).toFixed(2)}%
+              </span>
+            )}
             <button className="wl-rm" onClick={e => removeSymbol(it.symbol, e)}>×</button>
           </div>
         ))}

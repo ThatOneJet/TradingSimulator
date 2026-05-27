@@ -12,6 +12,11 @@ import api from './api.js'
 
 const socket = io('http://localhost:8765')
 
+const TF_LABELS = {
+  '1Min':'1m', '5Min':'5m', '15Min':'15m', '1Hour':'1h', '1Day':'1D',
+  '1Wk':'1W',  '1Mo':'1M',  '3Mo':'3M',   'YTD':'YTD',  '1Yr':'1Y', '5Yr':'5Y',
+}
+
 export default function App() {
   const [symbol,    setSymbol]    = useState('AAPL')
   const [account,   setAccount]   = useState(null)
@@ -19,10 +24,13 @@ export default function App() {
   const [quote,     setQuote]     = useState(null)
   const [timeframe, setTimeframe] = useState('1Min')
   const [centerTab, setCenterTab] = useState('chart')  // 'chart' | 'holdings'
+  const [delta,     setDelta]     = useState(null)
 
-  // Subscribe to the active symbol's real-time data
+  // Subscribe to active symbol + fetch initial quote for day delta
   useEffect(() => {
     api.post(`/subscribe/${symbol}`)
+    setDelta(null)
+    api.get(`/quote/${symbol}`).then(r => setDelta(r.data)).catch(() => {})
   }, [symbol])
 
   // Live quote from SocketIO
@@ -68,10 +76,16 @@ export default function App() {
                     <span className="chart-spread"> spread ${quote.spread?.toFixed(2)}</span>
                   </span>
                 )}
+                {delta?.change !== undefined && delta.change !== 0 && (
+                  <span className={`chart-delta mono ${delta.change >= 0 ? 'ok' : 'err'}`}>
+                    {delta.change >= 0 ? '+' : ''}{Number(delta.change).toFixed(2)}&nbsp;
+                    ({delta.change >= 0 ? '+' : ''}{Number(delta.change_pct).toFixed(2)}%)
+                  </span>
+                )}
                 <div className="tf-group">
-                  {['1Min','5Min','15Min','1Hour','1Day','1Wk','1Mo','3Mo','YTD','1Yr','5Yr'].map(tf => (
+                  {Object.keys(TF_LABELS).map(tf => (
                     <button key={tf} className={`tf-btn${timeframe === tf ? ' active' : ''}`}
-                      onClick={() => setTimeframe(tf)}>{tf}</button>
+                      onClick={() => setTimeframe(tf)}>{TF_LABELS[tf]}</button>
                   ))}
                 </div>
               </div>

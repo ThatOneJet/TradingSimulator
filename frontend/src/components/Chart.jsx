@@ -9,12 +9,12 @@ export default function Chart({ symbol, timeframe, socket }) {
   const volumeRef    = useRef()
 
   useEffect(() => {
-    const isDaily = timeframe === '1Day'
+    const isDaily = !['1Min','5Min','15Min','1Hour'].includes(timeframe)
     const tz      = Intl.DateTimeFormat().resolvedOptions().timeZone
 
     const chart = createChart(containerRef.current, {
       width:  containerRef.current.clientWidth,
-      height: 340,
+      height: containerRef.current.clientHeight || 340,
       layout: { background: { color: '#0d1119' }, textColor: '#8899aa' },
       grid:   { vertLines: { color: '#1a2234' }, horzLines: { color: '#1a2234' } },
       crosshair: { mode: 1 },
@@ -27,7 +27,7 @@ export default function Chart({ symbol, timeframe, socket }) {
           if (isDaily) {
             return d.toLocaleDateString('en-US', { timeZone: tz, month: 'short', day: 'numeric', year: 'numeric' })
           }
-          return d.toLocaleTimeString('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false })
+          return d.toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true })
         },
       },
     })
@@ -70,7 +70,11 @@ export default function Chart({ symbol, timeframe, socket }) {
       })
 
     const ro = new ResizeObserver(() => {
-      chart.applyOptions({ width: containerRef.current.clientWidth })
+      if (!containerRef.current) return
+      chart.applyOptions({
+        width:  containerRef.current.clientWidth,
+        height: containerRef.current.clientHeight,
+      })
     })
     ro.observe(containerRef.current)
 

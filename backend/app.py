@@ -94,9 +94,11 @@ _init_db()
 # in-memory watchlist
 _watchlist: list[str] = ['AAPL', 'TSLA', 'NVDA', 'SPY']
 
-# ── Price cache (30s TTL — avoids hammering yfinance on every poll) ────────────
+# ── Price / quote cache ────────────────────────────────────────────────────────
 _price_cache: dict[str, tuple[float, float]] = {}
 _PRICE_TTL = 30
+_quote_cache: dict[str, tuple[dict, float]] = {}
+_QUOTE_TTL  = 60
 
 def _fetch_price_live(symbol: str) -> float:
     if KEYS_SET:
@@ -544,19 +546,28 @@ def get_sparkline(symbol):
         return jsonify([])
 
 def _quote_yfinance(symbol: str) -> dict:
+    now = _time.time()
+    if symbol in _quote_cache:
+        q, ts = _quote_cache[symbol]
+        if now - ts < _QUOTE_TTL:
+            return q
     import yfinance as yf
-    price = 0.0
+    price = 0.0; prev = 0.0
     try:
-        tk   = yf.Ticker(symbol)
-        hist = tk.history(period='2d')
-        if not hist.empty:
-            price = float(hist['Close'].iloc[-1])
-        else:
-            price = float(tk.fast_info.last_price or 0)
+        closes = yf.Ticker(symbol).history(period='5d')['Close'].dropna()
+        if len(closes) >= 2:
+            price = float(closes.iloc[-1]); prev = float(closes.iloc[-2])
+        elif len(closes) == 1:
+            price = float(closes.iloc[0])
     except Exception:
         pass
-    return {'symbol': symbol, 'bid': price, 'bid_size': 0,
-            'ask': price, 'ask_size': 0, 'spread': 0.0, 'delayed': True}
+    change     = round(price - prev, 4) if prev else 0.0
+    change_pct = round((change / prev) * 100, 2) if prev else 0.0
+    q = {'symbol': symbol, 'bid': price, 'bid_size': 0, 'ask': price, 'ask_size': 0,
+         'spread': 0.0, 'change': change, 'change_pct': change_pct, 'delayed': True}
+    _quote_cache[symbol] = (q, now)
+    _price_cache[symbol] = (price, now)
+    return q
 
 @app.route('/api/quote/<symbol>')
 def get_quote(symbol):
@@ -569,10 +580,12 @@ def get_quote(symbol):
     try:
         req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed='iex')
         q   = data_client.get_stock_latest_quote(req)[symbol]
+        yq  = _quote_yfinance(symbol)
         return jsonify({'symbol': symbol,
                         'bid': float(q.bid_price), 'bid_size': float(q.bid_size),
                         'ask': float(q.ask_price), 'ask_size': float(q.ask_size),
-                        'spread': float(q.ask_price) - float(q.bid_price)})
+                        'spread': float(q.ask_price) - float(q.bid_price),
+                        'change': yq.get('change', 0.0), 'change_pct': yq.get('change_pct', 0.0)})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
@@ -582,10 +595,11 @@ def get_watchlist():
     result = []
     for sym in _watchlist:
         try:
-            price = _get_current_price(sym)
-            result.append({'symbol': sym, 'bid': price, 'ask': price, 'price': price})
+            q = _quote_yfinance(sym)
+            result.append({'symbol': sym, 'bid': q['bid'], 'ask': q['bid'], 'price': q['bid'],
+                           'change': q.get('change', 0.0), 'change_pct': q.get('change_pct', 0.0)})
         except:
-            result.append({'symbol': sym, 'price': None})
+            result.append({'symbol': sym, 'price': None, 'change': 0.0, 'change_pct': 0.0})
     return jsonify(result)
 
 @app.route('/api/watchlist', methods=['POST'])
