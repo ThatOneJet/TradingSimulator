@@ -1,39 +1,75 @@
 import { useState, useEffect, useCallback } from 'react'
 import { io } from 'socket.io-client'
 import TitleBar from './components/TitleBar.jsx'
-import Watchlist from './components/Watchlist.jsx'
+import Rail from './components/Rail.jsx'
+import NavSidebar from './components/NavSidebar.jsx'
 import Chart from './components/Chart.jsx'
 import OrderForm from './components/OrderForm.jsx'
 import OrderBook from './components/OrderBook.jsx'
 import Portfolio from './components/Portfolio.jsx'
 import Positions from './components/Positions.jsx'
 import Holdings from './components/Holdings.jsx'
+import Login from './pages/Login.jsx'
+import PortfolioTabs from './components/PortfolioTabs.jsx'
+import NewsPage from './pages/NewsPage.jsx'
+import NewsWidget from './components/NewsWidget.jsx'
+import ExplorePage from './pages/ExplorePage.jsx'
 import api from './api.js'
 
 const socket = io('http://localhost:8765')
 
 const TF_LABELS = {
-  '1Min':'1m', '5Min':'5m', '15Min':'15m', '1Hour':'1h', '1Day':'1D',
-  '1Wk':'1W',  '1Mo':'1M',  '3Mo':'3M',   'YTD':'YTD',  '1Yr':'1Y', '5Yr':'5Y',
+  '1Min': '1m', '5Min': '5m', '15Min': '15m', '1Hour': '1h', '1Day': '1D',
+  '1Wk': '1W',  '1Mo': '1M', '3Mo': '3M',    'YTD': 'YTD', '1Yr': '1Y', '5Yr': '5Y',
 }
 
 export default function App() {
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  const [user, setUser] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('ts_user')) } catch { return null }
+  })
+
+  // ── UI state ──────────────────────────────────────────────────────────────
+  const [sideOpen,     setSideOpen]     = useState(true)
+  const [navCollapsed, setNavCollapsed] = useState(false)
+  const [railTab,      setRailTab]      = useState('chart') // 'chart' | 'news' | 'holdings' | 'explore'
+
+  // ── Trading state ─────────────────────────────────────────────────────────
   const [symbol,    setSymbol]    = useState('AAPL')
   const [account,   setAccount]   = useState(null)
   const [positions, setPositions] = useState([])
   const [quote,     setQuote]     = useState(null)
   const [timeframe, setTimeframe] = useState('1Min')
-  const [centerTab, setCenterTab] = useState('chart')  // 'chart' | 'holdings'
   const [delta,     setDelta]     = useState(null)
+  const [company,   setCompany]   = useState(null) // { name, exchange }
 
-  // Subscribe to active symbol + fetch initial quote for day delta
+  // ── Chart overlay toggles ─────────────────────────────────────────────────
+  const [overlays, setOverlays] = useState(new Set())
+  const toggleOverlay = (name) => setOverlays(prev => {
+    const n = new Set(prev)
+    n.has(name) ? n.delete(name) : n.add(name)
+    return n
+  })
+
+  // ── Portfolio ─────────────────────────────────────────────────────────────
+  const [portfolioId, setPortfolioId] = useState(() => {
+    const stored = localStorage.getItem('ts_portfolio_id')
+    return stored ? Number(stored) : 1
+  })
+
+  // ── Watchlist symbol list (fed to news page) ──────────────────────────────
+  const [watchlistSymbols, setWatchlistSymbols] = useState([])
+
+  // ── Subscribe to active symbol + fetch day delta + company name ───────────
   useEffect(() => {
     api.post(`/subscribe/${symbol}`)
     setDelta(null)
+    setCompany(null)
     api.get(`/quote/${symbol}`).then(r => setDelta(r.data)).catch(() => {})
+    api.get(`/company/${symbol}`).then(r => setCompany(r.data)).catch(() => {})
   }, [symbol])
 
-  // Live quote from SocketIO
+  // ── Live quote via SocketIO ───────────────────────────────────────────────
   useEffect(() => {
     const handler = (data) => {
       if (data.symbol === symbol) setQuote(data)
@@ -42,11 +78,11 @@ export default function App() {
     return () => socket.off('quote', handler)
   }, [symbol])
 
-  // Poll account + positions every 5s
+  // ── Poll account + positions every 5s ────────────────────────────────────
   const refresh = useCallback(() => {
-    api.get('/account').then(r => setAccount(r.data)).catch(() => {})
-    api.get('/positions').then(r => setPositions(r.data)).catch(() => {})
-  }, [])
+    api.get(`/account?portfolio_id=${portfolioId}`).then(r => setAccount(r.data)).catch(() => {})
+    api.get(`/positions?portfolio_id=${portfolioId}`).then(r => setPositions(r.data)).catch(() => {})
+  }, [portfolioId])
 
   useEffect(() => {
     refresh()
@@ -54,54 +90,164 @@ export default function App() {
     return () => clearInterval(id)
   }, [refresh])
 
+  // ── Persist portfolioId to localStorage ──────────────────────────────────
+  useEffect(() => {
+    localStorage.setItem('ts_portfolio_id', String(portfolioId))
+  }, [portfolioId])
+
+  // ── Auth guard ────────────────────────────────────────────────────────────
+  if (!user) return <Login onLogin={setUser} />
+
+  const midPrice = quote ? ((quote.bid + quote.ask) / 2).toFixed(2) : null
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell${sideOpen ? ' side-open' : ''}`}>
+
+      {/* ── TitleBar: row 1, all columns ── */}
       <TitleBar symbol={symbol} account={account} />
-      <div className="main-grid">
-        <aside className="panel-left">
-          <Watchlist active={symbol} onSelect={setSymbol} socket={socket} />
-        </aside>
-        <main className="panel-center">
-          <div className="center-tabs">
-            <button className={`center-tab${centerTab === 'chart' ? ' active' : ''}`} onClick={() => setCenterTab('chart')}>Chart</button>
-            <button className={`center-tab${centerTab === 'holdings' ? ' active' : ''}`} onClick={() => setCenterTab('holdings')}>Holdings</button>
-          </div>
-          {centerTab === 'chart' ? (
-            <>
-              <div className="chart-header">
+
+      {/* ── Rail: row 2, col 1 ── */}
+      <Rail
+        activeTab={railTab}
+        onTabChange={setRailTab}
+        sideOpen={sideOpen}
+        onToggleSide={() => setSideOpen(s => !s)}
+      />
+
+      {/* ── NavSidebar: row 2, col 2 ── */}
+      <NavSidebar
+        collapsed={navCollapsed}
+        onCollapse={() => setNavCollapsed(c => !c)}
+        active={symbol}
+        onSelect={setSymbol}
+        socket={socket}
+        user={user}
+        onWatchlistChange={setWatchlistSymbols}
+        onLogout={() => { localStorage.removeItem('ts_user'); window.location.reload() }}
+      />
+
+      {/* ── Main content: row 2, col 3 ── */}
+      <main className="main">
+
+        {railTab === 'chart' && (
+          <>
+            {/* Portfolio tabs row */}
+            <PortfolioTabs
+              portfolioId={portfolioId}
+              onSwitch={setPortfolioId}
+              userId={user?.user_id}
+            />
+
+            {/* Chart header bar */}
+            <div className="ch-header">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
                 <span className="chart-symbol">{symbol}</span>
-                {quote && (
-                  <span className="chart-price mono">
-                    ${((quote.bid + quote.ask) / 2).toFixed(2)}
-                    <span className="chart-spread"> spread ${quote.spread?.toFixed(2)}</span>
+                {company?.name && company.name !== symbol && (
+                  <span style={{ fontSize: 10, color: 'var(--t-3)', lineHeight: 1 }}>
+                    {company.name}
+                    {company.exchange ? ` · ${company.exchange}` : ''}
                   </span>
                 )}
-                {delta?.change !== undefined && delta.change !== 0 && (
-                  <span className={`chart-delta mono ${delta.change >= 0 ? 'ok' : 'err'}`}>
-                    {delta.change >= 0 ? '+' : ''}{Number(delta.change).toFixed(2)}&nbsp;
-                    ({delta.change >= 0 ? '+' : ''}{Number(delta.change_pct).toFixed(2)}%)
-                  </span>
-                )}
-                <div className="tf-group">
-                  {Object.keys(TF_LABELS).map(tf => (
-                    <button key={tf} className={`tf-btn${timeframe === tf ? ' active' : ''}`}
-                      onClick={() => setTimeframe(tf)}>{TF_LABELS[tf]}</button>
-                  ))}
-                </div>
               </div>
-              <Chart symbol={symbol} timeframe={timeframe} socket={socket} />
-              <OrderForm symbol={symbol} account={account} onOrderPlaced={refresh} />
-            </>
-          ) : (
-            <Holdings onSelectSymbol={(sym) => { setSymbol(sym); setCenterTab('chart') }} />
-          )}
-        </main>
-        <aside className="panel-right">
+
+              {midPrice && (
+                <span className="chart-price mono">
+                  ${midPrice}
+                  {quote?.spread != null && (
+                    <span className="chart-spread"> spread ${Number(quote.spread).toFixed(2)}</span>
+                  )}
+                </span>
+              )}
+
+              {delta?.change !== undefined && delta.change !== 0 && (
+                <span className={`chart-delta mono ${delta.change >= 0 ? 'ok' : 'err'}`}>
+                  {delta.change >= 0 ? '+' : ''}{Number(delta.change).toFixed(2)}&nbsp;
+                  ({delta.change >= 0 ? '+' : ''}{Number(delta.change_pct).toFixed(2)}%)
+                </span>
+              )}
+
+              {/* Timeframe buttons */}
+              <div className="tf-group">
+                {Object.keys(TF_LABELS).map(tf => (
+                  <button
+                    key={tf}
+                    className={`tf-btn${timeframe === tf ? ' active' : ''}`}
+                    onClick={() => setTimeframe(tf)}
+                  >
+                    {TF_LABELS[tf]}
+                  </button>
+                ))}
+              </div>
+
+              {/* Overlay toggles */}
+              <div className="overlay-group">
+                {['SMA20', 'SMA50', 'Proj', 'RSI'].map(o => (
+                  <button
+                    key={o}
+                    className={`tf-btn${overlays.has(o) ? ' active' : ''}`}
+                    onClick={() => toggleOverlay(o)}
+                  >
+                    {o}
+                  </button>
+                ))}
+              </div>
+
+              {/* Toggle side panel */}
+              <button
+                className="ch-btn"
+                title={sideOpen ? 'Hide panel' : 'Show panel'}
+                onClick={() => setSideOpen(s => !s)}
+              >
+                ⊞
+              </button>
+            </div>
+
+            {/* Chart + order form */}
+            <div className="ch-body">
+              <Chart
+                symbol={symbol}
+                timeframe={timeframe}
+                socket={socket}
+                overlays={overlays}
+              />
+              <OrderForm
+                symbol={symbol}
+                account={account}
+                onOrderPlaced={refresh}
+                portfolioId={portfolioId}
+              />
+            </div>
+          </>
+        )}
+
+        {railTab === 'news' && (
+          <NewsPage symbol={symbol} watchlist={watchlistSymbols} />
+        )}
+
+        {railTab === 'holdings' && (
+          <Holdings
+            onSelectSymbol={(sym) => { setSymbol(sym); setRailTab('chart') }}
+          />
+        )}
+
+        {railTab === 'explore' && (
+          <ExplorePage
+            onSelectSymbol={(sym) => { setSymbol(sym); setRailTab('chart') }}
+          />
+        )}
+
+      </main>
+
+      {/* ── Side panel: row 2, col 4 ── */}
+      {sideOpen && (
+        <aside className="side">
           <Portfolio account={account} onReset={refresh} />
           <Positions positions={positions} onRefresh={refresh} />
           <OrderBook symbol={symbol} quote={quote} socket={socket} />
+          <NewsWidget symbol={symbol} />
         </aside>
-      </div>
+      )}
+
     </div>
   )
 }

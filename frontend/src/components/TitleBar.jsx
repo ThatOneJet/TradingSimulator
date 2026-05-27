@@ -48,29 +48,36 @@ export default function TitleBar({ symbol, account }) {
     <div className="titlebar" onMouseDown={startDrag} onDoubleClick={toggleMax}>
       <span className="tb-dot" />
       <span className="tb-wordmark">TRADESIM</span>
-      <span className="tb-sep">/</span>
-      <span className="tb-symbol">{symbol}</span>
+      <span className="tb-sep" style={{ color: 'var(--t-3)' }}>/</span>
+      <span className="tb-symbol" style={{ color: 'var(--cy)' }}>{symbol}</span>
       <div className="tb-spacer" />
       {account && (
         <span className="tb-cluster-item">
-          <span className="lbl">EQUITY</span>
-          <span className="val mono">${Number(account.equity).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}</span>
+          <span className="lbl" style={{ color: 'var(--t-3)' }}>EQUITY</span>
+          <span className="val mono" style={{ color: 'var(--t-1)' }}>
+            ${Number(account.equity).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </span>
         </span>
       )}
       {account && (
         <span className="tb-cluster-item">
-          <span className="lbl">DAY P&L</span>
-          <span className="val mono" style={{color: account.pnl_day >= 0 ? 'var(--ok)' : 'var(--err)'}}>
+          <span className="lbl" style={{ color: 'var(--t-3)' }}>DAY P&L</span>
+          <span className="val mono" style={{ color: account.pnl_day >= 0 ? 'var(--ok)' : 'var(--err)' }}>
             {account.pnl_day >= 0 ? '+' : ''}{Number(account.pnl_day).toFixed(2)}
           </span>
         </span>
       )}
-      <span className="tb-cluster-item"><span className="tb-dot" style={{background:'var(--ok)',boxShadow:'0 0 6px var(--ok)'}}/><span className="lbl">PAPER</span></span>
-      <span className="tb-cluster-item"><span className="val mono">{time}</span></span>
+      <span className="tb-cluster-item" style={{ borderLeft: '1px solid var(--hairline)' }}>
+        <span className="tb-dot" style={{ background: 'var(--ok)', boxShadow: '0 0 6px var(--ok)' }} />
+        <span className="lbl" style={{ color: 'var(--t-3)' }}>PAPER</span>
+      </span>
+      <span className="tb-cluster-item" style={{ borderLeft: '1px solid var(--hairline)' }}>
+        <span className="val mono" style={{ color: 'var(--t-3)' }}>{time}</span>
+      </span>
       <div className="tb-controls">
-        <button className="tb-btn" onClick={win.minimize}><MinimizeIcon/></button>
-        <button className="tb-btn" onClick={toggleMax}>{maximized ? <RestoreIcon/> : <MaximizeIcon/>}</button>
-        <button className="tb-btn tb-close" onClick={win.close}><CloseIcon/></button>
+        <button className="tb-btn" onClick={win.minimize}><MinimizeIcon /></button>
+        <button className="tb-btn" onClick={toggleMax}>{maximized ? <RestoreIcon /> : <MaximizeIcon />}</button>
+        <button className="tb-btn tb-close" onClick={win.close}><CloseIcon /></button>
       </div>
     </div>
   )

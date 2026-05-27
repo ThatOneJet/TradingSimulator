@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import api from '../api.js'
 
-export default function OrderForm({ symbol, account, onOrderPlaced }) {
+export default function OrderForm({ symbol, account, onOrderPlaced, portfolioId }) {
   const [qty,        setQty]        = useState('')
   const [side,       setSide]       = useState('buy')
   const [orderType,  setOrderType]  = useState('market')
@@ -15,7 +15,7 @@ export default function OrderForm({ symbol, account, onOrderPlaced }) {
     if (orderType === 'limit' && (!limitPrice || isNaN(limitPrice))) { setStatus({ err: 'Enter a valid limit price' }); return }
     setLoading(true); setStatus(null)
     try {
-      const body = { symbol, qty: Number(qty), side, type: orderType }
+      const body = { symbol, qty: Number(qty), side, type: orderType, portfolio_id: portfolioId || 1 }
       if (orderType === 'limit') body.limit_price = Number(limitPrice)
       const r = await api.post('/orders', body)
       setStatus({ ok: `Order submitted: ${r.data.id?.slice(0,8)}…` })

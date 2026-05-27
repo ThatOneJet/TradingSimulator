@@ -1,4 +1,4 @@
-import os, threading, sqlite3, time as _time, json as _json, csv, io
+import os, threading, sqlite3, time as _time, json as _json, csv, io, hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory
@@ -66,10 +66,12 @@ def _init_db():
         ''')
         conn.execute('''
             CREATE TABLE IF NOT EXISTS sim_positions (
-                symbol      TEXT PRIMARY KEY,
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol      TEXT NOT NULL,
                 shares      REAL NOT NULL DEFAULT 0,
                 avg_cost    REAL NOT NULL DEFAULT 0,
-                realized_pl REAL NOT NULL DEFAULT 0
+                realized_pl REAL NOT NULL DEFAULT 0,
+                portfolio_id INTEGER NOT NULL DEFAULT 1
             )
         ''')
         conn.execute('''
@@ -88,6 +90,43 @@ def _init_db():
             )
         ''')
         conn.execute('INSERT OR IGNORE INTO sim_state (id) VALUES (1)')
+
+        # Users table
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                username     TEXT    NOT NULL UNIQUE,
+                pw_hash      TEXT    NOT NULL,
+                display_name TEXT,
+                avatar_color TEXT    NOT NULL DEFAULT '#ff6a1a',
+                created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        ''')
+
+        # Portfolios table
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS portfolios (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                name       TEXT    NOT NULL DEFAULT 'Main Portfolio',
+                color      TEXT    NOT NULL DEFAULT '#ff6a1a',
+                created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        ''')
+
+        # Safe migration: add portfolio_id to existing sim tables (ignore if column already exists)
+        for tbl in ('sim_state', 'sim_positions', 'sim_trades'):
+            try:
+                conn.execute(f'ALTER TABLE {tbl} ADD COLUMN portfolio_id INTEGER NOT NULL DEFAULT 1')
+            except Exception:
+                pass  # column already exists
+
+        # Seed default user and portfolio so existing data still works
+        conn.execute("INSERT OR IGNORE INTO users (id, username, pw_hash, display_name) VALUES (1, 'default', '', 'Default')")
+        conn.execute("INSERT OR IGNORE INTO portfolios (id, user_id, name) VALUES (1, 1, 'Main Portfolio')")
+
+        # Ensure sim_state row 1 has portfolio_id = 1
+        conn.execute("UPDATE sim_state SET portfolio_id = 1 WHERE id = 1 AND portfolio_id != 1")
 
 _init_db()
 
@@ -121,48 +160,80 @@ def _get_current_price(symbol: str) -> float:
     return price
 
 # ── Portfolio simulation helpers ───────────────────────────────────────────────
-def _sim_state() -> dict:
+def _sim_state(portfolio_id: int = 1) -> dict:
     with _get_db() as conn:
-        row = conn.execute('SELECT * FROM sim_state WHERE id = 1').fetchone()
+        row = conn.execute('SELECT * FROM sim_state WHERE portfolio_id = ?', (portfolio_id,)).fetchone()
+        if not row:
+            # Auto-create sim_state for this portfolio
+            conn.execute(
+                'INSERT INTO sim_state (cash, initial_cash, last_equity, portfolio_id) VALUES (100000,100000,100000,?)',
+                (portfolio_id,)
+            )
+            row = conn.execute('SELECT * FROM sim_state WHERE portfolio_id = ?', (portfolio_id,)).fetchone()
         return dict(row)
 
-def _sim_buy(symbol: str, qty: float, price: float):
+def _sim_buy(symbol: str, qty: float, price: float, portfolio_id: int = 1):
     cost = qty * price
     with _get_db() as conn:
-        state = conn.execute('SELECT cash FROM sim_state WHERE id = 1').fetchone()
+        state = conn.execute('SELECT cash FROM sim_state WHERE portfolio_id = ?', (portfolio_id,)).fetchone()
+        if not state:
+            # Auto-create
+            conn.execute(
+                'INSERT INTO sim_state (cash, initial_cash, last_equity, portfolio_id) VALUES (100000,100000,100000,?)',
+                (portfolio_id,)
+            )
+            state = conn.execute('SELECT cash FROM sim_state WHERE portfolio_id = ?', (portfolio_id,)).fetchone()
         if cost > state['cash']:
             raise ValueError(f'Insufficient cash: need ${cost:.2f}, have ${state["cash"]:.2f}')
-        conn.execute('UPDATE sim_state SET cash = cash - ? WHERE id = 1', (cost,))
-        existing = conn.execute('SELECT shares, avg_cost FROM sim_positions WHERE symbol = ?', (symbol,)).fetchone()
+        conn.execute('UPDATE sim_state SET cash = cash - ? WHERE portfolio_id = ?', (cost, portfolio_id))
+        existing = conn.execute(
+            'SELECT shares, avg_cost FROM sim_positions WHERE symbol = ? AND portfolio_id = ?',
+            (symbol, portfolio_id)
+        ).fetchone()
         if existing:
             total_shares = existing['shares'] + qty
             new_avg      = (existing['shares'] * existing['avg_cost'] + qty * price) / total_shares
-            conn.execute('UPDATE sim_positions SET shares = ?, avg_cost = ? WHERE symbol = ?',
-                         (total_shares, new_avg, symbol))
+            conn.execute(
+                'UPDATE sim_positions SET shares = ?, avg_cost = ? WHERE symbol = ? AND portfolio_id = ?',
+                (total_shares, new_avg, symbol, portfolio_id)
+            )
         else:
-            conn.execute('INSERT INTO sim_positions (symbol, shares, avg_cost, realized_pl) VALUES (?,?,?,0)',
-                         (symbol, qty, price))
+            conn.execute(
+                'INSERT INTO sim_positions (symbol, shares, avg_cost, realized_pl, portfolio_id) VALUES (?,?,?,0,?)',
+                (symbol, qty, price, portfolio_id)
+            )
 
-def _sim_sell(symbol: str, qty: float, price: float) -> float:
+def _sim_sell(symbol: str, qty: float, price: float, portfolio_id: int = 1) -> float:
     with _get_db() as conn:
-        pos = conn.execute('SELECT shares, avg_cost FROM sim_positions WHERE symbol = ?', (symbol,)).fetchone()
+        pos = conn.execute(
+            'SELECT shares, avg_cost FROM sim_positions WHERE symbol = ? AND portfolio_id = ?',
+            (symbol, portfolio_id)
+        ).fetchone()
         if not pos or pos['shares'] < qty - 0.0001:
             have = pos['shares'] if pos else 0
             raise ValueError(f'Insufficient shares: need {qty}, have {have:.4f}')
         realized_pl = (price - pos['avg_cost']) * qty
         proceeds     = qty * price
-        conn.execute('UPDATE sim_state SET cash = cash + ? WHERE id = 1', (proceeds,))
+        conn.execute('UPDATE sim_state SET cash = cash + ? WHERE portfolio_id = ?', (proceeds, portfolio_id))
         new_shares = pos['shares'] - qty
         if new_shares < 0.0001:
-            conn.execute('DELETE FROM sim_positions WHERE symbol = ?', (symbol,))
+            conn.execute(
+                'DELETE FROM sim_positions WHERE symbol = ? AND portfolio_id = ?',
+                (symbol, portfolio_id)
+            )
         else:
-            conn.execute('UPDATE sim_positions SET shares = ?, realized_pl = realized_pl + ? WHERE symbol = ?',
-                         (new_shares, realized_pl, symbol))
+            conn.execute(
+                'UPDATE sim_positions SET shares = ?, realized_pl = realized_pl + ? WHERE symbol = ? AND portfolio_id = ?',
+                (new_shares, realized_pl, symbol, portfolio_id)
+            )
         return realized_pl
 
-def _sim_positions_with_prices() -> list[dict]:
+def _sim_positions_with_prices(portfolio_id: int = 1) -> list[dict]:
     with _get_db() as conn:
-        rows = conn.execute('SELECT * FROM sim_positions WHERE shares > 0.0001').fetchall()
+        rows = conn.execute(
+            'SELECT * FROM sim_positions WHERE shares > 0.0001 AND portfolio_id = ?',
+            (portfolio_id,)
+        ).fetchall()
     out = []
     for row in rows:
         price = _get_current_price(row['symbol'])
@@ -339,11 +410,121 @@ def status():
         'polygon_configured':  POLYGON_KEYS_SET,
     })
 
+# ── Auth ──────────────────────────────────────────────────────────────────────
+def _hash_pw(pw: str) -> str:
+    return hashlib.sha256(pw.encode('utf-8')).hexdigest()
+
+@app.route('/api/auth/register', methods=['POST'])
+def auth_register():
+    data         = request.json or {}
+    username     = data.get('username', '').strip().lower()
+    password     = data.get('password', '')
+    display_name = data.get('display_name', '').strip() or username
+    avatar_color = data.get('avatar_color', '#ff6a1a')
+    if not username or len(username) < 2:
+        return jsonify({'error': 'Username must be at least 2 characters'}), 400
+    if len(password) < 4:
+        return jsonify({'error': 'Password must be at least 4 characters'}), 400
+    try:
+        with _get_db() as conn:
+            cur = conn.execute(
+                'INSERT INTO users (username, pw_hash, display_name, avatar_color) VALUES (?,?,?,?)',
+                (username, _hash_pw(password), display_name, avatar_color)
+            )
+            user_id = cur.lastrowid
+            # Create default portfolio for new user
+            conn.execute('INSERT INTO portfolios (user_id, name, color) VALUES (?,?,?)',
+                         (user_id, 'Main Portfolio', '#ff6a1a'))
+        return jsonify({'user_id': user_id, 'username': username, 'display_name': display_name, 'avatar_color': avatar_color})
+    except Exception as e:
+        if 'UNIQUE' in str(e):
+            return jsonify({'error': 'Username already taken'}), 409
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login():
+    data     = request.json or {}
+    username = data.get('username', '').strip().lower()
+    password = data.get('password', '')
+    with _get_db() as conn:
+        row = conn.execute(
+            'SELECT id, username, pw_hash, display_name, avatar_color FROM users WHERE username = ?',
+            (username,)
+        ).fetchone()
+    if not row or row['pw_hash'] != _hash_pw(password):
+        return jsonify({'error': 'Invalid username or password'}), 401
+    return jsonify({
+        'user_id':      row['id'],
+        'username':     row['username'],
+        'display_name': row['display_name'] or row['username'],
+        'avatar_color': row['avatar_color'],
+    })
+
+# ── Portfolios ────────────────────────────────────────────────────────────────
+@app.route('/api/portfolios')
+def get_portfolios():
+    user_id = request.args.get('user_id', 1, type=int)
+    with _get_db() as conn:
+        rows = conn.execute(
+            'SELECT * FROM portfolios WHERE user_id = ? ORDER BY id', (user_id,)
+        ).fetchall()
+    result = []
+    for row in rows:
+        pid = row['id']
+        result.append({
+            'id':    pid,
+            'name':  row['name'],
+            'color': row['color'],
+        })
+    return jsonify(result)
+
+@app.route('/api/portfolios', methods=['POST'])
+def create_portfolio():
+    data    = request.json or {}
+    user_id = data.get('user_id', 1)
+    name    = data.get('name', 'New Portfolio').strip()
+    color   = data.get('color', '#ff6a1a')
+    if not name:
+        return jsonify({'error': 'Name required'}), 400
+    with _get_db() as conn:
+        cur = conn.execute(
+            'INSERT INTO portfolios (user_id, name, color) VALUES (?,?,?)',
+            (user_id, name, color)
+        )
+        pid = cur.lastrowid
+        # Seed sim_state for this portfolio
+        conn.execute(
+            "INSERT OR IGNORE INTO sim_state (id, cash, initial_cash, last_equity, reset_at, portfolio_id) VALUES (?,100000,100000,100000,datetime('now'),?)",
+            (pid + 1000, pid)   # offset id to avoid collision with default id=1
+        )
+    return jsonify({'id': pid, 'name': name, 'color': color, 'user_id': user_id})
+
+@app.route('/api/portfolios/<int:pid>', methods=['PATCH'])
+def update_portfolio(pid):
+    data = request.json or {}
+    with _get_db() as conn:
+        if 'name' in data:
+            conn.execute('UPDATE portfolios SET name = ? WHERE id = ?', (data['name'], pid))
+        if 'color' in data:
+            conn.execute('UPDATE portfolios SET color = ? WHERE id = ?', (data['color'], pid))
+    return jsonify({'status': 'updated'})
+
+@app.route('/api/portfolios/<int:pid>', methods=['DELETE'])
+def delete_portfolio(pid):
+    if pid == 1:
+        return jsonify({'error': 'Cannot delete default portfolio'}), 400
+    with _get_db() as conn:
+        conn.execute('DELETE FROM portfolios WHERE id = ?', (pid,))
+        conn.execute('DELETE FROM sim_positions WHERE portfolio_id = ?', (pid,))
+        conn.execute('DELETE FROM sim_trades WHERE portfolio_id = ?', (pid,))
+    return jsonify({'status': 'deleted'})
+
 # ── Portfolio simulation routes (no Alpaca required) ──────────────────────────
 @app.route('/api/account')
 def account():
-    state     = _sim_state()
-    positions = _sim_positions_with_prices()
+    pid       = request.args.get('portfolio_id', 1, type=int)
+    state     = _sim_state(pid)
+    positions = _sim_positions_with_prices(pid)
     portfolio_value = state['cash'] + sum(p['market_value'] for p in positions)
     pnl_day   = portfolio_value - state['last_equity']
     return jsonify({
@@ -357,12 +538,17 @@ def account():
 
 @app.route('/api/positions')
 def positions():
-    return jsonify(_sim_positions_with_prices())
+    pid = request.args.get('portfolio_id', 1, type=int)
+    return jsonify(_sim_positions_with_prices(pid))
 
 @app.route('/api/orders', methods=['GET'])
 def get_orders():
+    pid = request.args.get('portfolio_id', 1, type=int)
     with _get_db() as conn:
-        rows = conn.execute('SELECT * FROM sim_trades ORDER BY created_at DESC LIMIT 100').fetchall()
+        rows = conn.execute(
+            'SELECT * FROM sim_trades WHERE portfolio_id = ? ORDER BY created_at DESC LIMIT 100',
+            (pid,)
+        ).fetchall()
     return jsonify([{
         'id':               str(row['id']),
         'symbol':           row['symbol'],
@@ -385,6 +571,7 @@ def place_order():
     side       = data.get('side', 'buy').lower()
     otype      = data.get('type', 'market').lower()
     limit_price = data.get('limit_price')
+    pid        = request.args.get('portfolio_id', data.get('portfolio_id', 1), type=int)
 
     if not symbol or qty <= 0:
         return jsonify({'error': 'Invalid symbol or qty'}), 400
@@ -408,14 +595,14 @@ def place_order():
             fill_price = lp
 
         if side == 'buy':
-            _sim_buy(symbol, qty, fill_price)
+            _sim_buy(symbol, qty, fill_price, pid)
         else:
-            realized_pl = _sim_sell(symbol, qty, fill_price)
+            realized_pl = _sim_sell(symbol, qty, fill_price, pid)
 
         with _get_db() as conn:
             cur = conn.execute(
-                'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, limit_price, realized_pl) VALUES (?,?,?,?,?,?,?,?,?)',
-                (symbol, side, qty, fill_price, qty, status, otype, limit_price, realized_pl)
+                'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, limit_price, realized_pl, portfolio_id) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                (symbol, side, qty, fill_price, qty, status, otype, limit_price, realized_pl, pid)
             )
             order_id = cur.lastrowid
 
@@ -439,14 +626,18 @@ def cancel_order(order_id):
 
 @app.route('/api/account/reset', methods=['POST'])
 def reset_account():
+    pid = 1
+    if request.json:
+        pid = request.json.get('portfolio_id', 1)
     with _get_db() as conn:
-        conn.execute("UPDATE sim_state SET cash = 100000.0, last_equity = 100000.0, reset_at = datetime('now') WHERE id = 1")
-        conn.execute('DELETE FROM sim_positions')
-        conn.execute('DELETE FROM sim_trades')
-        conn.execute('DELETE FROM holdings')
+        conn.execute("UPDATE sim_state SET cash=100000, last_equity=100000, reset_at=datetime('now') WHERE portfolio_id=?", (pid,))
+        conn.execute('DELETE FROM sim_positions WHERE portfolio_id=?', (pid,))
+        conn.execute('DELETE FROM sim_trades WHERE portfolio_id=?', (pid,))
+        if pid == 1:
+            conn.execute('DELETE FROM holdings')
     return jsonify({
         'status':  'reset',
-        'message': 'Account reset to $100,000. All positions, trades, and holdings cleared.',
+        'message': 'Account reset to $100,000. All positions and trades cleared.',
     })
 
 # ── Market data routes ─────────────────────────────────────────────────────────
@@ -783,6 +974,214 @@ def delete_holding(holding_id):
     with _get_db() as conn:
         conn.execute('DELETE FROM holdings WHERE id = ?', (holding_id,))
     return jsonify({'status': 'deleted'})
+
+# ── News feed ─────────────────────────────────────────────────────────────────
+_news_cache: dict[str, tuple[list, float]] = {}
+_NEWS_TTL = 600  # 10 minutes
+
+def _fetch_news_av(symbol: str = '', topics: str = 'technology,finance') -> list:
+    """Fetch from Alpha Vantage NEWS_SENTIMENT."""
+    if not AV_KEYS_SET:
+        return []
+    try:
+        import requests as _req
+        params = {'function': 'NEWS_SENTIMENT', 'apikey': AV_KEY, 'limit': 20, 'sort': 'LATEST'}
+        if symbol:
+            params['tickers'] = symbol
+        else:
+            params['topics'] = topics
+        r = _req.get('https://www.alphavantage.co/query', params=params, timeout=8)
+        feed = r.json().get('feed', [])
+        result = []
+        for item in feed[:15]:
+            # Find ticker-specific sentiment if symbol provided
+            sentiment_score = 0.0
+            sentiment_label = 'Neutral'
+            if symbol and item.get('ticker_sentiment'):
+                for ts in item['ticker_sentiment']:
+                    if ts.get('ticker') == symbol:
+                        sentiment_score = float(ts.get('ticker_sentiment_score', 0))
+                        sentiment_label = ts.get('ticker_sentiment_label', 'Neutral')
+                        break
+            else:
+                sentiment_score = float(item.get('overall_sentiment_score', 0))
+                sentiment_label = item.get('overall_sentiment_label', 'Neutral')
+            result.append({
+                'title':     item.get('title', ''),
+                'summary':   item.get('summary', '')[:200],
+                'url':       item.get('url', ''),
+                'source':    item.get('source', ''),
+                'published': item.get('time_published', ''),
+                'sentiment_score': round(sentiment_score, 3),
+                'sentiment_label': sentiment_label,  # Bullish/Somewhat Bullish/Neutral/Somewhat Bearish/Bearish
+                'banner_image': item.get('banner_image', ''),
+            })
+        return result
+    except Exception as e:
+        print(f'[TradeSimulator] AV news fetch failed: {e}')
+        return []
+
+def _fetch_news_polygon(symbol: str = '') -> list:
+    """Fallback: Polygon.io news."""
+    if not POLYGON_KEYS_SET:
+        return []
+    try:
+        import requests as _req
+        params = {'apiKey': POLYGON_KEY, 'limit': 10, 'order': 'desc'}
+        if symbol:
+            params['ticker'] = symbol
+        r = _req.get('https://api.polygon.io/v2/reference/news', params=params, timeout=8)
+        results = r.json().get('results', [])
+        return [{
+            'title':     a.get('title', ''),
+            'summary':   a.get('description', '')[:200],
+            'url':       a.get('article_url', ''),
+            'source':    a.get('publisher', {}).get('name', ''),
+            'published': a.get('published_utc', ''),
+            'sentiment_score': 0.0,
+            'sentiment_label': 'Neutral',
+            'banner_image':    a.get('image_url', ''),
+        } for a in results]
+    except Exception as e:
+        print(f'[TradeSimulator] Polygon news fetch failed: {e}')
+        return []
+
+@app.route('/api/news/<symbol>')
+def get_news_symbol(symbol):
+    symbol = symbol.upper()
+    cache_key = f'sym:{symbol}'
+    now = _time.time()
+    if cache_key in _news_cache:
+        items, ts = _news_cache[cache_key]
+        if now - ts < _NEWS_TTL:
+            return jsonify(items)
+    items = _fetch_news_av(symbol) or _fetch_news_polygon(symbol)
+    _news_cache[cache_key] = (items, now)
+    return jsonify(items)
+
+@app.route('/api/news/general')
+def get_news_general():
+    topic = request.args.get('topic', 'technology')
+    cache_key = f'general:{topic}'
+    now = _time.time()
+    if cache_key in _news_cache:
+        items, ts = _news_cache[cache_key]
+        if now - ts < _NEWS_TTL:
+            return jsonify(items)
+    items = _fetch_news_av(topics=f'{topic},finance') or _fetch_news_polygon()
+    _news_cache[cache_key] = (items, now)
+    return jsonify(items)
+
+# ── Price projection ──────────────────────────────────────────────────────────
+@app.route('/api/projection/<symbol>')
+def get_projection(symbol):
+    symbol = symbol.upper()
+    try:
+        import yfinance as yf
+        import math
+
+        hist = yf.Ticker(symbol).history(period='90d')
+        if hist.empty or len(hist) < 20:
+            return jsonify({'error': 'Insufficient data'}), 400
+
+        closes  = list(hist['Close'].dropna())
+        times   = [int(ts.timestamp()) for ts in hist.index]
+        n       = len(closes)
+
+        # ── SMA20 and SMA50 ──
+        sma20 = [
+            {'time': times[i], 'value': round(sum(closes[i-19:i+1]) / 20, 4)}
+            for i in range(19, n)
+        ]
+        sma50 = [
+            {'time': times[i], 'value': round(sum(closes[i-49:i+1]) / 50, 4)}
+            for i in range(49, n)
+        ] if n >= 50 else []
+
+        # ── Linear regression on last 20 days → project 10 bars forward ──
+        last20_y = closes[-20:]
+        last20_x = list(range(20))
+        x_mean   = 9.5
+        y_mean   = sum(last20_y) / 20
+        num   = sum((last20_x[i] - x_mean) * (last20_y[i] - y_mean) for i in range(20))
+        denom = sum((xi - x_mean) ** 2 for xi in last20_x)
+        slope = num / denom if denom else 0
+        intercept = y_mean - slope * x_mean
+
+        last_time    = times[-1]
+        day_seconds  = 86400
+        projection   = [
+            {'time': last_time + (i + 1) * day_seconds,
+             'value': round(intercept + slope * (19 + i + 1), 4)}
+            for i in range(10)
+        ]
+
+        # ── RSI (14-period) ──
+        gains  = [max(closes[i] - closes[i-1], 0) for i in range(1, n)]
+        losses = [max(closes[i-1] - closes[i], 0) for i in range(1, n)]
+        avg_g  = sum(gains[-14:])  / 14
+        avg_l  = sum(losses[-14:]) / 14
+        rsi    = 100 - (100 / (1 + avg_g / avg_l)) if avg_l else 100.0
+        rsi    = round(rsi, 2)
+        if rsi >= 70:
+            rsi_signal = 'overbought'
+        elif rsi <= 30:
+            rsi_signal = 'oversold'
+        else:
+            rsi_signal = 'neutral'
+
+        # ── Support / Resistance (local min/max over last 60 days) ──
+        window = min(60, n)
+        recent = closes[-window:]
+        local_min = min(recent)
+        local_max = max(recent)
+        # Simple support = 10th percentile, resistance = 90th percentile
+        sorted_c   = sorted(recent)
+        support    = round(sorted_c[int(len(sorted_c) * 0.10)], 2)
+        resistance = round(sorted_c[int(len(sorted_c) * 0.90)], 2)
+
+        # ── Trend ──
+        if slope > 0.05:
+            trend = 'up'
+        elif slope < -0.05:
+            trend = 'down'
+        else:
+            trend = 'sideways'
+
+        return jsonify({
+            'sma20':       sma20,
+            'sma50':       sma50,
+            'projection':  projection,
+            'support':     support,
+            'resistance':  resistance,
+            'rsi':         rsi,
+            'rsi_signal':  rsi_signal,
+            'trend':       trend,
+            'slope':       round(slope, 4),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ── Company info ─────────────────────────────────────────────────────────────
+@app.route('/api/company/<symbol>')
+def get_company(symbol):
+    symbol = symbol.upper()
+    if not _ticker_db_loaded:
+        threading.Thread(target=_load_ticker_db, daemon=True).start()
+    search_list = _ticker_db if _ticker_db_loaded else _STATIC_ASSETS_DICTS
+    for a in search_list:
+        if a['symbol'] == symbol:
+            return jsonify({'symbol': symbol, 'name': a['name'], 'exchange': a.get('exchange', '')})
+    # Fallback: try yfinance
+    try:
+        import yfinance as yf
+        info = yf.Ticker(symbol).info
+        name = info.get('longName') or info.get('shortName') or symbol
+        exchange = info.get('exchange', '')
+        return jsonify({'symbol': symbol, 'name': name, 'exchange': exchange})
+    except Exception:
+        pass
+    return jsonify({'symbol': symbol, 'name': symbol, 'exchange': ''})
 
 # ── Serve built React frontend ────────────────────────────────────────────────
 DIST_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
