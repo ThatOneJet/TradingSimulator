@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import api from '../api.js'
 
-export default function Portfolio({ account, onReset }) {
+export default function Portfolio({ account, onReset, portfolioId }) {
   const [resetting, setResetting] = useState(false)
   const [msg,       setMsg]       = useState('')
 
@@ -10,29 +10,33 @@ export default function Portfolio({ account, onReset }) {
     setResetting(true)
     setMsg('')
     try {
-      const r = await api.post('/account/reset')
-      setMsg(r.data.message || 'Account liquidated.')
+      const r = await api.post('/account/reset', { portfolio_id: portfolioId || 1 })
+      setMsg(r.data.message || 'Account reset.')
       onReset?.()
-    } catch (e) {
-      setMsg(e?.response?.data?.description || 'Reset failed — check Alpaca keys.')
+    } catch {
+      setMsg('Reset failed.')
     } finally {
       setResetting(false)
-      setTimeout(() => setMsg(''), 6000)
+      setTimeout(() => setMsg(''), 5000)
     }
   }
 
-  if (!account) return <div className="card portfolio skeleton-card" />
+  if (!account) return (
+    <div className="widget" style={{ minHeight: 90 }}>
+      <div style={{ height: 12, width: '60%', background: 'var(--hairline-2)', borderRadius: 4, marginBottom: 8 }} />
+      <div style={{ height: 12, width: '40%', background: 'var(--hairline-2)', borderRadius: 4 }} />
+    </div>
+  )
 
   const pnlColor = account.pnl_day >= 0 ? 'var(--ok)' : 'var(--err)'
-  const fmt = (n, decimals = 2) =>
-    Number(n).toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
+  const fmt = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
   return (
-    <div className="card portfolio">
-      <div className="card-header">
+    <div className="widget">
+      <div className="widget-hd">
         Portfolio
-        <button className="pf-reset-btn" onClick={handleReset} disabled={resetting} title="Liquidate all positions">
-          {resetting ? '…' : 'Liquidate All'}
+        <button className="pf-reset-btn" onClick={handleReset} disabled={resetting} style={{ marginLeft: 'auto' }}>
+          {resetting ? '…' : 'Reset'}
         </button>
       </div>
       <div className="pf-metrics">

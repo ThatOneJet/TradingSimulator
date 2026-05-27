@@ -140,13 +140,7 @@ _quote_cache: dict[str, tuple[dict, float]] = {}
 _QUOTE_TTL  = 60
 
 def _fetch_price_live(symbol: str) -> float:
-    if KEYS_SET:
-        try:
-            req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed='iex')
-            q   = data_client.get_stock_latest_quote(req)[symbol]
-            return (float(q.bid_price) + float(q.ask_price)) / 2
-        except:
-            pass
+    # Always use yfinance for simulation prices — no Alpaca dependency
     return _quote_yfinance(symbol)['bid']
 
 def _get_current_price(symbol: str) -> float:

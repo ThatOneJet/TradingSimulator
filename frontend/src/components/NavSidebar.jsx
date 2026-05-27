@@ -1,27 +1,9 @@
 // NavSidebar — collapsible watchlist nav (column 2, row 2 of app-shell grid)
-// Replaces the old Watchlist component.
+// Hover-driven collapse: expands on mouseenter, collapses (with 200ms delay) on mouseleave.
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import api from '../api.js'
 import SymbolSearch from './SymbolSearch.jsx'
-
-function ChevronLeftIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-      <polyline points="9,2 4,7 9,12" stroke="currentColor" strokeWidth="1.6"
-        strokeLinecap="round" strokeLinejoin="round"/>
-    </svg>
-  )
-}
-
-function ChevronRightIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-      <polyline points="5,2 10,7 5,12" stroke="currentColor" strokeWidth="1.6"
-        strokeLinecap="round" strokeLinejoin="round"/>
-    </svg>
-  )
-}
 
 /** Derive initials (up to 2 chars) from a ticker symbol */
 function symbolInitials(sym) {
@@ -38,16 +20,35 @@ function userInitials(username) {
 }
 
 export default function NavSidebar({
-  collapsed,
-  onCollapse,
+  // collapsed / onCollapse kept as optional for backward-compat but no longer used
   active,
   onSelect,
   socket,
   user,
   onWatchlistChange,
   onLogout,
+  onCollapseChange,  // NEW: called with boolean whenever collapsed state changes
 }) {
+  const [collapsed, setCollapsed] = useState(true)
   const [items, setItems] = useState([])
+  const leaveTimer = useRef(null)
+
+  // ── Hover handlers ─────────────────────────────────────────────────────
+  function handleMouseEnter() {
+    if (leaveTimer.current) {
+      clearTimeout(leaveTimer.current)
+      leaveTimer.current = null
+    }
+    setCollapsed(false)
+    if (onCollapseChange) onCollapseChange(false)
+  }
+
+  function handleMouseLeave() {
+    leaveTimer.current = setTimeout(() => {
+      setCollapsed(true)
+      if (onCollapseChange) onCollapseChange(true)
+    }, 200)
+  }
 
   // ── Load watchlist ──────────────────────────────────────────────────────
   function load() {
@@ -63,6 +64,13 @@ export default function NavSidebar({
     load()
     const id = setInterval(load, 10000)
     return () => clearInterval(id)
+  }, [])
+
+  // Cleanup leave timer on unmount
+  useEffect(() => {
+    return () => {
+      if (leaveTimer.current) clearTimeout(leaveTimer.current)
+    }
   }, [])
 
   // ── Live price updates via SocketIO ────────────────────────────────────
@@ -96,18 +104,15 @@ export default function NavSidebar({
   const initials = userInitials(user?.username || '')
 
   return (
-    <nav className={`nav${collapsed ? ' nav-collapsed' : ''}`}>
+    <nav
+      className={`nav${collapsed ? ' nav-collapsed' : ''}`}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
+    >
 
-      {/* ── Header row with collapse toggle ── */}
+      {/* ── Header row ── */}
       <div className="nav-head">
         <span className="nav-head-text">Watchlist</span>
-        <button
-          className="nav-collapse-btn"
-          title={collapsed ? 'Expand' : 'Collapse'}
-          onClick={onCollapse}
-        >
-          {collapsed ? <ChevronRightIcon /> : <ChevronLeftIcon />}
-        </button>
       </div>
 
       {/* ── Symbol search (hidden when collapsed) ── */}
@@ -129,8 +134,11 @@ export default function NavSidebar({
             onClick={() => onSelect(it.symbol)}
             title={collapsed ? it.symbol : undefined}
           >
-            {/* Symbol icon square — always visible */}
-            <div className="wl-item-icon">
+            {/* Symbol icon square — always visible, centered when collapsed */}
+            <div
+              className="wl-item-icon"
+              style={collapsed ? { margin: '0 auto' } : undefined}
+            >
               {symbolInitials(it.symbol)}
             </div>
 

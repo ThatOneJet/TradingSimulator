@@ -14,6 +14,7 @@ import PortfolioTabs from './components/PortfolioTabs.jsx'
 import NewsPage from './pages/NewsPage.jsx'
 import NewsWidget from './components/NewsWidget.jsx'
 import ExplorePage from './pages/ExplorePage.jsx'
+import ProjectionWidget from './components/ProjectionWidget.jsx'
 import api from './api.js'
 
 const socket = io('http://localhost:8765')
@@ -116,14 +117,13 @@ export default function App() {
 
       {/* ── NavSidebar: row 2, col 2 ── */}
       <NavSidebar
-        collapsed={navCollapsed}
-        onCollapse={() => setNavCollapsed(c => !c)}
         active={symbol}
         onSelect={setSymbol}
         socket={socket}
         user={user}
         onWatchlistChange={setWatchlistSymbols}
         onLogout={() => { localStorage.removeItem('ts_user'); window.location.reload() }}
+        onCollapseChange={(c) => setNavCollapsed(c)}
       />
 
       {/* ── Main content: row 2, col 3 ── */}
@@ -241,9 +241,10 @@ export default function App() {
       {/* ── Side panel: row 2, col 4 ── */}
       {sideOpen && (
         <aside className="side">
-          <Portfolio account={account} onReset={refresh} />
-          <Positions positions={positions} onRefresh={refresh} />
-          <OrderBook symbol={symbol} quote={quote} socket={socket} />
+          <Portfolio account={account} onReset={refresh} portfolioId={portfolioId} />
+          <Positions positions={positions} onRefresh={refresh} portfolioId={portfolioId} />
+          <OrderBook symbol={symbol} quote={quote} />
+          <ProjectionWidget symbol={symbol} />
           <NewsWidget symbol={symbol} />
         </aside>
       )}

@@ -1,23 +1,42 @@
 export default function OrderBook({ symbol, quote }) {
-  const bid = quote?.bid ?? 0
-  const ask = quote?.ask ?? 0
-  const bidSz = quote?.bid_size ?? 0
-  const askSz = quote?.ask_size ?? 0
+  const bid    = quote?.bid ?? 0
+  const ask    = quote?.ask ?? 0
+  const bidSz  = quote?.bid_size ?? 0
+  const askSz  = quote?.ask_size ?? 0
   const spread = ask - bid
   const spreadPct = bid > 0 ? ((spread / bid) * 100).toFixed(3) : '—'
 
   return (
-    <div className="card order-book">
-      <div className="card-header">Order Book <span className="muted">{symbol}</span></div>
-      <div className="ob-spread">SPREAD <span className="mono">${spread > 0 ? spread.toFixed(4) : '—'}</span> <span className="muted">({spreadPct}%)</span></div>
-      <table className="ob-table">
-        <thead><tr><th>Price</th><th>Size</th><th>Side</th></tr></thead>
+    <div className="widget" style={{ padding: '12px 14px' }}>
+      <div className="widget-hd">
+        Order Book
+        <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>{symbol}</span>
+      </div>
+      <div className="ob-spread" style={{ marginBottom: 8, fontSize: 11, color: 'var(--t-3)' }}>
+        SPREAD <span className="mono" style={{ color: 'var(--cy)' }}>
+          {spread > 0 ? `$${spread.toFixed(4)}` : '—'}
+        </span>
+        <span className="muted"> ({spreadPct}%)</span>
+      </div>
+      <table className="ob-table" style={{ width: '100%' }}>
+        <thead>
+          <tr>
+            <th>Price</th><th>Size</th><th>Side</th>
+          </tr>
+        </thead>
         <tbody>
-          <tr className="ob-ask"><td className="mono err">{ask > 0 ? ask.toFixed(2) : '—'}</td><td className="mono">{askSz}</td><td>ASK</td></tr>
-          <tr className="ob-bid"><td className="mono ok">{bid > 0 ? bid.toFixed(2) : '—'}</td><td className="mono">{bidSz}</td><td>BID</td></tr>
+          <tr className="ob-ask">
+            <td className="mono err">{ask > 0 ? ask.toFixed(2) : '—'}</td>
+            <td className="mono">{askSz || '—'}</td>
+            <td style={{ color: 'var(--err)', fontSize: 10, letterSpacing: '0.06em' }}>ASK</td>
+          </tr>
+          <tr className="ob-bid">
+            <td className="mono ok">{bid > 0 ? bid.toFixed(2) : '—'}</td>
+            <td className="mono">{bidSz || '—'}</td>
+            <td style={{ color: 'var(--ok)', fontSize: 10, letterSpacing: '0.06em' }}>BID</td>
+          </tr>
         </tbody>
       </table>
-      <div className="ob-note">IEX free tier: best bid/ask only</div>
     </div>
   )
 }
