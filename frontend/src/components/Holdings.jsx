@@ -2,7 +2,8 @@ import { useState, useEffect } from 'react'
 import SymbolSearch from './SymbolSearch.jsx'
 import api from '../api.js'
 
-export default function Holdings({ onSelectSymbol }) {
+// ── Real Portfolio tab ──────────────────────────────────────────────────────
+function RealPortfolio({ onSelectSymbol }) {
   const [holdings, setHoldings] = useState([])
   const [loading,  setLoading]  = useState(false)
 
@@ -14,7 +15,7 @@ export default function Holdings({ onSelectSymbol }) {
   const [note,      setNote]      = useState('')
   const [adding,    setAdding]    = useState(false)
   const [formErr,   setFormErr]   = useState('')
-  const [priceHint, setPriceHint] = useState('')  // "auto-fetching…" indicator
+  const [priceHint, setPriceHint] = useState('')
 
   function load() {
     setLoading(true)
@@ -46,20 +47,20 @@ export default function Holdings({ onSelectSymbol }) {
     load()
   }
 
-  // Totals
   const totalCost  = holdings.reduce((s, h) => s + (h.cost_basis || 0), 0)
   const totalValue = holdings.reduce((s, h) => s + (h.market_value || 0), 0)
   const totalPnl   = holdings.reduce((s, h) => s + (h.pnl || 0), 0)
   const totalPct   = totalCost > 0 ? (totalPnl / totalCost * 100) : 0
 
-  const fmt  = (n, d = 2) => n != null ? Number(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }) : '—'
-  const pnlColor = (v) => v == null ? 'var(--muted)' : v >= 0 ? 'var(--ok)' : 'var(--err)'
+  const fmt      = (n, d = 2) => n != null ? Number(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }) : '—'
+  const pnlColor = (v) => v == null ? 'var(--t-3)' : v >= 0 ? 'var(--ok)' : 'var(--err)'
 
   return (
-    <div className="holdings-view">
-      {/* Add form */}
-      <div className="card holdings-form">
-        <div className="card-header">Add Position</div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+
+      {/* Add Position form */}
+      <div className="widget" style={{ padding: '14px 16px' }}>
+        <div className="widget-hd">Add Position</div>
         <form onSubmit={submit}>
           <div className="hf-row">
             <div className="hf-field wide">
@@ -89,7 +90,7 @@ export default function Holdings({ onSelectSymbol }) {
             </div>
           </div>
           {priceHint && <div className="hf-hint">{priceHint}</div>}
-          {formErr && <div className="of-err">{formErr}</div>}
+          {formErr   && <div className="of-err">{formErr}</div>}
           <button type="submit" className="hf-submit" disabled={adding}>
             {adding ? 'Adding…' : 'Add Position'}
           </button>
@@ -97,12 +98,12 @@ export default function Holdings({ onSelectSymbol }) {
       </div>
 
       {/* Holdings table */}
-      <div className="card holdings-table-wrap">
-        <div className="card-header">
+      <div className="widget" style={{ padding: '14px 16px', flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+        <div className="widget-hd">
           My Holdings
-          <span className="badge">{holdings.length}</span>
+          <span className="badge" style={{ marginLeft: 4 }}>{holdings.length}</span>
           {totalValue > 0 && (
-            <span style={{ marginLeft: 'auto', fontFamily: 'Roboto Mono', fontSize: 12, color: pnlColor(totalPnl) }}>
+            <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 12, color: pnlColor(totalPnl) }}>
               {totalPnl >= 0 ? '+' : ''}${fmt(totalPnl)} ({totalPct >= 0 ? '+' : ''}{fmt(totalPct)}%)
             </span>
           )}
@@ -132,7 +133,7 @@ export default function Holdings({ onSelectSymbol }) {
               <tbody>
                 {holdings.map(h => (
                   <tr key={h.id} className="holdings-row" onClick={() => onSelectSymbol?.(h.symbol)}>
-                    <td className="mono bold acc">{h.symbol}</td>
+                    <td className="mono bold" style={{ color: 'var(--cy)' }}>{h.symbol}</td>
                     <td className="mono">{h.shares}</td>
                     <td className="muted">{h.buy_date}</td>
                     <td className="mono">${fmt(h.buy_price)}</td>
@@ -168,6 +169,214 @@ export default function Holdings({ onSelectSymbol }) {
               </tfoot>
             </table>
           </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Sim Portfolio tab ───────────────────────────────────────────────────────
+function SimPortfolio({ positions, portfolioId, onSelectSymbol, onRefresh }) {
+  const [orders,  setOrders]  = useState([])
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (!portfolioId) return
+    setLoading(true)
+    api.get('/orders', { params: { portfolio_id: portfolioId } })
+      .then(r => { setOrders(r.data); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [portfolioId])
+
+  async function closePosition(symbol, qty) {
+    try {
+      await api.post('/orders', { symbol, qty, side: 'sell', type: 'market', portfolio_id: portfolioId })
+      setTimeout(onRefresh, 800)
+    } catch {}
+  }
+
+  const fmt = (n, d = 2) => n != null ? Number(n).toFixed(d) : '—'
+
+  function fmtTimestamp(ts) {
+    if (!ts) return '—'
+    try {
+      return new Date(ts).toLocaleString('en-US', {
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: false,
+      })
+    } catch { return ts }
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+
+      {/* Open Positions */}
+      <div className="widget" style={{ padding: '14px 16px' }}>
+        <div className="widget-hd">
+          Open Positions
+          <span className="badge" style={{ marginLeft: 4 }}>{positions.length}</span>
+        </div>
+
+        {positions.length === 0
+          ? <div className="empty-state">No open positions</div>
+          : (
+            <div style={{ overflowX: 'auto' }}>
+              <table className="pos-table" style={{ minWidth: 500 }}>
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Qty</th>
+                    <th>Avg Entry</th>
+                    <th>Current Price</th>
+                    <th>Unrealized P&amp;L</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {positions.map(p => (
+                    <tr key={p.symbol}>
+                      <td className="mono bold" style={{ color: 'var(--cy)' }}>{p.symbol}</td>
+                      <td className="mono">{p.qty}</td>
+                      <td className="mono muted">${fmt(p.avg_entry_price)}</td>
+                      <td className="mono">${fmt(p.current_price)}</td>
+                      <td className="mono" style={{
+                        color: p.unrealized_pl >= 0 ? 'var(--ok)' : 'var(--err)',
+                        whiteSpace: 'nowrap',
+                      }}>
+                        {p.unrealized_pl >= 0 ? '+' : ''}{fmt(p.unrealized_pl)}
+                        <span className="muted"> ({(p.unrealized_plpc * 100).toFixed(2)}%)</span>
+                      </td>
+                      <td style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                        <button
+                          className="sim-action-btn"
+                          onClick={() => onSelectSymbol?.(p.symbol)}
+                          title="View chart"
+                        >
+                          Chart
+                        </button>
+                        <button
+                          className="close-btn"
+                          onClick={() => closePosition(p.symbol, p.qty)}
+                          title="Close position"
+                        >
+                          Close
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        }
+      </div>
+
+      {/* Trade History */}
+      <div className="widget" style={{ padding: '14px 16px' }}>
+        <div className="widget-hd">
+          Trade History
+          {!loading && <span className="badge" style={{ marginLeft: 4 }}>{orders.length}</span>}
+        </div>
+
+        {loading && <div className="empty-state">Loading…</div>}
+
+        {!loading && orders.length === 0 && (
+          <div className="empty-state">No orders yet</div>
+        )}
+
+        {!loading && orders.length > 0 && (
+          <div style={{ overflowX: 'auto' }}>
+            <table className="pos-table" style={{ minWidth: 460 }}>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Qty</th>
+                  <th>Fill Price</th>
+                  <th>Time</th>
+                </tr>
+              </thead>
+              <tbody>
+                {orders.map((o, i) => (
+                  <tr key={o.id ?? i}>
+                    <td className="mono bold" style={{ color: 'var(--cy)' }}>{o.symbol}</td>
+                    <td className="mono" style={{
+                      color: o.side?.toLowerCase() === 'buy' ? 'var(--ok)' : 'var(--err)',
+                      fontWeight: 600, textTransform: 'uppercase', fontSize: 10,
+                    }}>
+                      {o.side}
+                    </td>
+                    <td className="mono">{o.qty}</td>
+                    <td className="mono">{o.fill_price != null ? `$${Number(o.fill_price).toFixed(2)}` : '—'}</td>
+                    <td className="muted" style={{ fontSize: 11 }}>{fmtTimestamp(o.created_at || o.timestamp)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Main unified Holdings page ──────────────────────────────────────────────
+export default function Holdings({ onSelectSymbol, portfolioId, positions = [], onRefresh }) {
+  const [activeTab, setActiveTab] = useState('real')
+
+  const tabStyle = (tab) => ({
+    padding: '6px 18px',
+    borderRadius: 99,
+    border: 'none',
+    cursor: 'pointer',
+    fontSize: 12,
+    fontWeight: 600,
+    fontFamily: 'var(--font-sans)',
+    letterSpacing: '0.04em',
+    transition: 'all .15s',
+    background: activeTab === tab ? 'var(--acc-soft)' : 'transparent',
+    color: activeTab === tab ? 'var(--acc)' : 'var(--t-3)',
+    outline: activeTab === tab ? '1px solid var(--acc-line)' : '1px solid transparent',
+  })
+
+  return (
+    <div style={{
+      display: 'flex',
+      flexDirection: 'column',
+      height: '100%',
+      overflow: 'hidden',
+      background: 'var(--bg-main)',
+    }}>
+      {/* Tab switcher bar */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        padding: '8px 16px',
+        borderBottom: '1px solid var(--hairline)',
+        background: 'var(--bg-main)',
+        flexShrink: 0,
+      }}>
+        <button style={tabStyle('real')} onClick={() => setActiveTab('real')}>
+          Real Portfolio
+        </button>
+        <button style={tabStyle('sim')} onClick={() => setActiveTab('sim')}>
+          Sim Portfolio
+        </button>
+      </div>
+
+      {/* Tab content */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '12px 12px', display: 'flex', flexDirection: 'column' }}>
+        {activeTab === 'real' && (
+          <RealPortfolio onSelectSymbol={onSelectSymbol} />
+        )}
+        {activeTab === 'sim' && (
+          <SimPortfolio
+            positions={positions}
+            portfolioId={portfolioId}
+            onSelectSymbol={onSelectSymbol}
+            onRefresh={onRefresh}
+          />
         )}
       </div>
     </div>

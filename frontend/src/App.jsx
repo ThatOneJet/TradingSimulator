@@ -16,6 +16,7 @@ import NewsWidget from './components/NewsWidget.jsx'
 import ExplorePage from './pages/ExplorePage.jsx'
 import ProjectionWidget from './components/ProjectionWidget.jsx'
 import Settings from './pages/Settings.jsx'
+import NewsTicker from './components/NewsTicker.jsx'
 import api from './api.js'
 
 const socket = io('http://localhost:8765')
@@ -107,7 +108,7 @@ export default function App() {
   const midPrice = quote ? ((quote.bid + quote.ask) / 2).toFixed(2) : null
 
   return (
-    <div className={`app-shell${sideOpen ? ' side-open' : ''}`}>
+    <div className={`app-shell${sideOpen ? ' side-open' : ''}${navCollapsed ? ' nav-col-collapsed' : ''}`}>
 
       {/* ── TitleBar: row 1, all columns ── */}
       <TitleBar symbol={symbol} account={account} />
@@ -133,6 +134,7 @@ export default function App() {
 
       {/* ── Main content: row 2, col 3 ── */}
       <main className="main">
+        <NewsTicker />
 
         {railTab === 'chart' && (
           <>
@@ -232,6 +234,9 @@ export default function App() {
         {railTab === 'holdings' && (
           <Holdings
             onSelectSymbol={(sym) => { setSymbol(sym); setRailTab('chart') }}
+            portfolioId={portfolioId}
+            positions={positions}
+            onRefresh={refresh}
           />
         )}
 

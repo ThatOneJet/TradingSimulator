@@ -38,9 +38,11 @@ function sentimentColor(label) {
 const GENERAL_TOPICS = ['technology', 'finance', 'earnings', 'macro']
 
 export default function NewsWidget({ symbol }) {
-  const [mode,     setMode]     = useState('symbol') // 'symbol' | 'all'
-  const [articles, setArticles] = useState([])
-  const [loading,  setLoading]  = useState(false)
+  const [mode,        setMode]        = useState('symbol') // 'symbol' | 'all'
+  const [articles,    setArticles]    = useState([])
+  const [loading,     setLoading]     = useState(false)
+  const [spinning,    setSpinning]    = useState(false)
+  const [lastUpdated, setLastUpdated] = useState(null) // Date object
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -52,6 +54,7 @@ export default function NewsWidget({ symbol }) {
         res = await api.get('/news/general', { params: { topic: 'finance' } })
       }
       setArticles((res.data || []).slice(0, 5))
+      setLastUpdated(new Date())
     } catch {
       setArticles([])
     } finally {
@@ -59,14 +62,54 @@ export default function NewsWidget({ symbol }) {
     }
   }, [mode, symbol])
 
-  useEffect(() => { load() }, [load])
+  // Auto-refresh every 5 minutes
+  useEffect(() => {
+    load()
+    const id = setInterval(load, 5 * 60 * 1000)
+    return () => clearInterval(id)
+  }, [load])
+
+  // Manual refresh with brief spin animation
+  async function handleRefresh() {
+    setSpinning(true)
+    await load()
+    setTimeout(() => setSpinning(false), 600)
+  }
+
+  // "Updated X min ago" helper
+  function updatedAgo() {
+    if (!lastUpdated) return ''
+    const diff = Math.floor((Date.now() - lastUpdated.getTime()) / 60000)
+    if (diff < 1) return 'Updated just now'
+    return `Updated ${diff} min ago`
+  }
 
   return (
     <div className="widget" style={{ padding: '12px 14px' }}>
       {/* Header row */}
       <div className="widget-hd" style={{ marginBottom: 10, justifyContent: 'space-between' }}>
         <span>Market News</span>
-        <div style={{ display: 'flex', gap: 4 }}>
+        <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+          {/* Manual refresh button */}
+          <button
+            onClick={handleRefresh}
+            title="Refresh news"
+            style={{
+              background:   'transparent',
+              border:       'none',
+              color:        'var(--t-3)',
+              cursor:       'pointer',
+              fontSize:     13,
+              lineHeight:   1,
+              padding:      '1px 4px',
+              display:      'flex',
+              alignItems:   'center',
+              transform:    spinning ? 'rotate(360deg)' : 'rotate(0deg)',
+              transition:   'transform .6s ease, color .15s',
+            }}
+          >
+            ↻
+          </button>
           <button
             onClick={() => setMode('symbol')}
             style={{
@@ -179,6 +222,18 @@ export default function NewsWidget({ symbol }) {
           </div>
         ))}
       </div>
+
+      {/* Last updated timestamp */}
+      {lastUpdated && !loading && (
+        <div style={{
+          marginTop:  8,
+          fontSize:   9,
+          color:      'var(--t-4)',
+          textAlign:  'right',
+        }}>
+          {updatedAgo()}
+        </div>
+      )}
     </div>
   )
 }

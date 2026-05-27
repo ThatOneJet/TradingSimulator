@@ -18,7 +18,7 @@ export default function OrderBook({ symbol, quote }) {
         </span>
         <span className="muted"> ({spreadPct}%)</span>
       </div>
-      <table className="ob-table" style={{ width: '100%' }}>
+      <table className="ob-table" style={{ width: '100%', tableLayout: 'fixed' }}>
         <thead>
           <tr>
             <th>Price</th><th>Size</th><th>Side</th>
@@ -26,14 +26,14 @@ export default function OrderBook({ symbol, quote }) {
         </thead>
         <tbody>
           <tr className="ob-ask">
-            <td className="mono err">{ask > 0 ? ask.toFixed(2) : '—'}</td>
-            <td className="mono">{askSz || '—'}</td>
-            <td style={{ color: 'var(--err)', fontSize: 10, letterSpacing: '0.06em' }}>ASK</td>
+            <td className="mono err" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ask > 0 ? ask.toFixed(2) : '—'}</td>
+            <td className="mono" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{askSz || '—'}</td>
+            <td style={{ color: 'var(--err)', fontSize: 10, letterSpacing: '0.06em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>ASK</td>
           </tr>
           <tr className="ob-bid">
-            <td className="mono ok">{bid > 0 ? bid.toFixed(2) : '—'}</td>
-            <td className="mono">{bidSz || '—'}</td>
-            <td style={{ color: 'var(--ok)', fontSize: 10, letterSpacing: '0.06em' }}>BID</td>
+            <td className="mono ok" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{bid > 0 ? bid.toFixed(2) : '—'}</td>
+            <td className="mono" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{bidSz || '—'}</td>
+            <td style={{ color: 'var(--ok)', fontSize: 10, letterSpacing: '0.06em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>BID</td>
           </tr>
         </tbody>
       </table>

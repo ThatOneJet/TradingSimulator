@@ -17,8 +17,8 @@ export default function Positions({ positions, onRefresh, portfolioId }) {
       {positions.length === 0
         ? <div className="empty-state">No open positions</div>
         : (
-          <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 220 }}>
-            <table className="pos-table" style={{ minWidth: 340 }}>
+          <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 220, width: '100%', display: 'block' }}>
+            <table className="pos-table" style={{ minWidth: 320 }}>
               <thead>
                 <tr>
                   <th>Symbol</th><th>Qty</th><th>Avg</th><th>Price</th><th>P&L</th><th />
