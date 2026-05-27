@@ -15,6 +15,7 @@ import NewsPage from './pages/NewsPage.jsx'
 import NewsWidget from './components/NewsWidget.jsx'
 import ExplorePage from './pages/ExplorePage.jsx'
 import ProjectionWidget from './components/ProjectionWidget.jsx'
+import Settings from './pages/Settings.jsx'
 import api from './api.js'
 
 const socket = io('http://localhost:8765')
@@ -29,6 +30,10 @@ export default function App() {
   const [user, setUser] = useState(() => {
     try { return JSON.parse(localStorage.getItem('ts_user')) } catch { return null }
   })
+
+  function handleUserUpdate(updated) {
+    setUser(updated)
+  }
 
   // ── UI state ──────────────────────────────────────────────────────────────
   const [sideOpen,     setSideOpen]     = useState(true)
@@ -233,6 +238,16 @@ export default function App() {
         {railTab === 'explore' && (
           <ExplorePage
             onSelectSymbol={(sym) => { setSymbol(sym); setRailTab('chart') }}
+          />
+        )}
+
+        {railTab === 'settings' && (
+          <Settings
+            user={user}
+            onUserUpdate={handleUserUpdate}
+            portfolioId={portfolioId}
+            onReset={refresh}
+            onLogout={() => { localStorage.removeItem('ts_user'); window.location.reload() }}
           />
         )}
 

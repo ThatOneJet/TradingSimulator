@@ -129,11 +129,11 @@ export default function Rail({ activeTab, onTabChange, sideOpen, onToggleSide, o
         <SidePanelIcon open={sideOpen} />
       </button>
 
-      {/* Settings (placeholder — no action yet) */}
+      {/* Settings */}
       <button
-        className="rail-btn"
+        className={`rail-btn${activeTab === 'settings' ? ' active' : ''}`}
         title="Settings"
-        onClick={() => {}}
+        onClick={() => onTabChange('settings')}
       >
         <SettingsIcon />
       </button>

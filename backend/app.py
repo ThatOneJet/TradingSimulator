@@ -513,6 +513,33 @@ def delete_portfolio(pid):
         conn.execute('DELETE FROM sim_trades WHERE portfolio_id = ?', (pid,))
     return jsonify({'status': 'deleted'})
 
+@app.route('/api/users/<int:uid>', methods=['PATCH'])
+def update_user(uid):
+    data = request.json or {}
+    fields, vals = [], []
+    if 'display_name' in data:
+        fields.append('display_name = ?')
+        vals.append(data['display_name'])
+    if 'avatar_color' in data:
+        fields.append('avatar_color = ?')
+        vals.append(data['avatar_color'])
+    if not fields:
+        return jsonify({'error': 'Nothing to update'}), 400
+    vals.append(uid)
+    with _get_db() as conn:
+        conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", vals)
+        row = conn.execute(
+            'SELECT id, username, display_name, avatar_color FROM users WHERE id = ?', (uid,)
+        ).fetchone()
+    if not row:
+        return jsonify({'error': 'User not found'}), 404
+    return jsonify({
+        'user_id':      row['id'],
+        'username':     row['username'],
+        'display_name': row['display_name'],
+        'avatar_color': row['avatar_color'],
+    })
+
 # ── Portfolio simulation routes (no Alpaca required) ──────────────────────────
 @app.route('/api/account')
 def account():
