@@ -1,0 +1,26 @@
+{
+  "name": "tradesimulator-desktop",
+  "version": "0.1.0",
+  "description": "TradeSimulator desktop app",
+  "main": "main.js",
+  "scripts": {
+    "dev":       "set TRADESIM_DEV=1 && electron .",
+    "build:win": "electron-builder --win --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron":         "^34.0.0",
+    "electron-builder": "^25.1.8",
+    "concurrently":     "^9.0.0"
+  },
+  "build": {
+    "appId":       "com.tradesimulator.app",
+    "productName": "TradeSimulator",
+    "directories": { "output": "../dist-electron" },
+    "files": ["main.js", "preload.cjs"],
+    "extraResources": [
+      { "from": "../backend", "to": "backend", "filter": ["**/*", "!__pycache__/**", "!*.pyc"] },
+      { "from": "../frontend/dist", "to": "frontend/dist" }
+    ],
+    "win": { "target": "nsis" }
+  }
+}

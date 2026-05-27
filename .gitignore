@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Environment / secrets
+backend/.env
+backend/ticker_db.json
+backend/holdings.db
+
+# Node
+node_modules/
+frontend/node_modules/
+electron/node_modules/
+
+# Frontend build artifacts
+frontend/dist/
+
+# Electron build output
+electron/dist/
+electron/out/
+
+# Electron/Chromium cache
+.webview_data/
+*.dat
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

@@ -1,0 +1,9 @@
+flask
+flask-socketio
+flask-cors
+alpaca-py
+python-dotenv
+eventlet
+yfinance
+requests
+websocket-client
