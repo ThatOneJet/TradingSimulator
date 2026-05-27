@@ -1067,6 +1067,76 @@ def _fetch_news_polygon(symbol: str = '') -> list:
         print(f'[TradeSimulator] Polygon news fetch failed: {e}')
         return []
 
+def _yf_news_to_articles(raw: list) -> list:
+    """Normalize yfinance Ticker.news items to the app's article format."""
+    from datetime import datetime
+    result = []
+    for item in raw:
+        c = item.get('content', {})
+        title = c.get('title', '')
+        if not title:
+            continue
+        pub_date = c.get('pubDate', '')
+        try:
+            dt = datetime.fromisoformat(pub_date.replace('Z', '+00:00'))
+            published = dt.strftime('%Y%m%dT%H%M%S')
+        except Exception:
+            published = ''
+        thumb = c.get('thumbnail') or {}
+        banner = ''
+        for res in thumb.get('resolutions', []):
+            if res.get('width', 9999) <= 500:
+                banner = res.get('url', '')
+                break
+        if not banner:
+            banner = thumb.get('originalUrl', '')
+        url = ((c.get('canonicalUrl') or {}).get('url')
+               or (c.get('clickThroughUrl') or {}).get('url', ''))
+        source = (c.get('provider') or {}).get('displayName', 'Yahoo Finance')
+        result.append({
+            'title':           title,
+            'summary':         (c.get('summary') or '')[:200],
+            'url':             url,
+            'source':          source,
+            'published':       published,
+            'sentiment_score': 0.0,
+            'sentiment_label': 'Neutral',
+            'banner_image':    banner,
+        })
+    return result
+
+def _fetch_news_yfinance(symbol: str) -> list:
+    """Fetch symbol news via yfinance — no API key needed."""
+    try:
+        import yfinance as yf
+        raw = yf.Ticker(symbol).news or []
+        return _yf_news_to_articles(raw[:15])
+    except Exception as e:
+        print(f'[TradeSimulator] yfinance symbol news failed ({symbol}): {e}')
+        return []
+
+def _fetch_general_news_yfinance() -> list:
+    """Aggregate general market news from major tickers via yfinance."""
+    try:
+        import yfinance as yf
+        tickers = ['AAPL', 'NVDA', 'MSFT', 'AMZN', 'GOOGL', 'META', 'TSLA', 'SPY', 'QQQ']
+        seen, result = set(), []
+        for sym in tickers:
+            if len(result) >= 20:
+                break
+            try:
+                raw = yf.Ticker(sym).news or []
+                for art in _yf_news_to_articles(raw[:5]):
+                    if art['title'] not in seen:
+                        seen.add(art['title'])
+                        result.append(art)
+            except Exception:
+                continue
+        return result
+    except Exception as e:
+        print(f'[TradeSimulator] yfinance general news failed: {e}')
+        return []
+
 @app.route('/api/news/<symbol>')
 def get_news_symbol(symbol):
     symbol = symbol.upper()
@@ -1076,7 +1146,7 @@ def get_news_symbol(symbol):
         items, ts = _news_cache[cache_key]
         if now - ts < _NEWS_TTL:
             return jsonify(items)
-    items = _fetch_news_av(symbol) or _fetch_news_polygon(symbol)
+    items = _fetch_news_av(symbol) or _fetch_news_polygon(symbol) or _fetch_news_yfinance(symbol)
     _news_cache[cache_key] = (items, now)
     return jsonify(items)
 
@@ -1089,7 +1159,9 @@ def get_news_general():
         items, ts = _news_cache[cache_key]
         if now - ts < _NEWS_TTL:
             return jsonify(items)
-    items = _fetch_news_av(topics=f'{topic},finance') or _fetch_news_polygon()
+    items = (_fetch_news_av(topics=f'{topic},finance')
+             or _fetch_news_polygon()
+             or _fetch_general_news_yfinance())
     _news_cache[cache_key] = (items, now)
     return jsonify(items)
 

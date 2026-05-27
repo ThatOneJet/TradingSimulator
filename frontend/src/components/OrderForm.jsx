@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import api from '../api.js'
 
-export default function OrderForm({ symbol, account, onOrderPlaced, portfolioId }) {
+export default function OrderForm({ symbol, account, onOrderPlaced, portfolioId, quote }) {
   const [qty,        setQty]        = useState('')
   const [side,       setSide]       = useState('buy')
   const [orderType,  setOrderType]  = useState('market')
@@ -27,7 +27,19 @@ export default function OrderForm({ symbol, account, onOrderPlaced, portfolioId 
     setLoading(false)
   }
 
-  const estCost = account && qty ? (Number(qty) * (orderType === 'limit' && limitPrice ? Number(limitPrice) : 0)).toFixed(2) : null
+  // Live cost estimate
+  const marketPrice = quote
+    ? (side === 'buy' ? quote.ask : quote.bid)
+    : null
+  const effectivePrice = (orderType === 'limit' && limitPrice)
+    ? Number(limitPrice)
+    : marketPrice
+  const shares        = Number(qty)
+  const estimatedCost = (shares > 0 && effectivePrice > 0) ? shares * effectivePrice : null
+  const buyingPower   = account ? Number(account.buying_power) : null
+  const overBudget    = side === 'buy' && estimatedCost != null && buyingPower != null && estimatedCost > buyingPower
+
+  const fmt = (n) => n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
   return (
     <form className="card order-form" onSubmit={submit}>
@@ -49,7 +61,34 @@ export default function OrderForm({ symbol, account, onOrderPlaced, portfolioId 
           <label>Limit Price<input type="number" step="0.01" value={limitPrice} onChange={e => setLimitPrice(e.target.value)} placeholder="0.00" /></label>
         )}
       </div>
-      {account && <div className="of-meta">Available: <span className="mono">${Number(account.buying_power).toLocaleString('en-US',{maximumFractionDigits:0})}</span></div>}
+
+      {/* Live cost estimate */}
+      <div className="of-cost-block">
+        {effectivePrice != null && effectivePrice > 0 && (
+          <div className="of-cost-row">
+            <span className="of-cost-label">@ price</span>
+            <span className="of-cost-price mono">${fmt(effectivePrice)}</span>
+          </div>
+        )}
+        {estimatedCost != null && (
+          <div className="of-cost-row of-cost-total">
+            <span className="of-cost-label">{side === 'buy' ? 'Est. Cost' : 'Est. Proceeds'}</span>
+            <span className={`of-cost-value mono${overBudget ? ' err' : ''}`}>
+              ${fmt(estimatedCost)}
+            </span>
+          </div>
+        )}
+        {account && (
+          <div className="of-cost-row">
+            <span className="of-cost-label">Available</span>
+            <span className={`of-cost-avail mono${overBudget ? ' err' : ''}`}>
+              ${Number(account.buying_power).toLocaleString('en-US', { maximumFractionDigits: 0 })}
+              {overBudget && <span className="of-cost-warn"> — insufficient</span>}
+            </span>
+          </div>
+        )}
+      </div>
+
       {status?.err && <div className="of-err">{status.err}</div>}
       {status?.ok  && <div className="of-ok">{status.ok}</div>}
       <button type="submit" className={`of-submit ${side === 'buy' ? 'buy' : 'sell'}`} disabled={loading}>

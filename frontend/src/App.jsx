@@ -222,6 +222,7 @@ export default function App() {
                 account={account}
                 onOrderPlaced={refresh}
                 portfolioId={portfolioId}
+                quote={quote}
               />
             </div>
           </>

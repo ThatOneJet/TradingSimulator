@@ -510,6 +510,31 @@ body {
 .of-meta  { font-size: 11px; color: var(--t-3); margin-bottom: 8px; }
 .of-err   { font-size: 11px; color: var(--err); margin-bottom: 8px; }
 .of-ok    { font-size: 11px; color: var(--ok); margin-bottom: 8px; }
+
+/* Cost estimate block */
+.of-cost-block {
+  background: var(--bg-outside);
+  border: 1px solid var(--hairline-2);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.of-cost-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.of-cost-total { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--hairline); }
+.of-cost-label { font-size: 10px; color: var(--t-3); letter-spacing: 0.05em; }
+.of-cost-price { font-size: 11px; color: var(--t-2); }
+.of-cost-value { font-size: 13px; font-weight: 700; color: var(--ok); }
+.of-cost-value.err { color: var(--err); }
+.of-cost-avail { font-size: 11px; color: var(--t-2); }
+.of-cost-avail.err { color: var(--err); }
+.of-cost-warn  { font-size: 10px; color: var(--err); }
 .of-submit {
   width: 100%; padding: 10px; border: none; border-radius: 5px;
   font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity .15s;
