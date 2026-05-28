@@ -2,19 +2,19 @@ import { useState, useEffect, useCallback } from 'react'
 import { io } from 'socket.io-client'
 import TitleBar from './components/TitleBar.jsx'
 import Rail from './components/Rail.jsx'
-import NavSidebar from './components/NavSidebar.jsx'
+import Watchlist from './components/Watchlist.jsx'
+// NavSidebar no longer rendered — watchlist moved to left widget column
 import Chart from './components/Chart.jsx'
-import OrderForm from './components/OrderForm.jsx'
-import OrderBook from './components/OrderBook.jsx'
-import Portfolio from './components/Portfolio.jsx'
+import TradePanel from './components/TradePanel.jsx'
 import Positions from './components/Positions.jsx'
 import Holdings from './components/Holdings.jsx'
 import Login from './pages/Login.jsx'
 import PortfolioTabs from './components/PortfolioTabs.jsx'
 import NewsPage from './pages/NewsPage.jsx'
-import NewsWidget from './components/NewsWidget.jsx'
+import SetupGuideWidget from './components/SetupGuideWidget.jsx'
 import ExplorePage from './pages/ExplorePage.jsx'
-import ProjectionWidget from './components/ProjectionWidget.jsx'
+import MarketsPage from './pages/MarketsPage.jsx'
+import AnalysisPanel from './components/AnalysisPanel.jsx'
 import Settings from './pages/Settings.jsx'
 import NewsTicker from './components/NewsTicker.jsx'
 import api from './api.js'
@@ -37,9 +37,9 @@ export default function App() {
   }
 
   // ── UI state ──────────────────────────────────────────────────────────────
-  const [sideOpen,     setSideOpen]     = useState(true)
-  const [navCollapsed, setNavCollapsed] = useState(false)
-  const [railTab,      setRailTab]      = useState('chart') // 'chart' | 'news' | 'holdings' | 'explore'
+  const [railOpen,    setRailOpen]    = useState(false)
+  const [widgetsOpen, setWidgetsOpen] = useState(true)
+  const [railTab,     setRailTab]     = useState('chart')
 
   // ── Trading state ─────────────────────────────────────────────────────────
   const [symbol,    setSymbol]    = useState('AAPL')
@@ -105,54 +105,97 @@ export default function App() {
   // ── Auth guard ────────────────────────────────────────────────────────────
   if (!user) return <Login onLogin={setUser} />
 
-  const midPrice = quote ? ((quote.bid + quote.ask) / 2).toFixed(2) : null
+  const midPrice = quote
+    ? ((quote.bid + quote.ask) / 2).toFixed(2)
+    : delta?.bid
+      ? ((Number(delta.bid) + Number(delta.ask || delta.bid)) / 2).toFixed(2)
+      : null
+  const priceDelayed = !quote && delta?.delayed
+
+  // ── User initials helper ──────────────────────────────────────────────────
+  function userInitials(name) {
+    if (!name) return '?'
+    const parts = name.trim().split(/\s+/)
+    return parts.length >= 2
+      ? (parts[0][0] + parts[1][0]).toUpperCase()
+      : name.slice(0, 2).toUpperCase()
+  }
 
   return (
-    <div className={`app-shell${sideOpen ? ' side-open' : ''}${navCollapsed ? ' nav-col-collapsed' : ''}`}>
+    <div className={`app-shell${railOpen ? ' rail-open' : ''}${!widgetsOpen ? ' widgets-collapsed' : ''}`}>
 
       {/* ── TitleBar: row 1, all columns ── */}
       <TitleBar symbol={symbol} account={account} />
 
-      {/* ── Rail: row 2, col 1 ── */}
-      <Rail
-        activeTab={railTab}
-        onTabChange={setRailTab}
-        sideOpen={sideOpen}
-        onToggleSide={() => setSideOpen(s => !s)}
-      />
+      {/* ── Left widget stack: row 2, col 1 ── */}
+      <aside className="widgets-col">
+        {/* Scrollable content — footer stays pinned below */}
+        <div className="widgets-scroll">
+          <Watchlist
+            active={symbol}
+            onSelect={setSymbol}
+            socket={socket}
+            onWatchlistChange={setWatchlistSymbols}
+            portfolioId={portfolioId}
+            onPrioritySymbol={setSymbol}
+          />
+          <Positions positions={positions} onRefresh={refresh} portfolioId={portfolioId} />
+          <AnalysisPanel symbol={symbol} quote={quote} delta={delta} />
+          <SetupGuideWidget symbol={symbol} quote={quote} delta={delta} />
+        </div>
 
-      {/* ── NavSidebar: row 2, col 2 ── */}
-      <NavSidebar
-        active={symbol}
-        onSelect={setSymbol}
-        socket={socket}
-        user={user}
-        onWatchlistChange={setWatchlistSymbols}
-        onLogout={() => { localStorage.removeItem('ts_user'); window.location.reload() }}
-        onCollapseChange={(c) => setNavCollapsed(c)}
-      />
+        {/* User profile footer — always visible, never scrolls away */}
+        <div className="wl-user-foot">
+          <div
+            className="nav-foot-avatar"
+            style={{ background: user?.avatar_color || 'var(--acc)' }}
+            title={user?.username}
+          >
+            {userInitials(user?.username || '')}
+          </div>
+          <div className="nav-foot-text">
+            <span className="nav-foot-name">{user?.username || 'Trader'}</span>
+            <span className="nav-foot-plan">PAPER</span>
+          </div>
+          <button
+            className="nav-foot-logout"
+            title="Log out"
+            onClick={() => {
+              if (window.confirm('Sign out of TradeSimulator?')) {
+                localStorage.removeItem('ts_user')
+                window.location.reload()
+              }
+            }}
+          >⏻</button>
+        </div>
+      </aside>
 
-      {/* ── Main content: row 2, col 3 ── */}
+      {/* ── Main content: row 2, col 2 ── */}
       <main className="main">
-        <NewsTicker />
+        <NewsTicker onSelectSymbol={(sym) => { setSymbol(sym); setRailTab('chart') }} />
 
         {railTab === 'chart' && (
           <>
-            {/* Portfolio tabs row */}
             <PortfolioTabs
               portfolioId={portfolioId}
               onSwitch={setPortfolioId}
               userId={user?.user_id}
             />
 
-            {/* Chart header bar */}
             <div className="ch-header">
+              <button
+                className="ch-btn"
+                title={widgetsOpen ? 'Collapse panel' : 'Expand panel'}
+                onClick={() => setWidgetsOpen(o => !o)}
+                style={{ fontSize: 13, letterSpacing: '-0.5px', width: 26, flexShrink: 0 }}
+              >
+                {widgetsOpen ? '«' : '»'}
+              </button>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
                 <span className="chart-symbol">{symbol}</span>
                 {company?.name && company.name !== symbol && (
                   <span style={{ fontSize: 10, color: 'var(--t-3)', lineHeight: 1 }}>
-                    {company.name}
-                    {company.exchange ? ` · ${company.exchange}` : ''}
+                    {company.name}{company.exchange ? ` · ${company.exchange}` : ''}
                   </span>
                 )}
               </div>
@@ -162,6 +205,9 @@ export default function App() {
                   ${midPrice}
                   {quote?.spread != null && (
                     <span className="chart-spread"> spread ${Number(quote.spread).toFixed(2)}</span>
+                  )}
+                  {priceDelayed && (
+                    <span style={{ fontSize: 9, color: 'var(--warn)', marginLeft: 5, opacity: 0.7 }}>delayed</span>
                   )}
                 </span>
               )}
@@ -173,65 +219,43 @@ export default function App() {
                 </span>
               )}
 
-              {/* Timeframe buttons */}
               <div className="tf-group">
                 {Object.keys(TF_LABELS).map(tf => (
                   <button
                     key={tf}
                     className={`tf-btn${timeframe === tf ? ' active' : ''}`}
                     onClick={() => setTimeframe(tf)}
-                  >
-                    {TF_LABELS[tf]}
-                  </button>
+                  >{TF_LABELS[tf]}</button>
                 ))}
               </div>
 
-              {/* Overlay toggles */}
               <div className="overlay-group">
-                {['SMA20', 'SMA50', 'Proj', 'RSI'].map(o => (
-                  <button
-                    key={o}
-                    className={`tf-btn${overlays.has(o) ? ' active' : ''}`}
-                    onClick={() => toggleOverlay(o)}
-                  >
-                    {o}
-                  </button>
+                {['SMA20', 'SMA50', 'BB', 'VWAP', 'Proj'].map(o => (
+                  <button key={o} className={`tf-btn${overlays.has(o) ? ' active' : ''}`} onClick={() => toggleOverlay(o)}>{o}</button>
+                ))}
+                <span className="overlay-divider" />
+                {['MACD', 'RSI', 'Stoch'].map(o => (
+                  <button key={o} className={`tf-btn indicator-btn${overlays.has(o) ? ' active' : ''}`} onClick={() => toggleOverlay(o)}>{o}</button>
                 ))}
               </div>
-
-              {/* Toggle side panel */}
-              <button
-                className="ch-btn"
-                title={sideOpen ? 'Hide panel' : 'Show panel'}
-                onClick={() => setSideOpen(s => !s)}
-              >
-                ⊞
-              </button>
             </div>
 
-            {/* Chart + order form */}
             <div className="ch-body">
-              <Chart
-                symbol={symbol}
-                timeframe={timeframe}
-                socket={socket}
-                overlays={overlays}
-              />
-              <OrderForm
+              <Chart symbol={symbol} timeframe={timeframe} socket={socket} overlays={overlays} />
+              <TradePanel
                 symbol={symbol}
                 account={account}
+                positions={positions}
                 onOrderPlaced={refresh}
                 portfolioId={portfolioId}
                 quote={quote}
+                onReset={refresh}
               />
             </div>
           </>
         )}
 
-        {railTab === 'news' && (
-          <NewsPage symbol={symbol} watchlist={watchlistSymbols} />
-        )}
-
+        {railTab === 'news'     && <NewsPage symbol={symbol} watchlist={watchlistSymbols} positions={positions} />}
         {railTab === 'holdings' && (
           <Holdings
             onSelectSymbol={(sym) => { setSymbol(sym); setRailTab('chart') }}
@@ -240,13 +264,15 @@ export default function App() {
             onRefresh={refresh}
           />
         )}
-
-        {railTab === 'explore' && (
-          <ExplorePage
+        {railTab === 'explore'  && (
+          <ExplorePage onSelectSymbol={(sym) => { setSymbol(sym); setRailTab('chart') }} />
+        )}
+        {railTab === 'markets'  && (
+          <MarketsPage
+            symbol={symbol}
             onSelectSymbol={(sym) => { setSymbol(sym); setRailTab('chart') }}
           />
         )}
-
         {railTab === 'settings' && (
           <Settings
             user={user}
@@ -256,19 +282,15 @@ export default function App() {
             onLogout={() => { localStorage.removeItem('ts_user'); window.location.reload() }}
           />
         )}
-
       </main>
 
-      {/* ── Side panel: row 2, col 4 ── */}
-      {sideOpen && (
-        <aside className="side">
-          <Portfolio account={account} onReset={refresh} portfolioId={portfolioId} />
-          <Positions positions={positions} onRefresh={refresh} portfolioId={portfolioId} />
-          <OrderBook symbol={symbol} quote={quote} />
-          <ProjectionWidget symbol={symbol} />
-          <NewsWidget symbol={symbol} />
-        </aside>
-      )}
+      {/* ── Right rail: row 2, col 3 ── */}
+      <Rail
+        activeTab={railTab}
+        onTabChange={setRailTab}
+        sideOpen={railOpen}
+        onToggleSide={() => setRailOpen(s => !s)}
+      />
 
     </div>
   )

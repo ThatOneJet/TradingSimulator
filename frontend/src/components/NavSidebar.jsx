@@ -19,17 +19,26 @@ function userInitials(username) {
   return username.slice(0, 2).toUpperCase()
 }
 
+function ChevronIcon({ open }) {
+  return (
+    <svg className={`nav-head-chev${open ? ' open' : ''}`} viewBox="0 0 12 12" fill="none">
+      <polyline points="4,2 8,6 4,10" stroke="currentColor" strokeWidth="1.4"
+        strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  )
+}
+
 export default function NavSidebar({
-  // collapsed / onCollapse kept as optional for backward-compat but no longer used
   active,
   onSelect,
   socket,
   user,
   onWatchlistChange,
   onLogout,
-  onCollapseChange,  // NEW: called with boolean whenever collapsed state changes
+  onCollapseChange,
 }) {
   const [collapsed, setCollapsed] = useState(true)
+  const [wlOpen, setWlOpen] = useState(true)   // watchlist widget open/closed
   const [items, setItems] = useState([])
   const leaveTimer = useRef(null)
 
@@ -110,13 +119,17 @@ export default function NavSidebar({
       onMouseLeave={handleMouseLeave}
     >
 
-      {/* ── Header row ── */}
-      <div className="nav-head">
+      {/* ── Watchlist widget header ── */}
+      <div className="nav-head" onClick={() => !collapsed && setWlOpen(o => !o)}>
+        <ChevronIcon open={wlOpen && !collapsed} />
         <span className="nav-head-text">Watchlist</span>
+        {!collapsed && items.length > 0 && (
+          <span className="nav-head-badge">{items.length}</span>
+        )}
       </div>
 
-      {/* ── Symbol search (hidden when collapsed) ── */}
-      {!collapsed && (
+      {/* ── Symbol search (hidden when collapsed or widget closed) ── */}
+      {!collapsed && wlOpen && (
         <div className="nav-search">
           <SymbolSearch
             onSelect={addSymbol}
@@ -125,8 +138,8 @@ export default function NavSidebar({
         </div>
       )}
 
-      {/* ── Watchlist items ── */}
-      <div className="nav-items">
+      {/* ── Watchlist items (hidden when widget closed) ── */}
+      <div className={`nav-items${!wlOpen && !collapsed ? ' nav-items-hidden' : ''}`}>
         {items.map(it => (
           <div
             key={it.symbol}

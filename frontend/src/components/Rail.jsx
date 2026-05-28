@@ -5,7 +5,7 @@ function LogoIcon() {
     <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
       <circle cx="14" cy="14" r="13" fill="var(--acc)" opacity="0.15" stroke="var(--acc)" strokeWidth="1.5"/>
       <text x="14" y="18.5" textAnchor="middle" fontSize="13" fontWeight="700"
-        fontFamily="'Roboto Mono', monospace" fill="var(--acc)">T</text>
+        fontFamily="'JetBrains Mono', monospace" fill="var(--acc)">T</text>
     </svg>
   )
 }
@@ -64,6 +64,17 @@ function ExploreIcon() {
   )
 }
 
+function MarketsIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <circle cx="9" cy="9" r="7" stroke="currentColor" strokeWidth="1.4" fill="none"/>
+      <line x1="2" y1="9" x2="16" y2="9" stroke="currentColor" strokeWidth="1.2"/>
+      <path d="M9 2 C11.5 4.5 11.5 13.5 9 16" stroke="currentColor" strokeWidth="1.2" fill="none"/>
+      <path d="M9 2 C6.5 4.5 6.5 13.5 9 16" stroke="currentColor" strokeWidth="1.2" fill="none"/>
+    </svg>
+  )
+}
+
 function SettingsIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
@@ -115,6 +126,14 @@ export default function Rail({ activeTab, onTabChange, sideOpen, onToggleSide, o
         onClick={() => onTabChange('explore')}
       >
         <ExploreIcon />
+      </button>
+
+      <button
+        className={`rail-btn${activeTab === 'markets' ? ' active' : ''}`}
+        title="Markets"
+        onClick={() => onTabChange('markets')}
+      >
+        <MarketsIcon />
       </button>
 
       {/* Push remaining buttons to the bottom */}

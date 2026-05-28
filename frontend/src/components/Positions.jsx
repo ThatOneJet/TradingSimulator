@@ -1,6 +1,8 @@
 import api from '../api.js'
 
 export default function Positions({ positions, onRefresh, portfolioId }) {
+  const isReal = portfolioId === 0
+
   async function closePosition(symbol, qty) {
     try {
       await api.post('/orders', { symbol, qty, side: 'sell', type: 'market', portfolio_id: portfolioId || 1 })
@@ -11,17 +13,18 @@ export default function Positions({ positions, onRefresh, portfolioId }) {
   return (
     <div className="widget" style={{ padding: '12px 14px' }}>
       <div className="widget-hd">
-        Positions
+        {isReal ? 'Holdings' : 'Positions'}
         <span className="badge" style={{ marginLeft: 6 }}>{positions.length}</span>
       </div>
       {positions.length === 0
-        ? <div className="empty-state">No open positions</div>
+        ? <div className="empty-state">{isReal ? 'No holdings tracked' : 'No open positions'}</div>
         : (
           <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 220, width: '100%', display: 'block' }}>
-            <table className="pos-table" style={{ minWidth: 320 }}>
+            <table className="pos-table" style={{ minWidth: isReal ? 280 : 320 }}>
               <thead>
                 <tr>
-                  <th>Symbol</th><th>Qty</th><th>Avg</th><th>Price</th><th>P&L</th><th />
+                  <th>Symbol</th><th>Qty</th><th>Avg</th><th>Price</th><th>P&L</th>
+                  {!isReal && <th />}
                 </tr>
               </thead>
               <tbody>
@@ -35,9 +38,11 @@ export default function Positions({ positions, onRefresh, portfolioId }) {
                       {p.unrealized_pl >= 0 ? '+' : ''}{Number(p.unrealized_pl).toFixed(2)}
                       <span className="muted"> ({(p.unrealized_plpc * 100).toFixed(2)}%)</span>
                     </td>
-                    <td>
-                      <button className="close-btn" onClick={() => closePosition(p.symbol, p.qty)} title="Close">✕</button>
-                    </td>
+                    {!isReal && (
+                      <td>
+                        <button className="close-btn" onClick={() => closePosition(p.symbol, p.qty)} title="Close">✕</button>
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>

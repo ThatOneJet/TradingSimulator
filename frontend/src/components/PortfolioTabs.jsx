@@ -16,18 +16,22 @@ function fmtPnl(n) {
 
 // ── New Portfolio Form ──────────────────────────────────────────────────────
 function NewPortfolioForm({ onCancel, onCreate }) {
-  const [name, setName]         = useState('')
-  const [color, setColor]       = useState(PRESET_COLORS[0])
-  const [error, setError]       = useState('')
-  const [loading, setLoading]   = useState(false)
+  const [name,         setName]         = useState('')
+  const [color,        setColor]        = useState(PRESET_COLORS[0])
+  const [initialCash,  setInitialCash]  = useState('100000')
+  const [aiControlled, setAiControlled] = useState(false)
+  const [error,        setError]        = useState('')
+  const [loading,      setLoading]      = useState(false)
 
   async function handleSubmit(e) {
     e.preventDefault()
     setError('')
     if (!name.trim()) { setError('Name is required.'); return }
+    const cash = parseFloat(initialCash)
+    if (isNaN(cash) || cash < 100) { setError('Starting balance must be at least $100.'); return }
     setLoading(true)
     try {
-      await onCreate(name.trim(), color)
+      await onCreate(name.trim(), color, cash, aiControlled)
     } catch (err) {
       setError(err?.response?.data?.error || 'Failed to create portfolio.')
     } finally {
@@ -66,9 +70,35 @@ function NewPortfolioForm({ onCancel, onCreate }) {
           color: 'var(--t-1)',
           fontFamily: 'var(--font-sans)',
           outline: 'none',
-          width: 160,
+          width: 140,
         }}
       />
+
+      {/* Starting balance */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+        <span style={{ fontSize: 11, color: 'var(--t-3)', fontFamily: 'var(--font-mono)' }}>$</span>
+        <input
+          type="number"
+          value={initialCash}
+          onChange={e => setInitialCash(e.target.value)}
+          min={100}
+          max={10000000}
+          step={1000}
+          placeholder="100000"
+          title="Starting balance"
+          style={{
+            background: 'var(--bg-input)',
+            border: '1px solid var(--hairline-2)',
+            borderRadius: 6,
+            padding: '6px 8px',
+            fontSize: 12,
+            color: 'var(--t-1)',
+            fontFamily: 'var(--font-mono)',
+            outline: 'none',
+            width: 90,
+          }}
+        />
+      </div>
 
       {/* Color presets */}
       <div style={{ display: 'flex', gap: 5, alignItems: 'center' }}>
@@ -93,7 +123,6 @@ function NewPortfolioForm({ onCancel, onCreate }) {
             }}
           />
         ))}
-        {/* Native color picker fallback */}
         <input
           type="color"
           value={color}
@@ -110,6 +139,48 @@ function NewPortfolioForm({ onCancel, onCreate }) {
           }}
         />
       </div>
+
+      {/* AI toggle */}
+      <label
+        title="Let the AI autonomously trade this portfolio based on technical indicators"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 5,
+          cursor: 'pointer',
+          userSelect: 'none',
+          flexShrink: 0,
+        }}
+      >
+        <div
+          onClick={() => setAiControlled(v => !v)}
+          style={{
+            width: 28,
+            height: 16,
+            borderRadius: 8,
+            background: aiControlled ? '#b39dff' : 'var(--hairline-3)',
+            position: 'relative',
+            transition: 'background .2s',
+            flexShrink: 0,
+            cursor: 'pointer',
+          }}
+        >
+          <div style={{
+            position: 'absolute',
+            top: 2,
+            left: aiControlled ? 14 : 2,
+            width: 12,
+            height: 12,
+            borderRadius: '50%',
+            background: '#fff',
+            transition: 'left .2s',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.4)',
+          }} />
+        </div>
+        <span style={{ fontSize: 11, color: aiControlled ? '#b39dff' : 'var(--t-3)', fontWeight: aiControlled ? 700 : 400, transition: 'color .2s' }}>
+          AI Managed
+        </span>
+      </label>
 
       {error && (
         <span style={{ color: 'var(--err)', fontSize: 11 }}>{error}</span>
@@ -137,7 +208,7 @@ function NewPortfolioForm({ onCancel, onCreate }) {
           disabled={loading}
           style={{
             padding: '5px 14px',
-            background: 'var(--acc)',
+            background: aiControlled ? '#b39dff' : 'var(--acc)',
             border: 'none',
             borderRadius: 6,
             color: '#fff',
@@ -210,8 +281,26 @@ function PortfolioCard({ portfolio, account, isActive, onClick, onDelete, canDel
 
       {/* Name + numbers */}
       <span style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-        <span style={{ fontSize: 12, fontWeight: 600, color: isActive ? 'var(--t-1)' : 'var(--t-2)' }}>
-          {portfolio.name}
+        <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+          <span style={{ fontSize: 12, fontWeight: 600, color: isActive ? 'var(--t-1)' : 'var(--t-2)' }}>
+            {portfolio.name}
+          </span>
+          {portfolio.ai_controlled ? (
+            <span style={{
+              fontSize: 9,
+              fontWeight: 700,
+              letterSpacing: '0.06em',
+              color: '#b39dff',
+              background: 'rgba(179,157,255,0.12)',
+              border: '1px solid rgba(179,157,255,0.3)',
+              borderRadius: 3,
+              padding: '1px 4px',
+              lineHeight: 1,
+              flexShrink: 0,
+            }}>
+              AI
+            </span>
+          ) : null}
         </span>
         <span style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
           <span style={{ fontSize: 11, color: 'var(--t-2)', fontFamily: 'var(--font-mono)' }}>
@@ -259,7 +348,7 @@ function PortfolioCard({ portfolio, account, isActive, onClick, onDelete, canDel
 // ── Main Component ──────────────────────────────────────────────────────────
 export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
   const [portfolios, setPortfolios] = useState([])
-  const [accounts, setAccounts]     = useState({})   // { [portfolioId]: accountData }
+  const [accounts, setAccounts]     = useState({})
   const [showForm, setShowForm]     = useState(false)
   const [loading, setLoading]       = useState(true)
 
@@ -270,14 +359,16 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
       const { data: ports } = await api.get(`/portfolios?user_id=${userId}`)
       setPortfolios(ports)
 
-      // Load account data for all portfolios in parallel
-      const results = await Promise.all(
-        ports.map(p =>
+      const results = await Promise.all([
+        api.get('/account?portfolio_id=0')
+          .then(r => ({ id: 0, data: r.data }))
+          .catch(() => ({ id: 0, data: null })),
+        ...ports.map(p =>
           api.get(`/account?portfolio_id=${p.id}`)
             .then(r => ({ id: p.id, data: r.data }))
             .catch(() => ({ id: p.id, data: null }))
-        )
-      )
+        ),
+      ])
       const map = {}
       results.forEach(r => { map[r.id] = r.data })
       setAccounts(map)
@@ -292,7 +383,6 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
     loadAll()
   }, [loadAll])
 
-  // Reload account data for the active portfolio when portfolioId changes from outside
   useEffect(() => {
     if (!portfolioId) return
     api.get(`/account?portfolio_id=${portfolioId}`)
@@ -300,8 +390,12 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
       .catch(() => {})
   }, [portfolioId])
 
-  async function handleCreate(name, color) {
-    const { data } = await api.post('/portfolios', { user_id: userId, name, color })
+  async function handleCreate(name, color, initialCash, aiControlled) {
+    const { data } = await api.post('/portfolios', {
+      user_id: userId, name, color,
+      initial_cash: initialCash,
+      ai_controlled: aiControlled,
+    })
     setShowForm(false)
     await loadAll()
     onSwitch(data.id)
@@ -314,7 +408,6 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
       await api.delete(`/portfolios/${id}`)
       const remaining = portfolios.filter(p => p.id !== id)
       await loadAll()
-      // If deleted portfolio was active, switch to first remaining
       if (portfolioId === id && remaining.length > 0) {
         onSwitch(remaining[0].id)
       }
@@ -328,7 +421,6 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
-      {/* Tab row */}
       <div
         className="portfolio-tabs"
         style={{
@@ -347,6 +439,16 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
           <span style={{ color: 'var(--t-4)', fontSize: 11 }}>Loading…</span>
         )}
 
+        <PortfolioCard
+          key={0}
+          portfolio={{ id: 0, name: 'Real Holdings', color: '#3ddc97' }}
+          account={accounts[0]}
+          isActive={portfolioId === 0}
+          onClick={() => onSwitch(0)}
+          onDelete={null}
+          canDelete={false}
+        />
+
         {portfolios.map(p => (
           <PortfolioCard
             key={p.id}
@@ -359,7 +461,6 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
           />
         ))}
 
-        {/* Add portfolio button */}
         <button
           type="button"
           onClick={() => setShowForm(v => !v)}
@@ -388,7 +489,6 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
         </button>
       </div>
 
-      {/* Inline new-portfolio form */}
       {showForm && (
         <NewPortfolioForm
           onCancel={() => setShowForm(false)}

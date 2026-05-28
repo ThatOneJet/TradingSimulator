@@ -28,36 +28,61 @@ export default function Portfolio({ account, onReset, portfolioId }) {
     </div>
   )
 
-  const pnlColor = account.pnl_day >= 0 ? 'var(--ok)' : 'var(--err)'
+  const isReal   = account.is_real
   const fmt = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  const pnl      = isReal ? account.pnl : account.pnl_day
+  const pnlColor = pnl != null && pnl >= 0 ? 'var(--ok)' : 'var(--err)'
 
   return (
     <div className="widget">
       <div className="widget-hd">
-        Portfolio
-        <button className="pf-reset-btn" onClick={handleReset} disabled={resetting} style={{ marginLeft: 'auto' }}>
-          {resetting ? '…' : 'Reset'}
-        </button>
+        {isReal ? 'Real Holdings' : 'Portfolio'}
+        {!isReal && (
+          <button className="pf-reset-btn" onClick={handleReset} disabled={resetting} style={{ marginLeft: 'auto' }}>
+            {resetting ? '…' : 'Reset'}
+          </button>
+        )}
+        {isReal && (
+          <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--ok)', fontFamily: 'var(--font-mono)', opacity: 0.8 }}>
+            READ-ONLY
+          </span>
+        )}
       </div>
       <div className="pf-metrics">
         <div className="pf-metric">
-          <span className="lbl">EQUITY</span>
+          <span className="lbl">MARKET VALUE</span>
           <span className="val mono">${fmt(account.equity)}</span>
         </div>
+        {isReal ? (
+          <div className="pf-metric">
+            <span className="lbl">COST BASIS</span>
+            <span className="val mono">${fmt(account.initial_cost ?? 0)}</span>
+          </div>
+        ) : (
+          <div className="pf-metric">
+            <span className="lbl">CASH</span>
+            <span className="val mono">${fmt(account.cash)}</span>
+          </div>
+        )}
         <div className="pf-metric">
-          <span className="lbl">CASH</span>
-          <span className="val mono">${fmt(account.cash)}</span>
-        </div>
-        <div className="pf-metric">
-          <span className="lbl">DAY P&L</span>
+          <span className="lbl">{isReal ? 'TOTAL P&L' : 'DAY P&L'}</span>
           <span className="val mono" style={{ color: pnlColor }}>
-            {account.pnl_day >= 0 ? '+' : ''}${fmt(account.pnl_day)}
+            {pnl != null ? `${pnl >= 0 ? '+' : ''}$${fmt(pnl)}` : '—'}
           </span>
         </div>
-        <div className="pf-metric">
-          <span className="lbl">BUYING PWR</span>
-          <span className="val mono">${fmt(account.buying_power)}</span>
-        </div>
+        {isReal ? (
+          <div className="pf-metric">
+            <span className="lbl">RETURN</span>
+            <span className="val mono" style={{ color: pnlColor }}>
+              {account.pnl_pct != null ? `${account.pnl_pct >= 0 ? '+' : ''}${Number(account.pnl_pct).toFixed(2)}%` : '—'}
+            </span>
+          </div>
+        ) : (
+          <div className="pf-metric">
+            <span className="lbl">BUYING PWR</span>
+            <span className="val mono">${fmt(account.buying_power)}</span>
+          </div>
+        )}
       </div>
       {msg && <div className="pf-msg">{msg}</div>}
     </div>

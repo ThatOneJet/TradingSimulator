@@ -1,4 +1,4 @@
-import os, threading, sqlite3, time as _time, json as _json, csv, io, hashlib
+import os, threading, sqlite3, time as _time, json as _json, csv, io, hashlib, random
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory
@@ -17,13 +17,15 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 API_KEY    = os.getenv('ALPACA_API_KEY',    '')
 SECRET_KEY = os.getenv('ALPACA_SECRET_KEY', '')
 AV_KEY     = os.getenv('ALPHA_VANTAGE_KEY', '')
-POLYGON_KEY = os.getenv('POLYGON_KEY', '')
+POLYGON_KEY  = os.getenv('POLYGON_KEY',  '')
+FINNHUB_KEY  = os.getenv('FINNHUB_KEY',  '')
 
-KEYS_SET    = bool(API_KEY and SECRET_KEY
-                   and API_KEY    != 'your_api_key_here'
-                   and SECRET_KEY != 'your_secret_key_here')
-AV_KEYS_SET     = bool(AV_KEY     and AV_KEY     != 'your_alpha_vantage_key_here')
-POLYGON_KEYS_SET = bool(POLYGON_KEY and POLYGON_KEY != 'your_polygon_key_here')
+KEYS_SET         = bool(API_KEY and SECRET_KEY
+                        and API_KEY    != 'your_api_key_here'
+                        and SECRET_KEY != 'your_secret_key_here')
+AV_KEYS_SET      = bool(AV_KEY      and AV_KEY      != 'your_alpha_vantage_key_here')
+POLYGON_KEYS_SET = bool(POLYGON_KEY  and POLYGON_KEY != 'your_polygon_key_here')
+FINNHUB_KEYS_SET = bool(FINNHUB_KEY  and FINNHUB_KEY != 'your_finnhub_key_here')
 
 app      = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}, r"/socket.io/*": {"origins": "*"}})
@@ -121,12 +123,52 @@ def _init_db():
             except Exception:
                 pass  # column already exists
 
+        # Per-portfolio watchlist table
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS watchlist_items (
+                portfolio_id INTEGER NOT NULL,
+                symbol       TEXT    NOT NULL,
+                PRIMARY KEY (portfolio_id, symbol)
+            )
+        ''')
+
         # Seed default user and portfolio so existing data still works
         conn.execute("INSERT OR IGNORE INTO users (id, username, pw_hash, display_name) VALUES (1, 'default', '', 'Default')")
         conn.execute("INSERT OR IGNORE INTO portfolios (id, user_id, name) VALUES (1, 1, 'Main Portfolio')")
 
         # Ensure sim_state row 1 has portfolio_id = 1
         conn.execute("UPDATE sim_state SET portfolio_id = 1 WHERE id = 1 AND portfolio_id != 1")
+
+        # Safe migration: add priority column if not present
+        try:
+            conn.execute('ALTER TABLE watchlist_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0')
+        except Exception:
+            pass
+
+        # Safe migration: AI-controlled flag on portfolios
+        try:
+            conn.execute('ALTER TABLE portfolios ADD COLUMN ai_controlled INTEGER NOT NULL DEFAULT 0')
+        except Exception:
+            pass
+
+        # AI trade log
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS ai_log (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id INTEGER NOT NULL,
+                symbol       TEXT    NOT NULL,
+                action       TEXT    NOT NULL,
+                score        REAL,
+                price        REAL,
+                shares       REAL,
+                reason       TEXT,
+                created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        ''')
+
+        # Seed default watchlist for portfolio 1
+        for _sym in ('AAPL', 'TSLA', 'NVDA', 'SPY'):
+            conn.execute('INSERT OR IGNORE INTO watchlist_items (portfolio_id, symbol) VALUES (1, ?)', (_sym,))
 
 _init_db()
 
@@ -138,6 +180,7 @@ _price_cache: dict[str, tuple[float, float]] = {}
 _PRICE_TTL = 30
 _quote_cache: dict[str, tuple[dict, float]] = {}
 _QUOTE_TTL  = 60
+_subscribed_symbols: set = set()
 
 def _fetch_price_live(symbol: str) -> float:
     # Always use yfinance for simulation prices — no Alpaca dependency
@@ -221,6 +264,42 @@ def _sim_sell(symbol: str, qty: float, price: float, portfolio_id: int = 1) -> f
                 (new_shares, realized_pl, symbol, portfolio_id)
             )
         return realized_pl
+
+def _real_holdings_with_prices() -> list[dict]:
+    with _get_db() as conn:
+        rows = conn.execute(
+            'SELECT symbol, shares, buy_price FROM holdings WHERE shares > 0'
+        ).fetchall()
+    out = []
+    for row in rows:
+        symbol = row['symbol']
+        qty    = float(row['shares'])
+        avg    = float(row['buy_price'])
+        price  = _get_current_price(symbol)
+        prev_close = None
+        try:
+            if FINNHUB_KEYS_SET:
+                q = _quote_finnhub(symbol)
+                price      = q['bid']
+                prev_close = q.get('prev_close')
+        except Exception:
+            pass
+        mv    = price * qty
+        upl   = (price - avg) * qty
+        day_pl = round((price - prev_close) * qty, 2) if prev_close and prev_close > 0 else None
+        out.append({
+            'symbol':          symbol,
+            'qty':             qty,
+            'avg_entry_price': avg,
+            'current_price':   price,
+            'market_value':    round(mv, 2),
+            'unrealized_pl':   round(upl, 2),
+            'unrealized_plpc': (upl / (avg * qty)) if avg and qty else 0,
+            'side':            'long',
+            'day_pl':          day_pl,
+            'is_real':         True,
+        })
+    return out
 
 def _sim_positions_with_prices(portfolio_id: int = 1) -> list[dict]:
     with _get_db() as conn:
@@ -466,32 +545,38 @@ def get_portfolios():
     for row in rows:
         pid = row['id']
         result.append({
-            'id':    pid,
-            'name':  row['name'],
-            'color': row['color'],
+            'id':            pid,
+            'name':          row['name'],
+            'color':         row['color'],
+            'ai_controlled': int(row['ai_controlled']) if 'ai_controlled' in row.keys() else 0,
         })
     return jsonify(result)
 
 @app.route('/api/portfolios', methods=['POST'])
 def create_portfolio():
-    data    = request.json or {}
-    user_id = data.get('user_id', 1)
-    name    = data.get('name', 'New Portfolio').strip()
-    color   = data.get('color', '#ff6a1a')
+    data          = request.json or {}
+    user_id       = data.get('user_id', 1)
+    name          = data.get('name', 'New Portfolio').strip()
+    color         = data.get('color', '#ff6a1a')
+    initial_cash  = float(data.get('initial_cash', 100000))
+    ai_controlled = int(bool(data.get('ai_controlled', False)))
     if not name:
         return jsonify({'error': 'Name required'}), 400
+    if initial_cash < 100 or initial_cash > 10_000_000:
+        return jsonify({'error': 'Starting balance must be between $100 and $10,000,000'}), 400
     with _get_db() as conn:
         cur = conn.execute(
-            'INSERT INTO portfolios (user_id, name, color) VALUES (?,?,?)',
-            (user_id, name, color)
+            'INSERT INTO portfolios (user_id, name, color, ai_controlled) VALUES (?,?,?,?)',
+            (user_id, name, color, ai_controlled)
         )
         pid = cur.lastrowid
-        # Seed sim_state for this portfolio
+        # Seed sim_state for this portfolio with the chosen starting balance
         conn.execute(
-            "INSERT OR IGNORE INTO sim_state (id, cash, initial_cash, last_equity, reset_at, portfolio_id) VALUES (?,100000,100000,100000,datetime('now'),?)",
-            (pid + 1000, pid)   # offset id to avoid collision with default id=1
+            "INSERT OR IGNORE INTO sim_state (id, cash, initial_cash, last_equity, reset_at, portfolio_id) VALUES (?,?,?,?,datetime('now'),?)",
+            (pid + 1000, initial_cash, initial_cash, initial_cash, pid)
         )
-    return jsonify({'id': pid, 'name': name, 'color': color, 'user_id': user_id})
+    return jsonify({'id': pid, 'name': name, 'color': color,
+                    'user_id': user_id, 'ai_controlled': ai_controlled})
 
 @app.route('/api/portfolios/<int:pid>', methods=['PATCH'])
 def update_portfolio(pid):
@@ -512,6 +597,25 @@ def delete_portfolio(pid):
         conn.execute('DELETE FROM sim_positions WHERE portfolio_id = ?', (pid,))
         conn.execute('DELETE FROM sim_trades WHERE portfolio_id = ?', (pid,))
     return jsonify({'status': 'deleted'})
+
+@app.route('/api/portfolios/<int:pid>/ai/log')
+def ai_log(pid):
+    with _get_db() as conn:
+        rows = conn.execute(
+            'SELECT * FROM ai_log WHERE portfolio_id=? ORDER BY id DESC LIMIT 50', (pid,)
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route('/api/portfolios/<int:pid>/ai/run', methods=['POST'])
+def ai_run(pid):
+    with _get_db() as conn:
+        row = conn.execute('SELECT ai_controlled FROM portfolios WHERE id=?', (pid,)).fetchone()
+    if not row:
+        return jsonify({'error': 'Portfolio not found'}), 404
+    if not row['ai_controlled']:
+        return jsonify({'error': 'Portfolio is not AI-controlled'}), 400
+    summary = _ai_run_portfolio(pid)
+    return jsonify(summary)
 
 @app.route('/api/users/<int:uid>', methods=['PATCH'])
 def update_user(uid):
@@ -543,7 +647,26 @@ def update_user(uid):
 # ── Portfolio simulation routes (no Alpaca required) ──────────────────────────
 @app.route('/api/account')
 def account():
-    pid       = request.args.get('portfolio_id', 1, type=int)
+    pid = request.args.get('portfolio_id', 1, type=int)
+    if pid == 0:
+        pos = _real_holdings_with_prices()
+        total_value = sum(p['market_value'] for p in pos)
+        total_cost  = sum(p['avg_entry_price'] * p['qty'] for p in pos)
+        pnl = total_value - total_cost
+        day_pls = [p['day_pl'] for p in pos if p.get('day_pl') is not None]
+        pnl_day = round(sum(day_pls), 2) if day_pls else None
+        return jsonify({
+            'equity':          round(total_value, 2),
+            'cash':            0,
+            'buying_power':    0,
+            'portfolio_value': round(total_value, 2),
+            'daytrade_count':  0,
+            'pnl_day':         pnl_day,
+            'pnl':             round(pnl, 2),
+            'pnl_pct':         round((pnl / total_cost * 100) if total_cost else 0, 2),
+            'initial_cost':    round(total_cost, 2),
+            'is_real':         True,
+        })
     state     = _sim_state(pid)
     positions = _sim_positions_with_prices(pid)
     portfolio_value = state['cash'] + sum(p['market_value'] for p in positions)
@@ -560,6 +683,8 @@ def account():
 @app.route('/api/positions')
 def positions():
     pid = request.args.get('portfolio_id', 1, type=int)
+    if pid == 0:
+        return jsonify(_real_holdings_with_prices())
     return jsonify(_sim_positions_with_prices(pid))
 
 @app.route('/api/orders', methods=['GET'])
@@ -651,14 +776,19 @@ def reset_account():
     if request.json:
         pid = request.json.get('portfolio_id', 1)
     with _get_db() as conn:
-        conn.execute("UPDATE sim_state SET cash=100000, last_equity=100000, reset_at=datetime('now') WHERE portfolio_id=?", (pid,))
+        row = conn.execute('SELECT initial_cash FROM sim_state WHERE portfolio_id=?', (pid,)).fetchone()
+        start = float(row['initial_cash']) if row and row['initial_cash'] else 100000.0
+        conn.execute(
+            "UPDATE sim_state SET cash=?, last_equity=?, reset_at=datetime('now') WHERE portfolio_id=?",
+            (start, start, pid)
+        )
         conn.execute('DELETE FROM sim_positions WHERE portfolio_id=?', (pid,))
         conn.execute('DELETE FROM sim_trades WHERE portfolio_id=?', (pid,))
         if pid == 1:
             conn.execute('DELETE FROM holdings')
     return jsonify({
         'status':  'reset',
-        'message': 'Account reset to $100,000. All positions and trades cleared.',
+        'message': f'Account reset to ${start:,.0f}. All positions and trades cleared.',
     })
 
 # ── Market data routes ─────────────────────────────────────────────────────────
@@ -781,9 +911,44 @@ def _quote_yfinance(symbol: str) -> dict:
     _price_cache[symbol] = (price, now)
     return q
 
+_FINNHUB_QUOTE_TTL = 8   # seconds — REST cache when WebSocket hasn't updated yet
+
+def _quote_finnhub(symbol: str) -> dict:
+    import requests
+    now = _time.time()
+    if symbol in _quote_cache:
+        q, ts = _quote_cache[symbol]
+        if now - ts < _FINNHUB_QUOTE_TTL:
+            return q
+    url  = f'https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}'
+    resp = requests.get(url, timeout=5)
+    resp.raise_for_status()
+    d     = resp.json()
+    price = float(d.get('c') or 0)
+    prev  = float(d.get('pc') or 0)
+    high  = float(d.get('h') or 0)
+    low   = float(d.get('l') or 0)
+    open_ = float(d.get('o') or 0)
+    ts_   = int(d.get('t') or 0)
+    if price <= 0:
+        raise ValueError(f'Finnhub returned no price for {symbol}')
+    change     = round(price - prev, 4)
+    change_pct = round((change / prev * 100), 2) if prev else 0
+    q = {'symbol': symbol, 'bid': price, 'ask': price, 'bid_size': 0, 'ask_size': 0,
+         'spread': 0.0, 'change': change, 'change_pct': change_pct, 'delayed': False,
+         'high': high, 'low': low, 'open': open_, 'prev_close': prev, 'timestamp': ts_}
+    _quote_cache[symbol] = (q, now)
+    _price_cache[symbol] = (price, now)
+    return q
+
 @app.route('/api/quote/<symbol>')
 def get_quote(symbol):
     symbol = symbol.upper()
+    if FINNHUB_KEYS_SET:
+        try:
+            return jsonify(_quote_finnhub(symbol))
+        except Exception:
+            pass  # fall through to yfinance
     if not KEYS_SET:
         try:
             return jsonify(_quote_yfinance(symbol))
@@ -801,17 +966,179 @@ def get_quote(symbol):
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
+# ── Markets: Futures / Forex / Options ───────────────────────────────────────
+
+_FUTURES_LIST = [
+    {'symbol': 'ES=F',  'display': 'ES',      'name': 'S&P 500 E-mini'},
+    {'symbol': 'NQ=F',  'display': 'NQ',      'name': 'NASDAQ E-mini'},
+    {'symbol': 'YM=F',  'display': 'YM',      'name': 'Dow Jones E-mini'},
+    {'symbol': 'RTY=F', 'display': 'RTY',     'name': 'Russell 2000 E-mini'},
+    {'symbol': 'CL=F',  'display': 'CL',      'name': 'Crude Oil WTI'},
+    {'symbol': 'GC=F',  'display': 'GC',      'name': 'Gold'},
+    {'symbol': 'SI=F',  'display': 'SI',      'name': 'Silver'},
+    {'symbol': 'NG=F',  'display': 'NG',      'name': 'Natural Gas'},
+    {'symbol': 'ZB=F',  'display': 'ZB',      'name': 'US 30Y T-Bond'},
+    {'symbol': 'ZN=F',  'display': 'ZN',      'name': 'US 10Y T-Note'},
+    {'symbol': 'BTC=F', 'display': 'BTC',     'name': 'Bitcoin Futures'},
+    {'symbol': 'ETH=F', 'display': 'ETH',     'name': 'Ether Futures'},
+]
+
+_FOREX_LIST = [
+    {'symbol': 'EURUSD=X', 'display': 'EUR/USD', 'name': 'Euro / US Dollar'},
+    {'symbol': 'GBPUSD=X', 'display': 'GBP/USD', 'name': 'British Pound / USD'},
+    {'symbol': 'USDJPY=X', 'display': 'USD/JPY', 'name': 'US Dollar / Japanese Yen'},
+    {'symbol': 'USDCHF=X', 'display': 'USD/CHF', 'name': 'US Dollar / Swiss Franc'},
+    {'symbol': 'AUDUSD=X', 'display': 'AUD/USD', 'name': 'Australian Dollar / USD'},
+    {'symbol': 'USDCAD=X', 'display': 'USD/CAD', 'name': 'US Dollar / Canadian Dollar'},
+    {'symbol': 'NZDUSD=X', 'display': 'NZD/USD', 'name': 'New Zealand Dollar / USD'},
+    {'symbol': 'EURGBP=X', 'display': 'EUR/GBP', 'name': 'Euro / British Pound'},
+    {'symbol': 'EURJPY=X', 'display': 'EUR/JPY', 'name': 'Euro / Japanese Yen'},
+    {'symbol': 'GBPJPY=X', 'display': 'GBP/JPY', 'name': 'British Pound / Yen'},
+    {'symbol': 'USDCNY=X', 'display': 'USD/CNY', 'name': 'US Dollar / Chinese Yuan'},
+    {'symbol': 'USDINR=X', 'display': 'USD/INR', 'name': 'US Dollar / Indian Rupee'},
+]
+
+_markets_cache: dict = {}
+_MARKETS_TTL = 45  # seconds
+
+def _get_market_quotes(instruments: list) -> list:
+    import yfinance as yf
+    result = []
+    for inst in instruments:
+        sym = inst['symbol']
+        try:
+            hist   = yf.Ticker(sym).history(period='5d')
+            closes = hist['Close'].dropna()
+            highs  = hist['High'].dropna()
+            lows   = hist['Low'].dropna()
+            if len(closes) >= 2:
+                price = float(closes.iloc[-1]); prev = float(closes.iloc[-2])
+                high  = float(highs.iloc[-1]);  low  = float(lows.iloc[-1])
+            elif len(closes) == 1:
+                price = float(closes.iloc[0]);  prev = 0.0
+                high  = float(highs.iloc[0]);   low  = float(lows.iloc[0])
+            else:
+                price = prev = high = low = 0.0
+            change     = round(price - prev, 6) if prev else 0.0
+            change_pct = round((change / prev) * 100, 3) if prev else 0.0
+            result.append({
+                'symbol': sym, 'display': inst['display'], 'name': inst['name'],
+                'price': round(price, 6), 'prev_close': round(prev, 6),
+                'change': change, 'change_pct': change_pct,
+                'high': round(high, 6), 'low': round(low, 6),
+            })
+        except Exception as e:
+            print(f'[TradeSimulator] market quote failed {sym}: {e}')
+            result.append({'symbol': sym, 'display': inst['display'], 'name': inst['name'],
+                           'price': 0.0, 'prev_close': 0.0, 'change': 0.0,
+                           'change_pct': 0.0, 'high': 0.0, 'low': 0.0})
+    return result
+
+@app.route('/api/markets/futures')
+def get_futures():
+    now = _time.time()
+    if 'futures' in _markets_cache:
+        data, ts = _markets_cache['futures']
+        if now - ts < _MARKETS_TTL:
+            return jsonify(data)
+    data = _get_market_quotes(_FUTURES_LIST)
+    _markets_cache['futures'] = (data, now)
+    return jsonify(data)
+
+@app.route('/api/markets/forex')
+def get_forex():
+    now = _time.time()
+    if 'forex' in _markets_cache:
+        data, ts = _markets_cache['forex']
+        if now - ts < _MARKETS_TTL:
+            return jsonify(data)
+    data = _get_market_quotes(_FOREX_LIST)
+    _markets_cache['forex'] = (data, now)
+    return jsonify(data)
+
+@app.route('/api/options/<symbol>')
+def get_options(symbol):
+    symbol = symbol.upper()
+    expiry = request.args.get('expiry', '')
+    cache_key = f'options:{symbol}:{expiry}'
+    now = _time.time()
+    if cache_key in _markets_cache:
+        data, ts = _markets_cache[cache_key]
+        if now - ts < 120:
+            return jsonify(data)
+    try:
+        import yfinance as yf
+        ticker      = yf.Ticker(symbol)
+        expirations = list(ticker.options or [])
+        if not expirations:
+            return jsonify({'symbol': symbol, 'expirations': [], 'calls': [], 'puts': [], 'selected': None})
+        selected = expiry if expiry in expirations else expirations[0]
+        chain    = ticker.option_chain(selected)
+
+        def _df(df):
+            rows = []
+            df = df.fillna(0)  # NaN is truthy; int(NaN) raises ValueError
+            for _, r in df.iterrows():
+                rows.append({
+                    'strike':     round(float(r.get('strike', 0)), 4),
+                    'bid':        round(float(r.get('bid', 0)), 4),
+                    'ask':        round(float(r.get('ask', 0)), 4),
+                    'last':       round(float(r.get('lastPrice', 0)), 4),
+                    'iv':         round(float(r.get('impliedVolatility', 0)) * 100, 1),
+                    'volume':     int(float(r.get('volume', 0))),
+                    'oi':         int(float(r.get('openInterest', 0))),
+                    'itm':        bool(r.get('inTheMoney', False)),
+                    'change':     round(float(r.get('change', 0)), 4),
+                    'change_pct': round(float(r.get('percentChange', 0)), 2),
+                })
+            return rows
+
+        # Get current underlying price for ATM reference
+        try:
+            hist  = ticker.history(period='1d')
+            closes = hist['Close'].dropna()
+            spot  = float(closes.iloc[-1]) if len(closes) else 0.0
+        except Exception:
+            spot = 0.0
+
+        data = {
+            'symbol':      symbol,
+            'spot':        round(spot, 4),
+            'expirations': expirations[:16],
+            'selected':    selected,
+            'calls':       _df(chain.calls),
+            'puts':        _df(chain.puts),
+        }
+        _markets_cache[cache_key] = (data, now)
+        return jsonify(data)
+    except Exception as e:
+        print(f'[TradeSimulator] options failed for {symbol}: {e}')
+        return jsonify({'error': str(e)}), 500
+
 # ── Watchlist ──────────────────────────────────────────────────────────────────
 @app.route('/api/watchlist', methods=['GET'])
 def get_watchlist():
+    pid = request.args.get('portfolio_id', 1, type=int)
+    if pid == 0:
+        with _get_db() as conn:
+            rows = conn.execute('SELECT DISTINCT symbol FROM holdings ORDER BY symbol').fetchall()
+        sym_rows = [(r['symbol'], False) for r in rows]
+    else:
+        with _get_db() as conn:
+            rows = conn.execute(
+                'SELECT symbol, priority FROM watchlist_items WHERE portfolio_id = ? ORDER BY rowid',
+                (pid,)
+            ).fetchall()
+        sym_rows = [(r['symbol'], bool(r['priority'])) for r in rows]
     result = []
-    for sym in _watchlist:
+    for sym, priority in sym_rows:
         try:
             q = _quote_yfinance(sym)
-            result.append({'symbol': sym, 'bid': q['bid'], 'ask': q['bid'], 'price': q['bid'],
-                           'change': q.get('change', 0.0), 'change_pct': q.get('change_pct', 0.0)})
+            result.append({'symbol': sym, 'price': q['bid'], 'bid': q['bid'], 'ask': q['bid'],
+                           'change': q.get('change', 0.0), 'change_pct': q.get('change_pct', 0.0),
+                           'priority': priority})
         except:
-            result.append({'symbol': sym, 'price': None, 'change': 0.0, 'change_pct': 0.0})
+            result.append({'symbol': sym, 'price': None, 'change': 0.0, 'change_pct': 0.0, 'priority': priority})
     return jsonify(result)
 
 @app.route('/api/watchlist', methods=['POST'])
@@ -819,15 +1146,52 @@ def update_watchlist():
     data   = request.json
     action = data.get('action', 'add')
     symbol = data.get('symbol', '').upper()
-    if action == 'add' and symbol and symbol not in _watchlist:
-        _watchlist.append(symbol)
-    elif action == 'remove' and symbol in _watchlist:
-        _watchlist.remove(symbol)
-    return jsonify({'watchlist': _watchlist})
+    pid    = data.get('portfolio_id', 1)
+    if pid == 0:
+        return jsonify({'error': 'Real Holdings watchlist is auto-generated from your holdings'}), 400
+    with _get_db() as conn:
+        if action == 'add' and symbol:
+            conn.execute('INSERT OR IGNORE INTO watchlist_items (portfolio_id, symbol) VALUES (?,?)', (pid, symbol))
+        elif action == 'remove' and symbol:
+            conn.execute('DELETE FROM watchlist_items WHERE portfolio_id = ? AND symbol = ?', (pid, symbol))
+        elif action == 'priority' and symbol:
+            row = conn.execute(
+                'SELECT priority FROM watchlist_items WHERE portfolio_id = ? AND symbol = ?',
+                (pid, symbol)
+            ).fetchone()
+            if row and row['priority']:
+                # Already priority — toggle off
+                conn.execute('UPDATE watchlist_items SET priority = 0 WHERE portfolio_id = ? AND symbol = ?', (pid, symbol))
+            else:
+                # Set as priority, clear any previous
+                conn.execute('UPDATE watchlist_items SET priority = 0 WHERE portfolio_id = ?', (pid,))
+                conn.execute('UPDATE watchlist_items SET priority = 1 WHERE portfolio_id = ? AND symbol = ?', (pid, symbol))
+    return jsonify({'status': 'ok'})
+
+_MARKET_SYMBOLS = ['SPY','QQQ','DIA','IWM','AAPL','MSFT','NVDA','TSLA','AMZN','GOOGL','META','JPM','BAC','AMD','NFLX']
+
+@app.route('/api/market-prices')
+def market_prices():
+    result = []
+    for sym in _MARKET_SYMBOLS:
+        try:
+            q = _quote_yfinance(sym)
+            result.append({'symbol': sym, 'price': q['bid'],
+                           'change': q.get('change', 0.0), 'change_pct': q.get('change_pct', 0.0)})
+        except:
+            pass
+    return jsonify(result)
 
 @app.route('/api/subscribe/<symbol>', methods=['POST'])
 def subscribe_symbol(symbol):
     sym = symbol.upper()
+    _subscribed_symbols.add(sym)
+    if FINNHUB_KEYS_SET:
+        try:
+            from finnhub_stream import subscribe as fh_sub
+            fh_sub(sym, socketio)
+        except Exception:
+            pass
     if KEYS_SET:
         try:
             from alpaca_stream import subscribe
@@ -998,7 +1362,7 @@ def delete_holding(holding_id):
 
 # ── News feed ─────────────────────────────────────────────────────────────────
 _news_cache: dict[str, tuple[list, float]] = {}
-_NEWS_TTL = 600  # 10 minutes
+_NEWS_TTL = 300  # 5 minutes
 
 def _fetch_news_av(symbol: str = '', topics: str = 'technology,finance') -> list:
     """Fetch from Alpha Vantage NEWS_SENTIMENT."""
@@ -1119,14 +1483,18 @@ def _fetch_general_news_yfinance() -> list:
     """Aggregate general market news from major tickers via yfinance."""
     try:
         import yfinance as yf
-        tickers = ['AAPL', 'NVDA', 'MSFT', 'AMZN', 'GOOGL', 'META', 'TSLA', 'SPY', 'QQQ']
+        tickers = [
+            'AAPL', 'NVDA', 'MSFT', 'AMZN', 'GOOGL', 'META', 'TSLA',
+            'SPY', 'QQQ', 'NFLX', 'AMD', 'INTC', 'JPM', 'GS', 'BAC',
+            'XOM', 'CVX', 'BRK-B', 'V', 'MA', 'COIN', 'PLTR', 'HOOD',
+        ]
         seen, result = set(), []
         for sym in tickers:
-            if len(result) >= 20:
+            if len(result) >= 40:
                 break
             try:
                 raw = yf.Ticker(sym).news or []
-                for art in _yf_news_to_articles(raw[:5]):
+                for art in _yf_news_to_articles(raw[:6]):
                     if art['title'] not in seen:
                         seen.add(art['title'])
                         result.append(art)
@@ -1135,6 +1503,41 @@ def _fetch_general_news_yfinance() -> list:
         return result
     except Exception as e:
         print(f'[TradeSimulator] yfinance general news failed: {e}')
+        return []
+
+
+def _fetch_news_finnhub_general() -> list:
+    """Fetch market-moving news from Finnhub general news endpoint."""
+    if not FINNHUB_KEYS_SET:
+        return []
+    try:
+        import requests as _req
+        r = _req.get(
+            'https://finnhub.io/api/v1/news',
+            params={'category': 'general', 'token': FINNHUB_KEY},
+            timeout=5,
+        )
+        r.raise_for_status()
+        items = r.json() or []
+        result = []
+        for item in items[:40]:
+            headline = (item.get('headline') or '').strip()
+            if not headline:
+                continue
+            result.append({
+                'title':            headline,
+                'source':           item.get('source', 'Finnhub'),
+                'url':              item.get('url', ''),
+                'published_at':     item.get('datetime', 0),
+                'summary':          item.get('summary', ''),
+                'ticker_sentiment': ([{'ticker': item['related'], 'sentiment_label': 'neutral', 'sentiment_score': 0}]
+                                     if item.get('related') else []),
+                'sentiment_label':  'neutral',
+                'banner_image':     item.get('image', ''),
+            })
+        return result
+    except Exception as e:
+        print(f'[TradeSimulator] Finnhub general news failed: {e}')
         return []
 
 @app.route('/api/news/<symbol>')
@@ -1150,108 +1553,518 @@ def get_news_symbol(symbol):
     _news_cache[cache_key] = (items, now)
     return jsonify(items)
 
+_TOPIC_AV = {
+    'finance':    'financial_markets,economy_fiscal',
+    'technology': 'technology',
+    'earnings':   'earnings',
+    'macro':      'economy_macro,economy_monetary,economy_fiscal',
+    'crypto':     'blockchain',
+}
+_TOPIC_FINNHUB = {
+    'finance': 'general',
+    'macro':   'general',
+    'crypto':  'crypto',
+}
+_TOPIC_YF = {
+    'finance':    ['JPM','GS','BAC','V','MA','BRK-B','SPY','QQQ'],
+    'technology': ['AAPL','MSFT','GOOGL','META','NVDA','AMD','INTC','TSLA'],
+    'earnings':   ['AAPL','MSFT','AMZN','GOOGL','META','NVDA','TSLA','JPM'],
+    'macro':      ['SPY','QQQ','TLT','GLD','IWM','DIA','VIX'],
+    'crypto':     ['BTC-USD','ETH-USD','COIN','HOOD','MARA','RIOT'],
+}
+
+def _fetch_news_finnhub_category(category: str) -> list:
+    if not FINNHUB_KEYS_SET:
+        return []
+    try:
+        import requests as _req
+        r = _req.get(
+            'https://finnhub.io/api/v1/news',
+            params={'category': category, 'token': FINNHUB_KEY},
+            timeout=5,
+        )
+        r.raise_for_status()
+        items = r.json() or []
+        result = []
+        for item in items[:40]:
+            headline = (item.get('headline') or '').strip()
+            if not headline:
+                continue
+            result.append({
+                'title':        headline,
+                'source':       item.get('source', 'Finnhub'),
+                'url':          item.get('url', ''),
+                'published_at': item.get('datetime', 0),
+                'summary':      item.get('summary', ''),
+                'sentiment_label': 'neutral',
+                'banner_image': item.get('image', ''),
+            })
+        return result
+    except Exception as e:
+        print(f'[TradeSimulator] Finnhub {category} news failed: {e}')
+        return []
+
+def _fetch_general_news_yfinance_topic(tickers: list) -> list:
+    try:
+        import yfinance as yf
+        seen, result = set(), []
+        for sym in tickers:
+            if len(result) >= 40:
+                break
+            try:
+                raw = yf.Ticker(sym).news or []
+                for art in _yf_news_to_articles(raw[:6]):
+                    if art['title'] not in seen:
+                        seen.add(art['title'])
+                        result.append(art)
+            except Exception:
+                continue
+        return result
+    except Exception as e:
+        print(f'[TradeSimulator] yfinance topic news failed: {e}')
+        return []
+
 @app.route('/api/news/general')
 def get_news_general():
-    topic = request.args.get('topic', 'technology')
+    topic = request.args.get('topic', 'finance')
     cache_key = f'general:{topic}'
     now = _time.time()
     if cache_key in _news_cache:
         items, ts = _news_cache[cache_key]
         if now - ts < _NEWS_TTL:
             return jsonify(items)
-    items = (_fetch_news_av(topics=f'{topic},finance')
-             or _fetch_news_polygon()
-             or _fetch_general_news_yfinance())
+
+    av_topics  = _TOPIC_AV.get(topic, 'financial_markets')
+    fh_cat     = _TOPIC_FINNHUB.get(topic)
+    yf_tickers = _TOPIC_YF.get(topic, ['SPY', 'QQQ', 'AAPL', 'MSFT'])
+
+    items = (
+        (_fetch_news_finnhub_category(fh_cat) if fh_cat else [])
+        or _fetch_news_av(topics=av_topics)
+        or _fetch_news_polygon()
+        or _fetch_general_news_yfinance_topic(yf_tickers)
+    )
     _news_cache[cache_key] = (items, now)
     return jsonify(items)
 
+# ── AI portfolio trading ───────────────────────────────────────────────────────
+
+_AI_UNIVERSE = [
+    # Mega-cap tech
+    'AAPL','MSFT','NVDA','GOOGL','META','AMZN','TSLA','AVGO','ADBE','CRM',
+    # Semiconductors / tech
+    'AMD','INTC','QCOM','TXN','ORCL','IBM','INTU','NOW','SNOW','PLTR',
+    # Financials
+    'JPM','BAC','GS','MS','V','MA','AXP','BLK','C','WFC',
+    # Healthcare
+    'UNH','LLY','JNJ','PFE','MRK','ABBV','TMO','DHR','AMGN','GILD',
+    # Consumer
+    'WMT','COST','HD','TGT','NKE','MCD','SBUX','CMG',
+    # Energy
+    'XOM','CVX','COP','SLB','OXY','EOG',
+    # Industrials
+    'CAT','DE','HON','BA','GE','UPS','FDX','RTX','LMT',
+    # Communication / media
+    'NFLX','DIS','CMCSA','T','VZ',
+    # ETFs (liquid, indicator-friendly)
+    'SPY','QQQ','IWM','GLD','TLT',
+]
+_AI_UNIVERSE = list(dict.fromkeys(_AI_UNIVERSE))  # deduplicate, preserve order
+
+# Per-portfolio rotating scan cursor: {portfolio_id: int}
+_ai_scan_cursor: dict = {}
+
+
+def _ema(vals, period):
+    k = 2.0 / (period + 1)
+    out = [vals[0]]
+    for v in vals[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
+def _ai_score(data: dict) -> float:
+    """Replicate the frontend computeDecision score. BUY ≥ 2.0, SELL ≤ -2.0."""
+    rsi      = float(data.get('rsi', 50) or 50)
+    macd_x   = data.get('macd_cross', '') or ''
+    stoch_k  = float(data.get('stoch_k_val', 50) or 50)
+    vol_sig  = data.get('volume_signal', '') or ''
+    vol_r    = float(data.get('volume_ratio', 1.0) or 1.0)
+    bb_pos   = data.get('bb_position', '') or ''
+    vwap_sig = data.get('vwap_signal', '') or ''
+    trend    = data.get('trend', '') or ''
+
+    score = 0.0
+
+    if   rsi <= 20: score += 3.0
+    elif rsi <= 28: score += 2.0
+    elif rsi <= 38: score += 1.0
+    elif rsi >= 80: score -= 3.0
+    elif rsi >= 72: score -= 2.0
+    elif rsi >= 62: score -= 1.0
+
+    if   macd_x == 'bullish_cross': score += 3.0
+    elif macd_x == 'bullish':       score += 1.5
+    elif macd_x == 'bearish_cross': score -= 3.0
+    elif macd_x == 'bearish':       score -= 1.5
+
+    if   stoch_k <= 15: score += 1.5
+    elif stoch_k <= 25: score += 1.0
+    elif stoch_k >= 85: score -= 1.5
+    elif stoch_k >= 75: score -= 1.0
+
+    vol_mult = min(vol_r / 1.5, 1.5) if vol_r > 1.5 else 1.0
+    if   vol_sig == 'high_up':   score += 2.0 * vol_mult
+    elif vol_sig == 'high_down': score -= 2.0 * vol_mult
+    elif vol_sig == 'low':       score *= 0.65
+
+    if   bb_pos == 'oversold':   score += 1.5
+    elif bb_pos == 'lower_half': score += 0.5
+    elif bb_pos == 'overbought': score -= 1.5
+    elif bb_pos == 'upper_half': score -= 0.5
+
+    if   vwap_sig == 'above': score += 1.0
+    elif vwap_sig == 'below': score -= 1.0
+
+    if   trend == 'up':   score += 1.5
+    elif trend == 'down': score -= 1.5
+
+    return round(score, 2)
+
+
+def _ai_log_entry(pid: int, symbol: str, action: str, score: float,
+                  price: float, shares: float, reason: str):
+    with _get_db() as conn:
+        conn.execute(
+            'INSERT INTO ai_log (portfolio_id, symbol, action, score, price, shares, reason) VALUES (?,?,?,?,?,?,?)',
+            (pid, symbol, action, score, price, shares, reason)
+        )
+
+
+def _ai_run_portfolio(pid: int) -> dict:
+    """One AI scan cycle: check existing positions, then scan a batch for buys."""
+    MAX_POS      = 8
+    POS_PCT      = 0.10    # max 10% equity per new position
+    CASH_RESERVE = 0.10    # keep ≥10% equity in cash
+    ATR_STOP_M   = 1.5
+    ATR_TGT_M    = 2.5
+    BATCH_SIZE   = 15
+
+    summary = {'pid': pid, 'scanned': 0, 'bought': [], 'sold': [], 'errors': []}
+
+    try:
+        # ── 1. Check held positions for exits ──────────────────────────────
+        with _get_db() as conn:
+            pos_rows = conn.execute(
+                'SELECT symbol, shares, avg_cost FROM sim_positions WHERE portfolio_id=? AND shares>0',
+                (pid,)
+            ).fetchall()
+
+        for row in pos_rows:
+            sym = row['symbol']
+            try:
+                data  = _compute_indicators(sym)
+                price = data.get('last_price') or _get_current_price(sym)
+                score = _ai_score(data)
+                atr   = data.get('atr') or (price * 0.02)
+                stop  = row['avg_cost'] - ATR_STOP_M * atr
+                tgt   = row['avg_cost'] + ATR_TGT_M  * atr
+
+                if score <= -2.0 or price <= stop or price >= tgt:
+                    reason = ('sell_signal' if score <= -2.0
+                              else 'stop_loss' if price <= stop
+                              else 'take_profit')
+                    _sim_sell(sym, row['shares'], price, pid)
+                    summary['sold'].append({'symbol': sym, 'price': round(price, 2),
+                                            'score': score, 'reason': reason})
+                    _ai_log_entry(pid, sym, 'SELL', score, price, row['shares'], reason)
+            except Exception as e:
+                summary['errors'].append(f'exit {sym}: {e}')
+
+        # ── 2. Compute equity for position sizing ──────────────────────────
+        state = _sim_state(pid)
+        cash  = state['cash']
+        with _get_db() as conn:
+            held = [r['symbol'] for r in conn.execute(
+                'SELECT symbol FROM sim_positions WHERE portfolio_id=? AND shares>0', (pid,)
+            ).fetchall()]
+
+        equity = cash
+        for sym in held:
+            try:
+                equity += _get_current_price(sym) * next(
+                    r['shares'] for r in pos_rows if r['symbol'] == sym
+                )
+            except Exception:
+                pass
+
+        available = cash - equity * CASH_RESERVE
+        if len(held) >= MAX_POS or available <= 100:
+            return summary
+
+        # ── 3. Scan batch of universe symbols for buys ─────────────────────
+        universe = [s for s in _AI_UNIVERSE if s not in held]
+        cursor   = _ai_scan_cursor.get(pid, 0)
+        batch    = [universe[(cursor + i) % len(universe)] for i in range(min(BATCH_SIZE, len(universe)))]
+        _ai_scan_cursor[pid] = (cursor + BATCH_SIZE) % max(len(universe), 1)
+
+        candidates = []
+        for sym in batch:
+            try:
+                data  = _compute_indicators(sym)
+                price = data.get('last_price')
+                if not price or price <= 0:
+                    continue
+                score = _ai_score(data)
+                summary['scanned'] += 1
+                if score >= 2.0:
+                    candidates.append({'symbol': sym, 'score': score,
+                                       'price': price, 'atr': data.get('atr')})
+            except Exception as e:
+                summary['errors'].append(f'scan {sym}: {e}')
+
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+
+        # ── 4. Buy top candidates ──────────────────────────────────────────
+        n_pos = len(held)
+        for c in candidates:
+            if n_pos >= MAX_POS or available <= 100:
+                break
+            alloc  = min(equity * POS_PCT, available)
+            shares = alloc / c['price']
+            if shares < 0.001:
+                continue
+            try:
+                _sim_buy(c['symbol'], shares, c['price'], pid)
+                n_pos    += 1
+                available -= alloc
+                summary['bought'].append({'symbol': c['symbol'], 'price': round(c['price'], 2),
+                                          'shares': round(shares, 4), 'score': c['score']})
+                _ai_log_entry(pid, c['symbol'], 'BUY', c['score'], c['price'], shares,
+                              f"score {c['score']:+.1f}")
+            except Exception as e:
+                summary['errors'].append(f'buy {c["symbol"]}: {e}')
+
+    except Exception as e:
+        summary['errors'].append(f'portfolio error: {e}')
+
+    return summary
+
+
+# ── AI background worker ───────────────────────────────────────────────────────
+_AI_INTERVAL = 600   # seconds between scans (10 min)
+
+def _ai_worker():
+    """Daemon thread: every _AI_INTERVAL seconds scan all AI portfolios."""
+    _time.sleep(30)   # let app finish startup
+    while True:
+        try:
+            with _get_db() as conn:
+                rows = conn.execute(
+                    'SELECT id FROM portfolios WHERE ai_controlled=1'
+                ).fetchall()
+            for row in rows:
+                try:
+                    _ai_run_portfolio(row['id'])
+                except Exception as e:
+                    print(f'[AI] portfolio {row["id"]} error: {e}')
+        except Exception as e:
+            print(f'[AI] worker error: {e}')
+        _time.sleep(_AI_INTERVAL)
+
+threading.Thread(target=_ai_worker, daemon=True, name='ai-trader').start()
+
+
 # ── Price projection ──────────────────────────────────────────────────────────
+_proj_cache: dict = {}
+_PROJ_TTL = 60  # seconds — matches frontend poll interval
+
+
+def _compute_indicators(symbol: str, force: bool = False) -> dict:
+    """Compute all technical indicators for a symbol. Returns indicator dict."""
+    now = _time.time()
+    if not force and symbol in _proj_cache:
+        payload, ts = _proj_cache[symbol]
+        if now - ts < _PROJ_TTL:
+            return payload
+
+    import yfinance as yf
+
+    hist = yf.Ticker(symbol).history(period='120d')
+    if hist.empty or len(hist) < 20:
+        raise ValueError(f'Insufficient data for {symbol}')
+
+    closes  = list(hist['Close'].dropna())
+    highs   = list(hist['High'].dropna())
+    lows    = list(hist['Low'].dropna())
+    volumes = list(hist['Volume'].dropna())
+    times   = [int(ts.timestamp()) for ts in hist.index]
+
+    n = min(len(closes), len(highs), len(lows), len(volumes), len(times))
+    closes  = closes[-n:]; highs   = highs[-n:]
+    lows    = lows[-n:];   volumes = volumes[-n:]
+    times   = times[-n:]
+
+    # ── SMA20 / SMA50 ──
+    sma20 = [{'time': times[i], 'value': round(sum(closes[i-19:i+1]) / 20, 4)} for i in range(19, n)]
+    sma50 = ([{'time': times[i], 'value': round(sum(closes[i-49:i+1]) / 50, 4)} for i in range(49, n)]
+             if n >= 50 else [])
+
+    # ── Linear regression → 10-day projection ──
+    last20_y  = closes[-20:]
+    x_mean    = 9.5
+    y_mean    = sum(last20_y) / 20
+    num       = sum((i - x_mean) * (last20_y[i] - y_mean) for i in range(20))
+    denom     = sum((i - x_mean) ** 2 for i in range(20))
+    slope     = num / denom if denom else 0
+    intercept = y_mean - slope * x_mean
+    last_time = times[-1]
+    projection = [
+        {'time': last_time + (i + 1) * 86400,
+         'value': round(intercept + slope * (19 + i + 1), 4)}
+        for i in range(10)
+    ]
+
+    # ── RSI (14-period) ──
+    gains  = [max(closes[i] - closes[i-1], 0) for i in range(1, n)]
+    losses = [max(closes[i-1] - closes[i], 0) for i in range(1, n)]
+    rsi_series = []
+    for i in range(13, len(gains)):
+        ag = sum(gains[i-13:i+1]) / 14
+        al = sum(losses[i-13:i+1]) / 14
+        rsi_series.append({'time': times[i+1], 'value': round(100 - (100 / (1 + ag / al)) if al else 100.0, 2)})
+    avg_g = sum(gains[-14:]) / 14
+    avg_l = sum(losses[-14:]) / 14
+    rsi   = round(100 - (100 / (1 + avg_g / avg_l)) if avg_l else 100.0, 2)
+    rsi_signal = 'overbought' if rsi >= 70 else 'oversold' if rsi <= 30 else 'neutral'
+
+    # ── MACD (12, 26, 9) ──
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
+    macd_raw   = [ema12[i] - ema26[i] for i in range(n)]
+    macd_vals  = macd_raw[25:]
+    macd_times = times[25:]
+    sig_vals   = _ema(macd_vals, 9)
+    macd_out = [{'time': macd_times[i], 'value': round(macd_vals[i], 4)} for i in range(len(macd_vals))]
+    sig_out  = [{'time': macd_times[8+i], 'value': round(sig_vals[8+i], 4)} for i in range(len(sig_vals)-8)]
+    hist_out = [
+        {'time': macd_times[8+i],
+         'value': round(macd_vals[8+i] - sig_vals[8+i], 4),
+         'color': '#26d97f66' if (macd_vals[8+i] - sig_vals[8+i]) >= 0 else '#ff4d4d66'}
+        for i in range(len(sig_vals) - 8)
+    ]
+    last_m = macd_vals[-1];  last_s = sig_vals[-1]
+    prev_m = macd_vals[-2] if len(macd_vals) > 1 else last_m
+    prev_s = sig_vals[-2]  if len(sig_vals)  > 1 else last_s
+    curr_h = last_m - last_s;  prev_h = prev_m - prev_s
+    if   curr_h > 0 and prev_h <= 0: macd_cross = 'bullish_cross'
+    elif curr_h < 0 and prev_h >= 0: macd_cross = 'bearish_cross'
+    elif curr_h > 0:                 macd_cross = 'bullish'
+    else:                            macd_cross = 'bearish'
+
+    # ── Bollinger Bands (20, 2σ) ──
+    bb_upper, bb_lower, bb_mid = [], [], []
+    for i in range(19, n):
+        w    = closes[i-19:i+1]
+        mean = sum(w) / 20
+        std  = (sum((c - mean)**2 for c in w) / 20) ** 0.5
+        bb_upper.append({'time': times[i], 'value': round(mean + 2*std, 4)})
+        bb_lower.append({'time': times[i], 'value': round(mean - 2*std, 4)})
+        bb_mid.append(  {'time': times[i], 'value': round(mean,         4)})
+    last_c = closes[-1]
+    bb_u   = bb_upper[-1]['value'] if bb_upper else None
+    bb_l   = bb_lower[-1]['value'] if bb_lower else None
+    bb_m   = bb_mid[-1]['value']   if bb_mid   else None
+    if bb_u and bb_l:
+        bw = bb_u - bb_l
+        if   bw < last_c * 0.03:     bb_pos = 'squeeze'
+        elif last_c >= bb_u * 0.995: bb_pos = 'overbought'
+        elif last_c <= bb_l * 1.005: bb_pos = 'oversold'
+        elif last_c > bb_m:          bb_pos = 'upper_half'
+        else:                        bb_pos = 'lower_half'
+    else:
+        bb_pos = 'unknown'
+
+    # ── Stochastic (14, 3) ──
+    stoch_k_arr = []
+    for i in range(13, n):
+        ph = max(highs[i-13:i+1]);  pl = min(lows[i-13:i+1])
+        k  = ((closes[i] - pl) / (ph - pl) * 100) if (ph - pl) > 0 else 50.0
+        stoch_k_arr.append({'time': times[i], 'value': round(k, 2)})
+    k_raw = [p['value'] for p in stoch_k_arr]
+    stoch_d_arr = [{'time': stoch_k_arr[i]['time'], 'value': round(sum(k_raw[i-2:i+1]) / 3, 2)}
+                   for i in range(2, len(k_raw))]
+    last_k = k_raw[-1] if k_raw else 50.0
+    last_d = stoch_d_arr[-1]['value'] if stoch_d_arr else 50.0
+    stoch_signal = 'overbought' if last_k >= 80 else 'oversold' if last_k <= 20 else 'neutral'
+
+    # ── ATR (14) ──
+    tr_vals = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+               for i in range(1, n)]
+    atr     = round(sum(tr_vals[-14:]) / 14, 4) if len(tr_vals) >= 14 else None
+    atr_pct = round(atr / last_c * 100, 2)       if atr and last_c   else None
+
+    # ── VWAP (20-day rolling) ──
+    vwap_arr = []
+    for i in range(19, n):
+        tp  = [(highs[j] + lows[j] + closes[j]) / 3 for j in range(i-19, i+1)]
+        vol = volumes[i-19:i+1]
+        tv  = sum(vol)
+        if tv > 0:
+            vwap_arr.append({'time': times[i], 'value': round(sum(p*v for p,v in zip(tp, vol)) / tv, 4)})
+    last_vwap   = vwap_arr[-1]['value'] if vwap_arr else None
+    vwap_signal = 'above' if (last_vwap and last_c > last_vwap) else 'below'
+
+    # ── Volume ──
+    last_vol  = volumes[-1] if volumes else 0
+    avg_vol   = sum(volumes[-20:]) / min(20, len(volumes)) if volumes else 0
+    vol_ratio = round(last_vol / avg_vol, 2) if avg_vol > 0 else 1.0
+    price_chg = last_c - closes[-2] if n >= 2 else 0
+    if   vol_ratio >= 1.5: vol_signal = 'high_up' if price_chg > 0 else 'high_down'
+    elif vol_ratio <= 0.5: vol_signal = 'low'
+    else:                  vol_signal = 'normal'
+
+    # ── Support / Resistance ──
+    sorted_c   = sorted(closes[-min(60, n):])
+    support    = round(sorted_c[int(len(sorted_c) * 0.10)], 2)
+    resistance = round(sorted_c[int(len(sorted_c) * 0.90)], 2)
+
+    trend = 'up' if slope > 0.05 else 'down' if slope < -0.05 else 'sideways'
+
+    payload = {
+        'last_price':  round(last_c, 4),
+        'sma20':       sma20,       'sma50':       sma50,
+        'projection':  projection,  'support':     support,
+        'resistance':  resistance,  'trend':       trend,
+        'slope':       round(slope, 4),
+        'rsi':         rsi,         'rsi_signal':  rsi_signal,
+        'rsi_series':  rsi_series,
+        'macd':        macd_out,    'macd_signal': sig_out,
+        'macd_hist':   hist_out,    'macd_value':  round(last_m, 4),
+        'macd_signal_value': round(last_s, 4),
+        'macd_cross':  macd_cross,
+        'bb_upper':    bb_upper,    'bb_lower':    bb_lower,
+        'bb_middle':   bb_mid,      'bb_position': bb_pos,
+        'bb_upper_val': bb_u,       'bb_lower_val': bb_l,
+        'stoch_k':     stoch_k_arr, 'stoch_d':     stoch_d_arr,
+        'stoch_k_val': round(last_k, 2), 'stoch_d_val': round(last_d, 2),
+        'stoch_signal': stoch_signal,
+        'atr':         atr,         'atr_pct':     atr_pct,
+        'vwap':        vwap_arr,    'vwap_value':  last_vwap,
+        'vwap_signal': vwap_signal,
+        'avg_volume':  round(avg_vol), 'last_volume': round(last_vol),
+        'volume_ratio': vol_ratio,     'volume_signal': vol_signal,
+    }
+    _proj_cache[symbol] = (payload, _time.time())
+    return payload
+
+
 @app.route('/api/projection/<symbol>')
 def get_projection(symbol):
     symbol = symbol.upper()
+    force  = request.args.get('force', '') == '1'
     try:
-        import yfinance as yf
-        import math
-
-        hist = yf.Ticker(symbol).history(period='90d')
-        if hist.empty or len(hist) < 20:
-            return jsonify({'error': 'Insufficient data'}), 400
-
-        closes  = list(hist['Close'].dropna())
-        times   = [int(ts.timestamp()) for ts in hist.index]
-        n       = len(closes)
-
-        # ── SMA20 and SMA50 ──
-        sma20 = [
-            {'time': times[i], 'value': round(sum(closes[i-19:i+1]) / 20, 4)}
-            for i in range(19, n)
-        ]
-        sma50 = [
-            {'time': times[i], 'value': round(sum(closes[i-49:i+1]) / 50, 4)}
-            for i in range(49, n)
-        ] if n >= 50 else []
-
-        # ── Linear regression on last 20 days → project 10 bars forward ──
-        last20_y = closes[-20:]
-        last20_x = list(range(20))
-        x_mean   = 9.5
-        y_mean   = sum(last20_y) / 20
-        num   = sum((last20_x[i] - x_mean) * (last20_y[i] - y_mean) for i in range(20))
-        denom = sum((xi - x_mean) ** 2 for xi in last20_x)
-        slope = num / denom if denom else 0
-        intercept = y_mean - slope * x_mean
-
-        last_time    = times[-1]
-        day_seconds  = 86400
-        projection   = [
-            {'time': last_time + (i + 1) * day_seconds,
-             'value': round(intercept + slope * (19 + i + 1), 4)}
-            for i in range(10)
-        ]
-
-        # ── RSI (14-period) ──
-        gains  = [max(closes[i] - closes[i-1], 0) for i in range(1, n)]
-        losses = [max(closes[i-1] - closes[i], 0) for i in range(1, n)]
-        avg_g  = sum(gains[-14:])  / 14
-        avg_l  = sum(losses[-14:]) / 14
-        rsi    = 100 - (100 / (1 + avg_g / avg_l)) if avg_l else 100.0
-        rsi    = round(rsi, 2)
-        if rsi >= 70:
-            rsi_signal = 'overbought'
-        elif rsi <= 30:
-            rsi_signal = 'oversold'
-        else:
-            rsi_signal = 'neutral'
-
-        # ── Support / Resistance (local min/max over last 60 days) ──
-        window = min(60, n)
-        recent = closes[-window:]
-        local_min = min(recent)
-        local_max = max(recent)
-        # Simple support = 10th percentile, resistance = 90th percentile
-        sorted_c   = sorted(recent)
-        support    = round(sorted_c[int(len(sorted_c) * 0.10)], 2)
-        resistance = round(sorted_c[int(len(sorted_c) * 0.90)], 2)
-
-        # ── Trend ──
-        if slope > 0.05:
-            trend = 'up'
-        elif slope < -0.05:
-            trend = 'down'
-        else:
-            trend = 'sideways'
-
-        return jsonify({
-            'sma20':       sma20,
-            'sma50':       sma50,
-            'projection':  projection,
-            'support':     support,
-            'resistance':  resistance,
-            'rsi':         rsi,
-            'rsi_signal':  rsi_signal,
-            'trend':       trend,
-            'slope':       round(slope, 4),
-        })
+        return jsonify(_compute_indicators(symbol, force=force))
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1277,6 +2090,25 @@ def get_company(symbol):
     return jsonify({'symbol': symbol, 'name': symbol, 'exchange': ''})
 
 # ── Serve built React frontend ────────────────────────────────────────────────
+def _poll_worker():
+    """Emit quotes every 25 s — uses Finnhub REST when key is set, yfinance otherwise."""
+    while True:
+        _time.sleep(25)
+        syms = list(_subscribed_symbols | set(_watchlist))
+        for sym in syms:
+            try:
+                _quote_cache.pop(sym, None)  # bypass cache for fresh data
+                q = _quote_finnhub(sym) if FINNHUB_KEYS_SET else _quote_yfinance(sym)
+                socketio.emit('quote', {
+                    'symbol':  sym,
+                    'bid':     q['bid'],
+                    'ask':     q.get('ask', q['bid']),
+                    'spread':  q.get('spread', 0),
+                    'delayed': not FINNHUB_KEYS_SET,
+                })
+            except Exception:
+                pass
+
 DIST_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
 
 @app.route('/', defaults={'path': ''})
@@ -1292,7 +2124,14 @@ def serve_frontend(path):
 
 if __name__ == '__main__':
     threading.Thread(target=_load_ticker_db, daemon=True).start()
-    if KEYS_SET:
+    if FINNHUB_KEYS_SET:
+        try:
+            from finnhub_stream import start_stream as fh_start
+            fh_start(FINNHUB_KEY, socketio)
+            print('[TradeSimulator] Finnhub real-time WebSocket stream starting.')
+        except Exception as e:
+            print(f'[TradeSimulator] Finnhub stream failed: {e}')
+    elif KEYS_SET:
         try:
             from alpaca_stream import start_stream
             threading.Thread(target=start_stream, args=(API_KEY, SECRET_KEY, socketio), daemon=True).start()
@@ -1306,7 +2145,9 @@ if __name__ == '__main__':
         except Exception as e:
             print(f'[TradeSimulator] Polygon stream failed: {e}')
     else:
-        print('[TradeSimulator] No live price feed — using yfinance (delayed). Add Alpaca or Polygon keys for real-time data.')
+        print('[TradeSimulator] No live price feed — using yfinance (delayed).')
+    # Poll worker runs always: fills gaps outside market hours and handles watchlist price updates
+    threading.Thread(target=_poll_worker, daemon=True).start()
     if AV_KEYS_SET:
         print('[TradeSimulator] Alpha Vantage key configured — comprehensive symbol search enabled.')
     socketio.run(app, host='0.0.0.0', port=8765, debug=False)

@@ -1,18 +1,15 @@
 import { useState, useEffect, useRef } from 'react'
 import api from '../api.js'
 
-// Module-level cache so sparklines persist across re-renders and searches
 const _sparkCache = new Map()
 
 function Sparkline({ closes }) {
-  if (!closes || closes.length < 2) {
-    return <div className="sym-spark-placeholder" />
-  }
+  if (!closes || closes.length < 2) return <div className="sym-spark-placeholder" />
   const W = 80, H = 28
-  const min = Math.min(...closes)
-  const max = Math.max(...closes)
+  const min   = Math.min(...closes)
+  const max   = Math.max(...closes)
   const range = max - min || 1
-  const pts = closes.map((v, i) => {
+  const pts   = closes.map((v, i) => {
     const x = ((i / (closes.length - 1)) * W).toFixed(1)
     const y = (H - 2 - ((v - min) / range) * (H - 4)).toFixed(1)
     return `${x},${y}`
@@ -20,48 +17,68 @@ function Sparkline({ closes }) {
   const up = closes[closes.length - 1] >= closes[0]
   return (
     <svg width={W} height={H} className="sym-spark">
-      <polyline
-        points={pts}
-        fill="none"
-        stroke={up ? '#26d97f' : '#ff4d4d'}
-        strokeWidth="1.5"
-        strokeLinejoin="round"
-        strokeLinecap="round"
-      />
+      <polyline points={pts} fill="none"
+        stroke={up ? '#26d97f' : '#ff4d4d'} strokeWidth="1.5"
+        strokeLinejoin="round" strokeLinecap="round" />
     </svg>
   )
 }
 
 export default function SymbolSearch({ value, onChange, onSelect, placeholder = 'Search symbol or company…', autoFocus = false }) {
-  const [query,      setQuery]      = useState(value || '')
-  const [results,    setResults]    = useState([])
+  const [query,      setQuery]     = useState(value || '')
+  const [results,    setResults]   = useState([])
   const [sparklines, setSparklines] = useState({})
-  const [open,       setOpen]       = useState(false)
-  const [focused,    setFocused]    = useState(0)
+  const [open,       setOpen]      = useState(false)
+  const [focused,    setFocused]   = useState(0)
+  const [dropStyle,  setDropStyle] = useState({})
   const debounce = useRef(null)
   const inputRef = useRef(null)
+  const wrapRef  = useRef(null)
 
   useEffect(() => {
     if (autoFocus) inputRef.current?.focus()
   }, [autoFocus])
 
-  // Fetch sparklines for current results (non-blocking, uses cache)
+  // Recalculate fixed position of dropdown to escape overflow clipping
+  function recalcDrop() {
+    const el = wrapRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    setDropStyle({
+      position: 'fixed',
+      top:   rect.bottom + 4,
+      left:  rect.left,
+      width: rect.width,
+      zIndex: 9999,
+    })
+  }
+
+  useEffect(() => {
+    if (open) recalcDrop()
+  }, [open, results])
+
+  // Close on outside click
+  useEffect(() => {
+    if (!open) return
+    const handler = (e) => {
+      if (!wrapRef.current?.contains(e.target)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  // Fetch sparklines for current results
   useEffect(() => {
     if (!results.length) { setSparklines({}); return }
-
-    // Apply already-cached entries immediately
     const cached = {}
     results.forEach(a => {
-      if (_sparkCache.has(a.symbol) && _sparkCache.get(a.symbol) !== null) {
+      if (_sparkCache.has(a.symbol) && _sparkCache.get(a.symbol) !== null)
         cached[a.symbol] = _sparkCache.get(a.symbol)
-      }
     })
     if (Object.keys(cached).length) setSparklines(cached)
-
-    // Fetch missing ones
     results.forEach(a => {
-      if (_sparkCache.has(a.symbol)) return   // already fetched or in flight
-      _sparkCache.set(a.symbol, null)          // mark in-flight
+      if (_sparkCache.has(a.symbol)) return
+      _sparkCache.set(a.symbol, null)
       api.get(`/sparkline/${a.symbol}`)
         .then(r => {
           _sparkCache.set(a.symbol, r.data)
@@ -103,7 +120,7 @@ export default function SymbolSearch({ value, onChange, onSelect, placeholder = 
   }
 
   return (
-    <div className="sym-search-wrap" onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget)) setOpen(false) }}>
+    <div ref={wrapRef} className="sym-search-wrap">
       <input
         ref={inputRef}
         className="sym-search-input"
@@ -115,8 +132,8 @@ export default function SymbolSearch({ value, onChange, onSelect, placeholder = 
         autoComplete="off"
         spellCheck={false}
       />
-      {open && (
-        <div className="sym-search-dropdown">
+      {open && results.length > 0 && (
+        <div className="sym-search-dropdown" style={dropStyle}>
           {results.map((a, i) => (
             <div
               key={a.symbol}
