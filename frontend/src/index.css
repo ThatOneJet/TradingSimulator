@@ -153,34 +153,8 @@ body {
   z-index: 1; pointer-events: none;
 }
 
-/* ── Setup Guide widget card ── */
-.setup-guide {
-  background: var(--bg-card);
-  border: 1px solid var(--hairline-2);
-  border-radius: var(--radius);
-  box-shadow: var(--card-shadow);
-  flex-shrink: 0;
-  position: relative;
-}
-.setup-guide::before {
-  content: '';
-  position: absolute; left: 0; top: 0; bottom: 0;
-  width: 2px; background: #b39dff; opacity: 0.5;
-  z-index: 1; pointer-events: none;
-  border-radius: 2px 0 0 2px;
-}
-.setup-guide-hd {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 9px 12px 8px 14px;
-  border-bottom: 1px solid var(--hairline-2);
-  background: rgba(7,9,15,0.55);
-  flex-shrink: 0;
-}
-.setup-guide-body {
-  padding: 10px 12px 12px 14px;
-}
+/* ── Setup Guide widget — fully inline-styled in SetupGuideWidget.jsx ── */
+.setup-guide { border-radius: 10px; overflow: hidden; }
 .watchlist:hover {
   border-color: var(--acc-line);
   box-shadow: 0 0 0 1px var(--acc-line), 0 0 18px var(--acc-glow), var(--card-shadow);

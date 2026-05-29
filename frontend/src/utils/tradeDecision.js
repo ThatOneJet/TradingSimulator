@@ -8,19 +8,23 @@ export function computeDecision(data, price) {
   const atr = data.atr || price * 0.02
   const atrPct = data.atr_pct ?? 2
 
+  // ── Regime weight multipliers ───────────────────────────────────────────────
+  const rsibbMult  = data.regime === 'consolidating'                                    ? 1.3 : 1.0
+  const macdtrendMult = (data.regime === 'trending_up' || data.regime === 'trending_down') ? 1.3 : 1.0
+
   // ── RSI — 6-tier grading ────────────────────────────────────────────────────
-  if      (rsi <= 20)  { score += 3.0;  signals.push({ t: `RSI ${rsi.toFixed(1)} — extreme oversold (top 1% of readings). Mean-reversion buy is high probability`,          bull: true  }) }
-  else if (rsi <= 28)  { score += 2.0;  signals.push({ t: `RSI ${rsi.toFixed(1)} — oversold zone. Buyers historically dominate at these levels; watch for confirmation`,     bull: true  }) }
-  else if (rsi <= 38)  { score += 1.0;  signals.push({ t: `RSI ${rsi.toFixed(1)} — mild oversold bias. Momentum is fading from the downside`,                               bull: true  }) }
-  else if (rsi >= 80)  { score -= 3.0;  signals.push({ t: `RSI ${rsi.toFixed(1)} — extreme overbought (top 1% of readings). Sharp reversal or pullback likely`,              bull: false }) }
-  else if (rsi >= 72)  { score -= 2.0;  signals.push({ t: `RSI ${rsi.toFixed(1)} — overbought zone. Selling pressure typically increases at these levels`,                   bull: false }) }
-  else if (rsi >= 62)  { score -= 1.0;  signals.push({ t: `RSI ${rsi.toFixed(1)} — mild overbought bias. Upside momentum is thinning`,                                      bull: false }) }
+  if      (rsi <= 20)  { score += 3.0 * rsibbMult;  signals.push({ t: `RSI ${rsi.toFixed(1)} — extreme oversold (top 1% of readings). Mean-reversion buy is high probability`,          bull: true  }) }
+  else if (rsi <= 28)  { score += 2.0 * rsibbMult;  signals.push({ t: `RSI ${rsi.toFixed(1)} — oversold zone. Buyers historically dominate at these levels; watch for confirmation`,     bull: true  }) }
+  else if (rsi <= 38)  { score += 1.0 * rsibbMult;  signals.push({ t: `RSI ${rsi.toFixed(1)} — mild oversold bias. Momentum is fading from the downside`,                               bull: true  }) }
+  else if (rsi >= 80)  { score -= 3.0 * rsibbMult;  signals.push({ t: `RSI ${rsi.toFixed(1)} — extreme overbought (top 1% of readings). Sharp reversal or pullback likely`,              bull: false }) }
+  else if (rsi >= 72)  { score -= 2.0 * rsibbMult;  signals.push({ t: `RSI ${rsi.toFixed(1)} — overbought zone. Selling pressure typically increases at these levels`,                   bull: false }) }
+  else if (rsi >= 62)  { score -= 1.0 * rsibbMult;  signals.push({ t: `RSI ${rsi.toFixed(1)} — mild overbought bias. Upside momentum is thinning`,                                      bull: false }) }
 
   // ── MACD — fresh crossovers weighted more than sustained ────────────────────
-  if      (data.macd_cross === 'bullish_cross') { score += 3.0;  signals.push({ t: `MACD bullish crossover — momentum just flipped positive. One of the strongest short-term entry signals`,   bull: true  }) }
-  else if (data.macd_cross === 'bearish_cross') { score -= 3.0;  signals.push({ t: `MACD bearish crossover — momentum just flipped negative. Classic exit or short signal`,                     bull: false }) }
-  else if (data.macd_cross === 'bullish')       { score += 1.5;  signals.push({ t: `MACD ${(data.macd_value ?? 0).toFixed(4)} above signal (${(data.macd_signal_value ?? 0).toFixed(4)}) — sustained bullish momentum. Histogram: ${((data.macd_value ?? 0) - (data.macd_signal_value ?? 0)).toFixed(4)}`, bull: true }) }
-  else if (data.macd_cross === 'bearish')       { score -= 1.5;  signals.push({ t: `MACD ${(data.macd_value ?? 0).toFixed(4)} below signal (${(data.macd_signal_value ?? 0).toFixed(4)}) — sustained bearish momentum. Bears are in control`,                                             bull: false }) }
+  if      (data.macd_cross === 'bullish_cross') { score += 3.0 * macdtrendMult;  signals.push({ t: `MACD bullish crossover — momentum just flipped positive. One of the strongest short-term entry signals`,   bull: true  }) }
+  else if (data.macd_cross === 'bearish_cross') { score -= 3.0 * macdtrendMult;  signals.push({ t: `MACD bearish crossover — momentum just flipped negative. Classic exit or short signal`,                     bull: false }) }
+  else if (data.macd_cross === 'bullish')       { score += 1.5 * macdtrendMult;  signals.push({ t: `MACD ${(data.macd_value ?? 0).toFixed(4)} above signal (${(data.macd_signal_value ?? 0).toFixed(4)}) — sustained bullish momentum. Histogram: ${((data.macd_value ?? 0) - (data.macd_signal_value ?? 0)).toFixed(4)}`, bull: true }) }
+  else if (data.macd_cross === 'bearish')       { score -= 1.5 * macdtrendMult;  signals.push({ t: `MACD ${(data.macd_value ?? 0).toFixed(4)} below signal (${(data.macd_signal_value ?? 0).toFixed(4)}) — sustained bearish momentum. Bears are in control`,                                             bull: false }) }
 
   // ── Stochastic — with actual %K and %D values ───────────────────────────────
   if      (stochK <= 15) { score += 1.5;  signals.push({ t: `Stoch %K ${stochK.toFixed(1)} — deep oversold (below 15). Snap-back rally typically follows; watch for %K > %D cross`,  bull: true  }) }
@@ -35,11 +39,11 @@ export function computeDecision(data, price) {
   else if (data.volume_signal === 'low')       { score *= 0.65; signals.push({ t: `Volume ${volRatio.toFixed(2)}× of average — well below normal. All signals carry reduced weight until volume confirms`,           bull: null  }) }
 
   // ── Bollinger Bands ──────────────────────────────────────────────────────────
-  if      (data.bb_position === 'oversold')   { score += 1.5;  signals.push({ t: `Price below lower BB ($${(data.bb_lower_val ?? 0).toFixed(2)}) — statistically extreme, only ~2.3% of days. Reversion to midline probable`,    bull: true  }) }
-  else if (data.bb_position === 'overbought') { score -= 1.5;  signals.push({ t: `Price above upper BB ($${(data.bb_upper_val ?? 0).toFixed(2)}) — statistically extreme, only ~2.3% of days. Mean reversion probable`,           bull: false }) }
-  else if (data.bb_position === 'squeeze')    {                 signals.push({ t: `BB squeeze active — bands narrowing to historical low. A large volatility breakout is imminent; direction TBD`,                                  bull: null  }) }
-  else if (data.bb_position === 'upper_half') { score += 0.5;  signals.push({ t: `Price in upper BB half — constructive. Mild bullish bias with room before overbought`,                                                           bull: true  }) }
-  else if (data.bb_position === 'lower_half') { score -= 0.5;  signals.push({ t: `Price in lower BB half — mild bearish pressure. Support at lower band ($${(data.bb_lower_val ?? 0).toFixed(2)})`,                               bull: false }) }
+  if      (data.bb_position === 'oversold')   { score += 1.5 * rsibbMult;  signals.push({ t: `Price below lower BB ($${(data.bb_lower_val ?? 0).toFixed(2)}) — statistically extreme, only ~2.3% of days. Reversion to midline probable`,          bull: true  }) }
+  else if (data.bb_position === 'overbought') { score -= 1.5 * rsibbMult;  signals.push({ t: `Price above upper BB ($${(data.bb_upper_val ?? 0).toFixed(2)}) — statistically extreme, only ~2.3% of days. Mean reversion probable`,                 bull: false }) }
+  else if (data.bb_position === 'squeeze')    {                              signals.push({ t: `BB squeeze active — bands narrowing to historical low. A large volatility breakout is imminent; direction TBD`,                                        bull: null  }) }
+  else if (data.bb_position === 'lower_half') { score += 0.5 * rsibbMult;  signals.push({ t: `Price in lower BB half — approaching support near lower band ($${(data.bb_lower_val ?? 0).toFixed(2)}). Mild mean-reversion bullish lean`,            bull: true  }) }
+  else if (data.bb_position === 'upper_half') { score -= 0.5 * rsibbMult;  signals.push({ t: `Price in upper BB half — approaching resistance near upper band ($${(data.bb_upper_val ?? 0).toFixed(2)}). Mild mean-reversion bearish lean`,          bull: false }) }
 
   // ── VWAP — with distance ────────────────────────────────────────────────────
   const vwapDist = data.vwap_value ? ((price - data.vwap_value) / data.vwap_value * 100).toFixed(2) : null
@@ -47,9 +51,9 @@ export function computeDecision(data, price) {
   else if (data.vwap_signal === 'below') { score -= 1.0;  signals.push({ t: `Price ${vwapDist != null ? `${Math.abs(vwapDist)}% ` : ''}below VWAP ($${(data.vwap_value ?? 0).toFixed(2)}) — institutional algorithms net short today`, bull: false }) }
 
   // ── Trend — linear regression direction ────────────────────────────────────
-  if      (data.trend === 'up')   { score += 1.5;  signals.push({ t: `Regression slope positive — price in confirmed uptrend. Buy dips, trail stops on strength`,    bull: true  }) }
-  else if (data.trend === 'down') { score -= 1.5;  signals.push({ t: `Regression slope negative — price in confirmed downtrend. Sell rallies, shorting has tailwind`, bull: false }) }
-  else                            { score -= 0.25; signals.push({ t: `Sideways trend — no directional edge from price structure. Breakout required for trend trade`,   bull: null  }) }
+  if      (data.trend === 'up')   { score += 1.5 * macdtrendMult;  signals.push({ t: `Regression slope positive — price in confirmed uptrend. Buy dips, trail stops on strength`,    bull: true  }) }
+  else if (data.trend === 'down') { score -= 1.5 * macdtrendMult;  signals.push({ t: `Regression slope negative — price in confirmed downtrend. Sell rallies, shorting has tailwind`, bull: false }) }
+  else                            {                                  signals.push({ t: `Sideways trend — no directional edge from price structure. Breakout required for trend trade`,   bull: null  }) }
 
   // ── Volatility regime adjustment ────────────────────────────────────────────
   if (atrPct > 5) {
@@ -57,6 +61,17 @@ export function computeDecision(data, price) {
     signals.push({ t: `ATR ${(atr).toFixed(2)} (${atrPct.toFixed(1)}%) — elevated volatility regime. All signals discounted; widen stops to 2× ATR`, bull: null })
   } else if (atrPct < 0.8) {
     signals.push({ t: `ATR ${(atr).toFixed(2)} (${atrPct.toFixed(1)}%) — very low volatility. Compressed coil; breakout likely. Direction unclear until it fires`, bull: null })
+  }
+
+  // ── Regime high-volatility discount ─────────────────────────────────────────
+  if (data.regime === 'high_volatility') {
+    score *= 0.70
+  }
+
+  // ── MTF alignment bonus/penalty ──────────────────────────────────────────────
+  if (data.mtf) {
+    if (data.mtf.bull_count >= 2) score += 0.5
+    else if (data.mtf.bear_count >= 2) score -= 0.5
   }
 
   // ── Decision ────────────────────────────────────────────────────────────────
@@ -109,5 +124,7 @@ export function computeDecision(data, price) {
     riskDist:   +riskDist.toFixed(2),
     rewardDist: +rewardDist.toFixed(2),
     rr, signals, bulls, bears, neutrals, summary,
+    regime: data.regime || 'neutral',
+    mtf: data.mtf || null,
   }
 }

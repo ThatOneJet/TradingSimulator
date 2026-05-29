@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import api from '../api.js'
 import { computeDecision } from '../utils/tradeDecision.js'
+import AIThesisPanel from './AIThesisPanel.jsx'
 
 function f(n, d = 2) { return (n == null || isNaN(n)) ? '—' : Number(n).toFixed(d) }
 
@@ -21,6 +22,20 @@ const SIG_COLOR = {
   above: '#3ddc97', below: '#ff476f',
   high_up: '#3ddc97', high_down: '#ff476f',
   low: '#f5b342', normal: '#6b7689',
+}
+
+const MARKET_STATE_CFG = {
+  panic:              { color: '#ff1a4e', label: 'PANIC',          bg: 'rgba(255,26,78,0.12)'  },
+  overbought_extreme: { color: '#ff476f', label: 'OVERBOUGHT',     bg: 'rgba(255,71,111,0.10)' },
+  oversold_extreme:   { color: '#3ddc97', label: 'OVERSOLD',       bg: 'rgba(61,220,151,0.10)' },
+  breakout:           { color: '#f5b342', label: 'BREAKOUT',       bg: 'rgba(245,179,66,0.10)' },
+  trending_up:        { color: '#3ddc97', label: 'TRENDING UP',    bg: 'rgba(61,220,151,0.08)' },
+  trending_down:      { color: '#ff476f', label: 'TRENDING DOWN',  bg: 'rgba(255,71,111,0.08)' },
+  accumulation:       { color: '#4ad9ff', label: 'ACCUMULATION',   bg: 'rgba(74,217,255,0.08)' },
+  ranging:            { color: '#8899aa', label: 'RANGING',        bg: 'rgba(136,153,170,0.07)' },
+  mild_uptrend:       { color: '#5ee8a9', label: 'MILD UPTREND',   bg: 'rgba(94,232,169,0.07)' },
+  mild_downtrend:     { color: '#ff6a6a', label: 'MILD DOWNTREND', bg: 'rgba(255,106,106,0.07)' },
+  neutral:            { color: '#6b7689', label: 'NEUTRAL',        bg: 'rgba(107,118,137,0.06)' },
 }
 
 function SigBadge({ val }) {
@@ -61,6 +76,42 @@ function Row({ label, value, color, badge, mono = true }) {
         {badge && <SigBadge val={badge} />}
         {value}
       </span>
+    </div>
+  )
+}
+
+function ContribBar({ label, contrib, signal, weight = 1, penalty = false }) {
+  const maxC = 3.5
+  const pct   = Math.min(100, Math.abs(contrib) / maxC * 100)
+  const color = contrib > 0.05 ? '#3ddc97' : contrib < -0.05 ? '#ff476f' : '#475061'
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 3 }}>
+        <div style={{ display: 'flex', gap: 5, alignItems: 'center' }}>
+          <span style={{ fontSize: 9.5, fontFamily: 'var(--font-mono)', color: 'var(--t-3)', letterSpacing: '0.05em' }}>{label}</span>
+          {weight !== 1 && <span style={{ fontSize: 8, color: '#f5b342', fontFamily: 'var(--font-mono)' }}>×{weight.toFixed(1)}</span>}
+          {penalty   && <span style={{ fontSize: 8, color: '#ff6a6a' }}>trend↓</span>}
+        </div>
+        <div style={{ display: 'flex', gap: 5, alignItems: 'center' }}>
+          {signal && <SigBadge val={signal} />}
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color, fontWeight: 700 }}>
+            {contrib > 0 ? '+' : ''}{contrib.toFixed(2)}
+          </span>
+        </div>
+      </div>
+      <div style={{ position: 'relative', height: 4, background: 'rgba(140,170,220,0.08)', borderRadius: 2 }}>
+        <div style={{ position: 'absolute', left: '50%', top: 0, bottom: 0, width: 1, background: 'rgba(140,170,220,0.15)' }} />
+        {contrib !== 0 && (
+          <div style={{
+            position: 'absolute',
+            [contrib > 0 ? 'left' : 'right']: 0,
+            width: `${pct / 2}%`,
+            top: 0, bottom: 0,
+            background: color, borderRadius: 2, opacity: 0.8,
+            transition: 'width 0.4s',
+          }} />
+        )}
+      </div>
     </div>
   )
 }
@@ -314,23 +365,15 @@ function PageHd({ label, color }) {
   )
 }
 
-// ── Paginated Card — cycles infinitely ────────────────────────────────────────
+// ── Paginated content — nav + page body, no outer card wrapper ───────────────
 
-function PaginatedCard({ title, dot, pages }) {
+function PaginatedContent({ dot, pages }) {
   const [page, setPage] = useState(0)
   const n = pages.length
   const prev = () => setPage(p => (p - 1 + n) % n)
   const next = () => setPage(p => (p + 1) % n)
-
   return (
-    <div className="ap-card ap-paged-card">
-      {/* Centered title row */}
-      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 7, fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--t-2)', marginBottom: n > 1 ? 6 : 8 }}>
-        <div className="ap-dot" style={{ background: dot }} />
-        <span>{title}</span>
-      </div>
-
-      {/* Centered nav row */}
+    <>
       {n > 1 && (
         <div className="ap-pnav" style={{ justifyContent: 'center', marginBottom: 2 }}>
           <button className="ap-pnav-btn" onClick={prev}>‹</button>
@@ -338,8 +381,6 @@ function PaginatedCard({ title, dot, pages }) {
           <button className="ap-pnav-btn" onClick={next}>›</button>
         </div>
       )}
-
-      {/* Page indicator dots */}
       {n > 1 && (
         <div className="ap-pdots">
           {pages.map((_, i) => (
@@ -349,10 +390,61 @@ function PaginatedCard({ title, dot, pages }) {
           ))}
         </div>
       )}
-
       <div className="ap-page-body">
         {pages[page]?.content}
       </div>
+    </>
+  )
+}
+
+// ── Tabbed indicator card — two tabs each with their own paginated content ────
+
+function TabbedIndicatorCard({ momentumPages, contextPages }) {
+  const [activeTab, setActiveTab] = useState('momentum')
+  const tabs = [
+    { key: 'momentum', label: 'Momentum Signals', dot: '#4ad9ff', pages: momentumPages },
+    { key: 'context',  label: 'Market Context',   dot: '#3ddc97', pages: contextPages  },
+  ]
+  const active = tabs.find(t => t.key === activeTab)
+
+  return (
+    <div className="ap-card ap-paged-card">
+      {/* Tab switcher */}
+      <div style={{ display: 'flex', marginBottom: 12, marginLeft: -12, marginRight: -12, marginTop: -8, borderBottom: '1px solid rgba(140,170,220,0.10)' }}>
+        {tabs.map(t => (
+          <button
+            key={t.key}
+            onClick={() => setActiveTab(t.key)}
+            style={{
+              flex: 1, padding: '7px 4px 8px', border: 'none', cursor: 'pointer',
+              background: activeTab === t.key ? `${t.dot}0d` : 'transparent',
+              color: activeTab === t.key ? t.dot : '#475061',
+              fontSize: '9px', fontWeight: activeTab === t.key ? 700 : 400,
+              letterSpacing: '0.08em', textTransform: 'uppercase',
+              borderBottom: activeTab === t.key ? `2px solid ${t.dot}` : '2px solid transparent',
+              fontFamily: 'var(--font-mono)', transition: 'color 0.15s',
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      <PaginatedContent key={activeTab} dot={active.dot} pages={active.pages} />
+    </div>
+  )
+}
+
+// ── Paginated Card — standalone card (kept for backward compat) ───────────────
+
+function PaginatedCard({ title, dot, pages }) {
+  return (
+    <div className="ap-card ap-paged-card">
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 7, fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--t-2)', marginBottom: 8 }}>
+        <div className="ap-dot" style={{ background: dot }} />
+        <span>{title}</span>
+      </div>
+      <PaginatedContent dot={dot} pages={pages} />
     </div>
   )
 }
@@ -593,14 +685,26 @@ function TradeGuide({ data, price }) {
 
 // ── Analysis Tab ───────────────────────────────────────────────────────────────
 
-function AnalysisTab({ data, price }) {
+function AnalysisTab({ data, price, symbol }) {
   if (!data) return <div className="ap-placeholder">Loading indicators…</div>
 
-  const macdDiff  = (data.macd_value ?? 0) - (data.macd_signal_value ?? 0)
-  const macdColor = macdDiff >= 0 ? '#3ddc97' : '#ff476f'
-
+  const macdDiff   = (data.macd_value ?? 0) - (data.macd_signal_value ?? 0)
+  const macdColor  = macdDiff >= 0 ? '#3ddc97' : '#ff476f'
   const trendColor = data.trend === 'up' ? '#3ddc97' : data.trend === 'down' ? '#ff476f' : '#f5b342'
   const trendLabel = data.trend === 'up' ? '▲ UPTREND' : data.trend === 'down' ? '▼ DOWNTREND' : '→ SIDEWAYS'
+
+  // MTF helpers
+  const mtf = data.mtf
+  const mtfArrow = (d) => d?.trend === 'up' ? '↗' : d?.trend === 'down' ? '↘' : '→'
+  const mtfColor = (d) => d?.trend === 'up' ? '#3ddc97' : d?.trend === 'down' ? '#ff476f' : '#f5b342'
+  const mtfMacdColor = (d) => (d?.macd ?? '').startsWith('bullish') ? '#3ddc97' : (d?.macd ?? '').startsWith('bearish') ? '#ff476f' : '#475061'
+  const mtfBbColor   = (d) => {
+    const b = d?.bb ?? ''
+    return (b === 'oversold' || b === 'lower_half') ? '#3ddc97' : (b === 'overbought' || b === 'upper_half') ? '#ff476f' : '#475061'
+  }
+  const alignColor = mtf?.alignment === 'bullish' ? '#3ddc97' : mtf?.alignment === 'bearish' ? '#ff476f' : '#f5b342'
+  const total   = (mtf?.bull_count ?? 0) + (mtf?.bear_count ?? 0)
+  const bullPct = total > 0 ? ((mtf?.bull_count ?? 0) / total) * 100 : 50
 
   const momentumPages = [
     {
@@ -611,14 +715,14 @@ function AnalysisTab({ data, price }) {
           <div style={{ textAlign: 'center', padding: '10px 0 6px' }}>
             <span style={{ fontSize: 22, fontWeight: 900, fontFamily: 'var(--font-mono)', color: trendColor, letterSpacing: '0.06em' }}>{trendLabel}</span>
           </div>
-          <Row label="DIRECTION" value={data.trend ?? '—'} color={trendColor} />
-          <Row label="ATR (volatility)" value={`$${f(data.atr)}`} color="var(--t-2)" />
+          <Row label="DIRECTION"  value={data.trend ?? '—'} color={trendColor} />
+          <Row label="ATR"        value={`$${f(data.atr)}`} color="var(--t-2)" />
           <Row label="SUPPORT"    value={data.support    != null ? `$${f(data.support)}`    : '—'} color="#3ddc97" />
           <Row label="RESISTANCE" value={data.resistance != null ? `$${f(data.resistance)}` : '—'} color="#ff476f" />
           <Interp>
             {data.trend === 'up'   && `Linear regression slope is positive — price is making higher highs and higher lows. Buy dips toward support ($${f(data.support)}). Resistance at $${f(data.resistance)} is the next target.`}
             {data.trend === 'down' && `Regression slope is negative — price is making lower highs and lower lows. Sell rallies toward resistance ($${f(data.resistance)}). Support at $${f(data.support)} is the next target.`}
-            {data.trend !== 'up' && data.trend !== 'down' && `Price is moving sideways with no directional bias. Range-trade between support ($${f(data.support)}) and resistance ($${f(data.resistance)}). Wait for a breakout before taking a directional trade.`}
+            {data.trend !== 'up' && data.trend !== 'down' && `Price is moving sideways. Range-trade between support ($${f(data.support)}) and resistance ($${f(data.resistance)}). Wait for a breakout before taking a directional trade.`}
           </Interp>
         </>
       ),
@@ -644,8 +748,7 @@ function AnalysisTab({ data, price }) {
           <PageHd label="MACD · Momentum Divergence" color="#4ad9ff" />
           <Row label="MACD LINE"   value={`${data.macd_value >= 0 ? '+' : ''}${f(data.macd_value, 4)}`} color={macdColor} />
           <Row label="SIGNAL LINE" value={f(data.macd_signal_value, 4)} color="var(--t-2)" />
-          <Row label="HISTOGRAM"   value={`${macdDiff >= 0 ? '+' : ''}${f(macdDiff, 4)}`}
-            color={macdColor} badge={data.macd_cross} />
+          <Row label="HISTOGRAM"   value={`${macdDiff >= 0 ? '+' : ''}${f(macdDiff, 4)}`} color={macdColor} badge={data.macd_cross} />
           <Interp>{macdInterp(data.macd_cross, data.macd_value, data.macd_signal_value)}</Interp>
         </>
       ),
@@ -700,9 +803,9 @@ function AnalysisTab({ data, price }) {
       content: (
         <>
           <PageHd label="ATR (14) · Average True Range" color="#ff476f" />
-          <Row label="ATR VALUE" value={`$${f(data.atr)}`}      color="var(--t-2)" />
-          <Row label="ATR %"     value={`${f(data.atr_pct)}%`}  color={data.atr_pct > 3 ? '#f5b342' : 'var(--t-2)'} />
-          <Row label="1.5× STOP" value={`$${f((data.atr ?? 0) * 1.5)}`} color="#ff476f" />
+          <Row label="ATR VALUE"   value={`$${f(data.atr)}`}               color="var(--t-2)" />
+          <Row label="ATR %"       value={`${f(data.atr_pct)}%`}           color={data.atr_pct > 3 ? '#f5b342' : 'var(--t-2)'} />
+          <Row label="1.5× STOP"   value={`$${f((data.atr ?? 0) * 1.5)}`} color="#ff476f" />
           <Row label="2.5× TARGET" value={`$${f((data.atr ?? 0) * 2.5)}`} color="#3ddc97" />
           <Interp>{atrInterp(data.atr, data.atr_pct)}</Interp>
         </>
@@ -720,14 +823,68 @@ function AnalysisTab({ data, price }) {
         </>
       ),
     },
+    ...(mtf ? [{
+      name: 'Multi-Timeframe',
+      content: (
+        <>
+          <PageHd label="Multi-Timeframe Alignment" color={alignColor} />
+
+          {/* 3-column timeframe grid */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 0, border: '1px solid rgba(140,170,220,0.08)', borderRadius: 6, overflow: 'hidden', marginBottom: 10 }}>
+            {[['1H', mtf['1H']], ['1D', mtf['1D']], ['1W', mtf['1W']]].map(([tf, d], i) => (
+              <div key={tf} style={{
+                padding: '10px 4px 8px',
+                textAlign: 'center',
+                borderRight: i < 2 ? '1px solid rgba(140,170,220,0.08)' : 'none',
+                background: 'rgba(0,0,0,0.2)',
+              }}>
+                <div style={{ fontSize: 9, color: '#475061', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 5 }}>{tf}</div>
+                <div style={{ fontSize: 26, color: mtfColor(d), lineHeight: 1 }}>{mtfArrow(d)}</div>
+                {d?.rsi != null && (
+                  <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: d.rsi <= 30 ? '#3ddc97' : d.rsi >= 70 ? '#ff476f' : '#6b7689', marginTop: 5 }}>
+                    RSI {d.rsi.toFixed(0)}
+                  </div>
+                )}
+                <div style={{ display: 'flex', justifyContent: 'center', gap: 4, marginTop: 6 }}>
+                  <span title={`MACD: ${d?.macd ?? '—'}`} style={{ width: 6, height: 6, borderRadius: '50%', background: mtfMacdColor(d), display: 'inline-block' }} />
+                  <span title={`BB: ${d?.bb ?? '—'}`}     style={{ width: 6, height: 6, borderRadius: '50%', background: mtfBbColor(d),   display: 'inline-block' }} />
+                </div>
+                <div style={{ fontSize: 8, color: '#333d4d', marginTop: 4 }}>MACD · BB</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Alignment badge + consensus bar */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+            <span style={{ fontSize: 9, color: '#475061', textTransform: 'uppercase', letterSpacing: '0.07em' }}>Consensus</span>
+            <span style={{
+              padding: '2px 8px', borderRadius: 4, fontSize: 10, fontWeight: 700,
+              background: `${alignColor}18`, color: alignColor,
+              border: `1px solid ${alignColor}44`, textTransform: 'capitalize',
+            }}>
+              {mtf.alignment ?? 'mixed'}
+            </span>
+          </div>
+          <div style={{ marginBottom: 4 }}>
+            <div style={{ height: 6, borderRadius: 3, overflow: 'hidden', background: 'rgba(255,71,111,0.2)', display: 'flex' }}>
+              <div style={{ width: `${bullPct}%`, background: '#3ddc97', transition: 'width 0.4s', borderRadius: 3 }} />
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#475061', marginTop: 3 }}>
+              <span style={{ color: '#3ddc97' }}>▲ {mtf.bull_count ?? 0} bullish</span>
+              <span style={{ color: '#ff476f' }}>{mtf.bear_count ?? 0} bearish ▼</span>
+            </div>
+          </div>
+        </>
+      ),
+    }] : []),
   ]
 
   return (
     <div className="ap-content">
-      <SmartSummaryCard data={data} price={price} />
-      <PaginatedCard title="Momentum Signals" dot="#4ad9ff" pages={momentumPages} />
-      <PaginatedCard title="Market Context"   dot="#3ddc97" pages={contextPages} />
-      {/* TradeGuide lives as its own sidebar widget — see SetupGuideWidget.jsx */}
+      <TabbedIndicatorCard momentumPages={momentumPages} contextPages={contextPages} />
+      <div style={{ borderTop: '1px solid rgba(140,170,220,0.07)', marginTop: 2 }}>
+        <AIThesisPanel data={data} price={price} symbol={symbol} />
+      </div>
     </div>
   )
 }
@@ -890,6 +1047,144 @@ function AIDecisionTab({ data, price }) {
   )
 }
 
+// ── AI Intel Tab ──────────────────────────────────────────────────────────────
+
+const INDIC_LABELS = { rsi: 'RSI', macd: 'MACD', stoch: 'STOCH', volume: 'VOLUME', bb: 'BB', vwap: 'VWAP', trend: 'TREND' }
+
+function AIIntelTab({ detail, aiLoading, aiError }) {
+  if (aiLoading && !detail) return <div className="ap-placeholder">Fetching AI analysis…</div>
+  if (aiError && !detail) return (
+    <div style={{ padding: 16, textAlign: 'center' }}>
+      <div style={{ fontSize: 10, color: '#ff6a6a', marginBottom: 4 }}>⚠ {aiError}</div>
+      <div style={{ fontSize: 9, color: 'var(--t-4)' }}>Restart the backend if this persists</div>
+    </div>
+  )
+  if (!detail) return <div className="ap-placeholder">No intelligence data yet.</div>
+
+  const { market_state, uncertainty, summary, what_changed, breakdown, score, weights_used } = detail
+  const cfg          = MARKET_STATE_CFG[market_state] ?? MARKET_STATE_CFG.neutral
+  const scoreColor   = score >= 2.5 ? '#3ddc97' : score <= -2.5 ? '#ff476f' : score > 0 ? '#5ee8a9' : score < 0 ? '#ff6a6a' : '#8899aa'
+  const uncertColor  = uncertainty >= 0.6 ? '#ff476f' : uncertainty >= 0.4 ? '#f5b342' : '#3ddc97'
+  const uncertLabel  = uncertainty >= 0.6 ? 'High' : uncertainty >= 0.4 ? 'Moderate' : 'Low'
+  const scorePct     = Math.min(100, Math.abs(score) / 10 * 100)
+
+  return (
+    <div className="ap-content">
+
+      {/* Market Regime Card */}
+      <div className="ap-card" style={{ background: cfg.bg, border: `1px solid ${cfg.color}28`, padding: '14px 12px', textAlign: 'center' }}>
+        <div style={{ fontSize: 8, letterSpacing: '0.14em', color: 'var(--t-4)', marginBottom: 5 }}>MARKET REGIME</div>
+        <div style={{ fontFamily: 'var(--font-mono)', fontSize: 18, fontWeight: 900, color: cfg.color, letterSpacing: '0.06em', marginBottom: 10 }}>
+          {cfg.label}
+        </div>
+        <div style={{ fontSize: 8, color: 'var(--t-4)', marginBottom: 4 }}>AI SCORE</div>
+        <div style={{ position: 'relative', height: 6, background: 'rgba(140,170,220,0.08)', borderRadius: 3, marginBottom: 5 }}>
+          <div style={{ position: 'absolute', left: '50%', top: 0, bottom: 0, width: 1, background: 'rgba(140,170,220,0.2)' }} />
+          {score !== 0 && (
+            <div style={{
+              position: 'absolute',
+              left: score >= 0 ? '50%' : `${50 - scorePct / 2}%`,
+              width: `${scorePct / 2}%`,
+              top: 0, bottom: 0,
+              background: scoreColor, borderRadius: 3, opacity: 0.85, transition: 'width 0.4s',
+            }} />
+          )}
+        </div>
+        <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: scoreColor, fontWeight: 700 }}>
+          {score > 0 ? '+' : ''}{score.toFixed(2)}
+        </div>
+      </div>
+
+      {/* Uncertainty + What Changed */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+        <div className="ap-card" style={{ padding: '10px 10px' }}>
+          <div style={{ fontSize: 8, letterSpacing: '0.1em', color: 'var(--t-4)', marginBottom: 5 }}>UNCERTAINTY</div>
+          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 16, fontWeight: 800, color: uncertColor, marginBottom: 5 }}>
+            {Math.round(uncertainty * 100)}%
+          </div>
+          <div style={{ height: 4, background: 'rgba(140,170,220,0.08)', borderRadius: 2 }}>
+            <div style={{ height: '100%', width: `${uncertainty * 100}%`, background: uncertColor, borderRadius: 2, opacity: 0.75, transition: 'width 0.4s' }} />
+          </div>
+          <div style={{ fontSize: 8, color: uncertColor, marginTop: 3, fontWeight: 700, letterSpacing: '0.07em' }}>{uncertLabel}</div>
+        </div>
+
+        <div className="ap-card" style={{ padding: '10px 10px' }}>
+          <div style={{ fontSize: 8, letterSpacing: '0.1em', color: 'var(--t-4)', marginBottom: 5 }}>WHAT CHANGED</div>
+          {what_changed?.length > 0 ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+              {what_changed.slice(0, 3).map((c, i) => (
+                <div key={i} style={{ fontSize: 8.5, color: '#f5b342', fontFamily: 'var(--font-mono)', lineHeight: 1.4, letterSpacing: '0.02em' }}>
+                  › {c}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ fontSize: 9, color: 'var(--t-4)', lineHeight: 1.5 }}>No changes detected</div>
+          )}
+        </div>
+      </div>
+
+      {/* AI Summary */}
+      <div className="ap-card">
+        <div style={{ fontSize: 8, letterSpacing: '0.12em', color: 'var(--t-4)', marginBottom: 6, textTransform: 'uppercase' }}>AI Market Summary</div>
+        <div style={{ fontSize: 10.5, color: 'var(--t-2)', lineHeight: 1.7, padding: '8px 10px', background: 'rgba(140,170,220,0.03)', borderLeft: `2px solid ${cfg.color}55`, borderRadius: '0 4px 4px 0' }}>
+          {summary || 'Analysis pending…'}
+        </div>
+      </div>
+
+      {/* Per-Indicator Breakdown */}
+      <div className="ap-card">
+        <div className="ap-card-hd">
+          <div className="ap-dot" style={{ background: '#b39dff' }} />
+          Signal Breakdown
+        </div>
+        {Object.entries(INDIC_LABELS).map(([key, label]) => {
+          const b = breakdown?.[key]
+          if (!b) return null
+          return (
+            <ContribBar
+              key={key}
+              label={label}
+              contrib={b.contribution ?? 0}
+              signal={b.signal}
+              weight={b.weight ?? 1}
+              penalty={b.trend_penalty_applied}
+            />
+          )
+        })}
+
+        {breakdown?.ema50_gate?.gate_triggered && (
+          <div style={{ marginTop: 6, padding: '5px 8px', background: 'rgba(255,71,111,0.06)', border: '1px solid rgba(255,71,111,0.15)', borderRadius: 4, fontSize: 9.5, color: '#ff6a6a', lineHeight: 1.4 }}>
+            ⚠ EMA50 gate — price is {Math.abs(Math.round((1 - (breakdown.ema50_gate.price_vs_ema50 ?? 1)) * 100))}% below 50-day MA. Buy signals capped.
+          </div>
+        )}
+
+        {/* Adaptive weights legend */}
+        {weights_used && Object.keys(weights_used).length > 0 && (
+          <div style={{ marginTop: 10, paddingTop: 8, borderTop: '1px solid rgba(140,170,220,0.07)' }}>
+            <div style={{ fontSize: 8, color: 'var(--t-4)', letterSpacing: '0.1em', marginBottom: 4 }}>
+              ADAPTIVE WEIGHTS · {(market_state ?? '').replace(/_/g, ' ').toUpperCase()}
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+              {Object.entries(weights_used).map(([k, v]) => (
+                <span key={k} style={{
+                  fontSize: 8, fontFamily: 'var(--font-mono)', padding: '2px 6px',
+                  border: '1px solid rgba(140,170,220,0.15)', borderRadius: 3,
+                  color: v > 1.1 ? '#f5b342' : v < 0.9 ? '#8899aa' : 'var(--t-4)',
+                  background: v > 1.1 ? 'rgba(245,179,66,0.06)' : 'transparent',
+                }}>
+                  {k.toUpperCase()} ×{Number(v).toFixed(1)}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+    </div>
+  )
+}
+
 // ── Live Quote Bar ─────────────────────────────────────────────────────────────
 
 function LiveQuoteBar({ quote, extQuote, secsAgo }) {
@@ -933,18 +1228,50 @@ function LiveQuoteBar({ quote, extQuote, secsAgo }) {
 // ── Main export ────────────────────────────────────────────────────────────────
 
 export default function AnalysisPanel({ symbol, quote, delta }) {
-  const [tab,      setTab]      = useState('analysis')
-  const [data,     setData]     = useState(null)
-  const [loading,  setLoading]  = useState(false)
-  const [extQuote, setExtQuote] = useState(null)
-  const [secsAgo,  setSecsAgo]  = useState(0)
+  const [tab,       setTab]      = useState('analysis')
+  const [data,      setData]     = useState(null)
+  const [loading,   setLoading]  = useState(false)
+  const [extQuote,  setExtQuote] = useState(null)
+  const [secsAgo,   setSecsAgo]  = useState(0)
+  const [aiDetail,  setAiDetail] = useState(null)
+  const [aiLoading, setAiLoading]= useState(false)
+  const [aiError,   setAiError]  = useState(null)
   const lastUpdRef = useRef(null)
   const refreshRef = useRef(null)
 
   useEffect(() => {
     setExtQuote(null)
     setSecsAgo(0)
+    setAiDetail(null)
+    setAiError(null)
     lastUpdRef.current = null
+  }, [symbol])
+
+  // AI Intelligence fetch — /api/analysis/<symbol> every 90s
+  useEffect(() => {
+    if (!symbol) return
+    let cancelled = false
+    const doFetch = () => {
+      setAiLoading(true)
+      setAiError(null)
+      api.get(`/analysis/${symbol}`, { timeout: 30000 })
+        .then(r => {
+          if (!cancelled) {
+            if (r.data?.error) setAiError(r.data.error)
+            else setAiDetail(r.data)
+            setAiLoading(false)
+          }
+        })
+        .catch(e => {
+          if (!cancelled) {
+            setAiError(e?.response?.data?.error || e?.message || 'Request failed')
+            setAiLoading(false)
+          }
+        })
+    }
+    doFetch()
+    const id = setInterval(doFetch, 90_000)
+    return () => { cancelled = true; clearInterval(id) }
   }, [symbol])
 
   useEffect(() => {
@@ -1030,8 +1357,15 @@ export default function AnalysisPanel({ symbol, quote, delta }) {
         <button className={`ap-tab${tab === 'ai' ? ' active ai-tab' : ' ai-tab'}`} onClick={() => setTab('ai')}>
           AI Decision
         </button>
+        <button className={`ap-tab${tab === 'intel' ? ' active' : ''}`} onClick={() => setTab('intel')}
+          style={{ position: 'relative' }}>
+          AI Intel
+          {aiDetail && tab !== 'intel' && aiDetail.what_changed?.length > 0 && (
+            <span style={{ position: 'absolute', top: 5, right: 4, width: 5, height: 5, borderRadius: '50%', background: '#f5b342' }} />
+          )}
+        </button>
         <div className="ap-tab-indicators">
-          {loading && <span className="ap-spinner" />}
+          {(loading || aiLoading) && <span className="ap-spinner" />}
           {data && price && !loading && <span className="ap-live-pip" title="Data ready" />}
           <button
             className="ap-refresh-btn"
@@ -1044,8 +1378,9 @@ export default function AnalysisPanel({ symbol, quote, delta }) {
 
       <LiveQuoteBar quote={quote} extQuote={extQuote} secsAgo={secsAgo} />
 
-      {tab === 'analysis' && <AnalysisTab data={data} price={price} />}
+      {tab === 'analysis' && <AnalysisTab data={data} price={price} symbol={symbol} />}
       {tab === 'ai'       && <AIDecisionTab data={data} price={price} />}
+      {tab === 'intel'    && <AIIntelTab detail={aiDetail} aiLoading={aiLoading} aiError={aiError} />}
 
     </div>
   )

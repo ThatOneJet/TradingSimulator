@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import api from '../api.js'
+import OptionProjectionWidget from '../components/OptionProjectionWidget'
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
@@ -129,13 +130,14 @@ function TileGrid({ endpoint, onChart, label }) {
 // ── Options chain ─────────────────────────────────────────────────────────────
 
 function OptionsChain({ defaultSymbol }) {
-  const [sym,     setSym]     = useState(defaultSymbol || 'AAPL')
-  const [input,   setInput]   = useState(defaultSymbol || 'AAPL')
-  const [data,    setData]    = useState(null)
-  const [expiry,  setExpiry]  = useState('')
-  const [side,    setSide]    = useState('calls')  // 'calls' | 'puts'
-  const [loading, setLoading] = useState(false)
-  const [error,   setError]   = useState('')
+  const [sym,            setSym]            = useState(defaultSymbol || 'AAPL')
+  const [input,          setInput]          = useState(defaultSymbol || 'AAPL')
+  const [data,           setData]           = useState(null)
+  const [expiry,         setExpiry]         = useState('')
+  const [side,           setSide]           = useState('calls')  // 'calls' | 'puts'
+  const [loading,        setLoading]        = useState(false)
+  const [error,          setError]          = useState('')
+  const [selectedOption, setSelectedOption] = useState(null)
 
   const fetchChain = useCallback((symbol, exp) => {
     if (!symbol) return
@@ -212,6 +214,16 @@ function OptionsChain({ defaultSymbol }) {
         )}
       </div>
 
+      {/* Projection widget renders ABOVE the table so it's always visible on click */}
+      {selectedOption && (
+        <OptionProjectionWidget
+          option={selectedOption}
+          underlyingPrice={spot}
+          onClose={() => setSelectedOption(null)}
+          onAddToPortfolio={() => alert('Select a portfolio in the main view first, then use the Trade panel to add positions.')}
+        />
+      )}
+
       {loading && <div style={{ color: 'var(--t-3)', fontSize: 12, padding: '20px 0' }}>Loading options chain…</div>}
       {error   && <div style={{ color: 'var(--err)', fontSize: 12, padding: '20px 0' }}>{error}</div>}
 
@@ -231,15 +243,17 @@ function OptionsChain({ defaultSymbol }) {
             </thead>
             <tbody>
               {rows.map((r, i) => {
-                const isATM  = spot > 0 && Math.abs(r.strike - spot) === Math.min(...rows.map(x => Math.abs(x.strike - spot)))
-                const itmBg  = r.itm
-                  ? (side === 'calls' ? 'rgba(61,220,151,0.06)' : 'rgba(255,71,111,0.06)')
-                  : 'transparent'
-                const chgColor = r.change_pct >= 0 ? '#3ddc97' : '#ff476f'
+                const isATM      = spot > 0 && Math.abs(r.strike - spot) === Math.min(...rows.map(x => Math.abs(x.strike - spot)))
+                const itmBg      = r.itm ? (side === 'calls' ? 'rgba(61,220,151,0.06)' : 'rgba(255,71,111,0.06)') : 'transparent'
+                const isSelected = selectedOption?.strike === r.strike && selectedOption?.type === side
+                const baseBg     = isSelected ? 'rgba(255,106,26,0.10)' : (isATM ? 'rgba(100,140,255,0.08)' : itmBg)
+                const chgColor   = r.change_pct >= 0 ? '#3ddc97' : '#ff476f'
                 return (
-                  <tr key={i} style={{ background: isATM ? 'rgba(100,140,255,0.08)' : itmBg, borderBottom: '1px solid rgba(140,170,220,0.05)', transition: 'background .1s' }}
-                    onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-card-hi)' }}
-                    onMouseLeave={e => { e.currentTarget.style.background = isATM ? 'rgba(100,140,255,0.08)' : itmBg }}
+                  <tr key={i}
+                    style={{ background: baseBg, borderBottom: '1px solid rgba(140,170,220,0.05)', cursor: 'pointer' }}
+                    onClick={() => setSelectedOption(isSelected ? null : { ...r, type: side })}
+                    onMouseEnter={e => { e.currentTarget.style.background = isSelected ? 'rgba(255,106,26,0.15)' : 'var(--bg-card-hi)' }}
+                    onMouseLeave={e => { e.currentTarget.style.background = baseBg }}
                   >
                     <td style={{ padding: '5px 10px', fontWeight: isATM ? 700 : 500, color: isATM ? 'var(--cy)' : 'var(--t-1)' }}>
                       {isATM && <span style={{ fontSize: 8, color: 'var(--cy)', marginRight: 4, opacity: 0.7 }}>ATM</span>}

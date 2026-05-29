@@ -45,190 +45,166 @@ function NewPortfolioForm({ onCancel, onCreate }) {
       noValidate
       style={{
         display: 'flex',
-        alignItems: 'center',
-        gap: 10,
-        padding: '8px 16px',
+        flexDirection: 'column',
+        gap: 8,
+        padding: '10px 16px',
         background: 'var(--bg-card-hi)',
         borderTop: '1px solid var(--hairline-2)',
         flexShrink: 0,
-        flexWrap: 'wrap',
       }}
     >
-      <input
-        autoFocus
-        type="text"
-        value={name}
-        onChange={e => setName(e.target.value)}
-        placeholder="Portfolio name"
-        maxLength={40}
-        style={{
-          background: 'var(--bg-input)',
-          border: '1px solid var(--hairline-2)',
-          borderRadius: 6,
-          padding: '6px 10px',
-          fontSize: 12,
-          color: 'var(--t-1)',
-          fontFamily: 'var(--font-sans)',
-          outline: 'none',
-          width: 140,
-        }}
-      />
-
-      {/* Starting balance */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-        <span style={{ fontSize: 11, color: 'var(--t-3)', fontFamily: 'var(--font-mono)' }}>$</span>
+      {/* Row 1: name, balance, colors */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'nowrap' }}>
         <input
-          type="number"
-          value={initialCash}
-          onChange={e => setInitialCash(e.target.value)}
-          min={100}
-          max={10000000}
-          step={1000}
-          placeholder="100000"
-          title="Starting balance"
+          autoFocus
+          type="text"
+          value={name}
+          onChange={e => setName(e.target.value)}
+          placeholder="Portfolio name"
+          maxLength={40}
           style={{
             background: 'var(--bg-input)',
             border: '1px solid var(--hairline-2)',
             borderRadius: 6,
-            padding: '6px 8px',
+            padding: '5px 9px',
             fontSize: 12,
             color: 'var(--t-1)',
-            fontFamily: 'var(--font-mono)',
+            fontFamily: 'var(--font-sans)',
             outline: 'none',
-            width: 90,
+            width: 130,
+            flexShrink: 0,
           }}
         />
-      </div>
 
-      {/* Color presets */}
-      <div style={{ display: 'flex', gap: 5, alignItems: 'center' }}>
-        {PRESET_COLORS.map(c => (
-          <button
-            key={c}
-            type="button"
-            onClick={() => setColor(c)}
-            title={c}
+        {/* Starting balance */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 3, flexShrink: 0 }}>
+          <span style={{ fontSize: 11, color: 'var(--t-3)', fontFamily: 'var(--font-mono)' }}>$</span>
+          <input
+            type="number"
+            value={initialCash}
+            onChange={e => setInitialCash(e.target.value)}
+            min={100}
+            max={10000000}
+            step={1000}
+            placeholder="100000"
+            title="Starting balance"
             style={{
-              width: 18,
-              height: 18,
-              borderRadius: '50%',
-              background: c,
-              border: color === c ? '2px solid var(--t-1)' : '2px solid transparent',
-              cursor: 'pointer',
-              padding: 0,
-              flexShrink: 0,
+              background: 'var(--bg-input)',
+              border: '1px solid var(--hairline-2)',
+              borderRadius: 6,
+              padding: '5px 7px',
+              fontSize: 12,
+              color: 'var(--t-1)',
+              fontFamily: 'var(--font-mono)',
               outline: 'none',
-              boxShadow: color === c ? '0 0 0 1px ' + c : 'none',
-              transition: 'border .1s, box-shadow .1s',
+              width: 85,
             }}
           />
-        ))}
-        <input
-          type="color"
-          value={color}
-          onChange={e => setColor(e.target.value)}
-          title="Custom color"
-          style={{
-            width: 18,
-            height: 18,
-            padding: 0,
-            border: '1px solid var(--hairline-2)',
-            borderRadius: '50%',
-            cursor: 'pointer',
-            background: 'none',
-          }}
-        />
+        </div>
+
+        {/* Color presets */}
+        <div style={{ display: 'flex', gap: 5, alignItems: 'center', flexShrink: 0 }}>
+          {PRESET_COLORS.map(c => (
+            <button
+              key={c}
+              type="button"
+              onClick={() => setColor(c)}
+              title={c}
+              style={{
+                width: 16,
+                height: 16,
+                borderRadius: '50%',
+                background: c,
+                border: color === c ? '2px solid var(--t-1)' : '2px solid transparent',
+                cursor: 'pointer',
+                padding: 0,
+                flexShrink: 0,
+                outline: 'none',
+                boxShadow: color === c ? '0 0 0 1px ' + c : 'none',
+                transition: 'border .1s, box-shadow .1s',
+              }}
+            />
+          ))}
+          <input
+            type="color"
+            value={color}
+            onChange={e => setColor(e.target.value)}
+            title="Custom color"
+            style={{
+              width: 16, height: 16, padding: 0,
+              border: '1px solid var(--hairline-2)',
+              borderRadius: '50%', cursor: 'pointer', background: 'none',
+            }}
+          />
+        </div>
       </div>
 
-      {/* AI toggle */}
-      <label
-        title="Let the AI autonomously trade this portfolio based on technical indicators"
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 5,
-          cursor: 'pointer',
-          userSelect: 'none',
-          flexShrink: 0,
-        }}
-      >
+      {/* Row 2: AI toggle + buttons */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        {/* AI toggle */}
         <div
           onClick={() => setAiControlled(v => !v)}
-          style={{
-            width: 28,
-            height: 16,
-            borderRadius: 8,
-            background: aiControlled ? '#b39dff' : 'var(--hairline-3)',
-            position: 'relative',
-            transition: 'background .2s',
-            flexShrink: 0,
-            cursor: 'pointer',
-          }}
+          title="Let the AI autonomously scan and trade this portfolio"
+          style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', userSelect: 'none', flexShrink: 0 }}
         >
           <div style={{
-            position: 'absolute',
-            top: 2,
-            left: aiControlled ? 14 : 2,
-            width: 12,
-            height: 12,
-            borderRadius: '50%',
-            background: '#fff',
-            transition: 'left .2s',
-            boxShadow: '0 1px 3px rgba(0,0,0,0.4)',
-          }} />
+            width: 28, height: 16, borderRadius: 8,
+            background: aiControlled ? '#b39dff' : 'rgba(140,170,220,0.2)',
+            position: 'relative', transition: 'background .2s', flexShrink: 0,
+          }}>
+            <div style={{
+              position: 'absolute', top: 2,
+              left: aiControlled ? 14 : 2,
+              width: 12, height: 12, borderRadius: '50%',
+              background: '#fff', transition: 'left .2s',
+              boxShadow: '0 1px 3px rgba(0,0,0,0.4)',
+            }} />
+          </div>
+          <span style={{
+            fontSize: 11, fontWeight: aiControlled ? 700 : 400,
+            color: aiControlled ? '#b39dff' : 'var(--t-3)',
+            transition: 'color .2s',
+          }}>
+            AI Managed
+          </span>
         </div>
-        <span style={{ fontSize: 11, color: aiControlled ? '#b39dff' : 'var(--t-3)', fontWeight: aiControlled ? 700 : 400, transition: 'color .2s' }}>
-          AI Managed
-        </span>
-      </label>
 
-      {error && (
-        <span style={{ color: 'var(--err)', fontSize: 11 }}>{error}</span>
-      )}
+        {error && <span style={{ color: 'var(--err)', fontSize: 11 }}>{error}</span>}
 
-      <div style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
-        <button
-          type="button"
-          onClick={onCancel}
-          style={{
-            padding: '5px 12px',
-            background: 'transparent',
-            border: '1px solid var(--hairline-2)',
-            borderRadius: 6,
-            color: 'var(--t-3)',
-            fontFamily: 'var(--font-sans)',
-            fontSize: 12,
-            cursor: 'pointer',
-          }}
-        >
-          Cancel
-        </button>
-        <button
-          type="submit"
-          disabled={loading}
-          style={{
-            padding: '5px 14px',
-            background: aiControlled ? '#b39dff' : 'var(--acc)',
-            border: 'none',
-            borderRadius: 6,
-            color: '#fff',
-            fontFamily: 'var(--font-sans)',
-            fontWeight: 700,
-            fontSize: 12,
-            cursor: loading ? 'default' : 'pointer',
-            opacity: loading ? 0.6 : 1,
-            transition: 'background .15s',
-          }}
-        >
-          {loading ? 'Creating…' : 'Create'}
-        </button>
+        <div style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
+          <button
+            type="button"
+            onClick={onCancel}
+            style={{
+              padding: '5px 12px', background: 'transparent',
+              border: '1px solid var(--hairline-2)', borderRadius: 6,
+              color: 'var(--t-3)', fontFamily: 'var(--font-sans)', fontSize: 12, cursor: 'pointer',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={loading}
+            style={{
+              padding: '5px 14px',
+              background: aiControlled ? '#b39dff' : 'var(--acc)',
+              border: 'none', borderRadius: 6, color: '#fff',
+              fontFamily: 'var(--font-sans)', fontWeight: 700, fontSize: 12,
+              cursor: loading ? 'default' : 'pointer',
+              opacity: loading ? 0.6 : 1, transition: 'background .15s',
+            }}
+          >
+            {loading ? 'Creating…' : 'Create'}
+          </button>
+        </div>
       </div>
     </form>
   )
 }
 
 // ── Portfolio Tab Card ──────────────────────────────────────────────────────
-function PortfolioCard({ portfolio, account, isActive, onClick, onDelete, canDelete }) {
+function PortfolioCard({ portfolio, account, isActive, onClick, onDelete, canDelete, onContextMenu }) {
   const [hover, setHover] = useState(false)
 
   const pnl    = account?.pnl_day
@@ -266,6 +242,7 @@ function PortfolioCard({ portfolio, account, isActive, onClick, onDelete, canDel
     <div
       style={cardStyle}
       onClick={onClick}
+      onContextMenu={onContextMenu}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
     >
@@ -283,6 +260,9 @@ function PortfolioCard({ portfolio, account, isActive, onClick, onDelete, canDel
       <span style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
         <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
           <span style={{ fontSize: 12, fontWeight: 600, color: isActive ? 'var(--t-1)' : 'var(--t-2)' }}>
+            {portfolio.ai_controlled && (
+              <span style={{ fontSize: '10px', marginRight: '4px', animation: 'aiPulse 2s infinite', display: 'inline-block' }}>🤖</span>
+            )}
             {portfolio.name}
           </span>
           {portfolio.ai_controlled ? (
@@ -351,6 +331,7 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
   const [accounts, setAccounts]     = useState({})
   const [showForm, setShowForm]     = useState(false)
   const [loading, setLoading]       = useState(true)
+  const [ctxMenu, setCtxMenu]       = useState(null)
 
   const loadAll = useCallback(async () => {
     if (!userId) return
@@ -382,6 +363,12 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
   useEffect(() => {
     loadAll()
   }, [loadAll])
+
+  useEffect(() => {
+    const close = () => setCtxMenu(null)
+    if (ctxMenu) document.addEventListener('mousedown', close)
+    return () => document.removeEventListener('mousedown', close)
+  }, [ctxMenu])
 
   useEffect(() => {
     if (!portfolioId) return
@@ -417,10 +404,22 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
     }
   }
 
+  const toggleAI = async (portfolio) => {
+    try {
+      const newVal = !portfolio.ai_controlled
+      await api.patch(`/portfolios/${portfolio.id}`, { ai_controlled: newVal })
+      await loadAll()
+      setCtxMenu(null)
+    } catch (err) {
+      console.error('Failed to toggle AI', err)
+    }
+  }
+
   const canDelete = portfolios.length > 1
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
+      <style>{`@keyframes aiPulse { 0%,100%{opacity:1} 50%{opacity:0.5} }`}</style>
       <div
         className="portfolio-tabs"
         style={{
@@ -458,6 +457,11 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
             onClick={() => onSwitch(p.id)}
             onDelete={() => handleDelete(p.id)}
             canDelete={canDelete}
+            onContextMenu={e => {
+              e.preventDefault()
+              e.stopPropagation()
+              setCtxMenu({ x: e.clientX, y: e.clientY, portfolio: p })
+            }}
           />
         ))}
 
@@ -494,6 +498,67 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
           onCancel={() => setShowForm(false)}
           onCreate={handleCreate}
         />
+      )}
+
+      {ctxMenu && (
+        <div
+          onMouseDown={e => e.stopPropagation()}
+          onClick={e => e.stopPropagation()}
+          style={{
+            position: 'fixed', top: ctxMenu.y, left: ctxMenu.x,
+            zIndex: 9999,
+            background: '#141925',
+            border: '1px solid rgba(140,170,220,0.18)',
+            borderRadius: '8px',
+            padding: '6px 0',
+            minWidth: '180px',
+            boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+            fontFamily: 'var(--font-sans)',
+            fontSize: '13px',
+          }}
+        >
+          {/* AI Toggle */}
+          <div
+            onClick={() => toggleAI(ctxMenu.portfolio)}
+            style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 14px', cursor: 'pointer', color: '#e6ecf5', borderBottom: '1px solid rgba(140,170,220,0.08)' }}
+            onMouseEnter={e => e.currentTarget.style.background = 'rgba(140,170,220,0.07)'}
+            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+          >
+            <span>🤖 AI Controlled</span>
+            <div style={{ width: '32px', height: '18px', borderRadius: '9px', background: ctxMenu.portfolio.ai_controlled ? '#3ddc97' : 'rgba(140,170,220,0.2)', position: 'relative', transition: 'background 0.2s', flexShrink: 0 }}>
+              <div style={{ position: 'absolute', top: '2px', left: ctxMenu.portfolio.ai_controlled ? '16px' : '2px', width: '14px', height: '14px', borderRadius: '50%', background: '#fff', transition: 'left 0.2s' }} />
+            </div>
+          </div>
+          {/* Rename */}
+          <div
+            onClick={() => setCtxMenu(null)}
+            style={{ padding: '8px 14px', cursor: 'pointer', color: '#aab4c5' }}
+            onMouseEnter={e => e.currentTarget.style.background = 'rgba(140,170,220,0.07)'}
+            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+          >
+            Rename
+          </div>
+          {/* Reset Balance */}
+          <div
+            onClick={() => setCtxMenu(null)}
+            style={{ padding: '8px 14px', cursor: 'pointer', color: '#aab4c5' }}
+            onMouseEnter={e => e.currentTarget.style.background = 'rgba(140,170,220,0.07)'}
+            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+          >
+            Reset Balance
+          </div>
+          {/* Delete — only for non-default portfolios */}
+          {ctxMenu.portfolio.id !== 1 && (
+            <div
+              onClick={() => { handleDelete(ctxMenu.portfolio.id); setCtxMenu(null) }}
+              style={{ padding: '8px 14px', cursor: 'pointer', color: '#ff476f', borderTop: '1px solid rgba(140,170,220,0.08)', marginTop: '4px' }}
+              onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,71,111,0.08)'}
+              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+            >
+              Delete Portfolio
+            </div>
+          )}
+        </div>
       )}
     </div>
   )

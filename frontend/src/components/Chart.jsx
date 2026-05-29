@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createChart } from 'lightweight-charts'
 import api from '../api.js'
 
@@ -26,7 +26,6 @@ function removeAttribution(el) {
 
 function fmtTime(t, isDaily) {
   if (!t) return ''
-  // t can be a unix timestamp (number) or date string "YYYY-MM-DD"
   let d
   if (typeof t === 'number') {
     d = new Date(t * 1000)
@@ -42,11 +41,21 @@ function fmtTime(t, isDaily) {
   return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })
 }
 
+function makeTimeFmt(isDaily) {
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone
+  return (t) => {
+    const d = new Date(t * 1000)
+    return isDaily
+      ? d.toLocaleDateString('en-US', { timeZone: tz, month: 'short', day: 'numeric', year: 'numeric' })
+      : d.toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true })
+  }
+}
+
 export default function Chart({ symbol, timeframe, socket, overlays }) {
-  const mainRef = useRef()
-  const macdRef = useRef()
-  const oscRef  = useRef()
-  const tooltipEl = useRef()
+  const mainRef    = useRef()
+  const macdRef    = useRef()
+  const oscRef     = useRef()
+  const tooltipEl  = useRef()
 
   const mainChartRef  = useRef()
   const candleRef     = useRef()
@@ -55,25 +64,40 @@ export default function Chart({ symbol, timeframe, socket, overlays }) {
   const oscChartRef   = useRef()
   const namedSeries   = useRef({})
   const priceLinesRef = useRef([])
+  const intervalRef   = useRef(null)
 
+  const [lastUpdated,  setLastUpdated]  = useState(null)
+  const [refreshFlash, setRefreshFlash] = useState(false)
   const [badges, setBadges] = useState({})
 
   const showMacd = !!overlays?.has('MACD')
   const showOsc  = !!(overlays?.has('RSI') || overlays?.has('Stoch'))
+  const isDaily  = !['1Min', '5Min', '15Min', '1Hour'].includes(timeframe)
 
-  const isDaily = !['1Min', '5Min', '15Min', '1Hour'].includes(timeframe)
+  // ── Bar polling ──────────────────────────────────────────────────────────────
+  const fetchBars = useCallback(() => {
+    api.get(`/bars/${symbol}?timeframe=${timeframe}&limit=300`).then(r => {
+      candleRef.current?.setData(r.data)
+      volumeRef.current?.setData(r.data.map(b => ({
+        time: b.time, value: b.volume,
+        color: b.close >= b.open ? 'rgba(38,217,127,0.25)' : 'rgba(255,77,77,0.25)',
+      })))
+      setLastUpdated(new Date())
+      setRefreshFlash(true)
+      setTimeout(() => setRefreshFlash(false), 800)
+    }).catch(() => {})
+  }, [symbol, timeframe])
 
-  // ── Main chart lifecycle ──────────────────────────────────────────────────────
   useEffect(() => {
-    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone
-    const timeFmt = (t) => {
-      const d = new Date(t * 1000)
-      return isDaily
-        ? d.toLocaleDateString('en-US', { timeZone: tz, month: 'short', day: 'numeric', year: 'numeric' })
-        : d.toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true })
-    }
+    fetchBars()
+    intervalRef.current = setInterval(fetchBars, 60_000)
+    return () => clearInterval(intervalRef.current)
+  }, [fetchBars])
 
-    const mainEl = mainRef.current
+  // ── Main chart (candle + volume + tooltip) — no MACD/OSC ────────────────────
+  useEffect(() => {
+    const timeFmt = makeTimeFmt(isDaily)
+    const mainEl  = mainRef.current
     if (!mainEl) return
 
     const mainChart = createChart(mainEl, {
@@ -100,7 +124,7 @@ export default function Chart({ symbol, timeframe, socket, overlays }) {
     candleRef.current    = candle
     volumeRef.current    = volume
 
-    // ── Custom OHLC tooltip ──
+    // tooltip
     const tip = tooltipEl.current
     const handleCrosshair = (param) => {
       if (!tip) return
@@ -116,12 +140,11 @@ export default function Chart({ symbol, timeframe, socket, overlays }) {
       const chg    = d.close - d.open
       const chgPct = d.open > 0 ? (chg / d.open * 100).toFixed(2) : '0.00'
       const fmt    = n => n?.toFixed(2) ?? '—'
-      const upC    = '#26d97f', dnC = '#ff4d4d'
-      const cc     = isUp ? upC : dnC
+      const upC = '#26d97f', dnC = '#ff4d4d'
+      const cc  = isUp ? upC : dnC
 
-      tip.style.display  = 'flex'
-      tip.style.left     = (flip ? x - tipW - 10 : x + 14) + 'px'
-
+      tip.style.display = 'flex'
+      tip.style.left    = (flip ? x - tipW - 10 : x + 14) + 'px'
       tip.innerHTML = `
         <div class="ct-time">${fmtTime(param.time, isDaily)}</div>
         <div class="ct-chg" style="color:${cc}">${isUp ? '▲' : '▼'} ${fmt(Math.abs(chg))} (${isUp ? '+' : ''}${chgPct}%)</div>
@@ -133,70 +156,89 @@ export default function Chart({ symbol, timeframe, socket, overlays }) {
     }
     mainChart.subscribeCrosshairMove(handleCrosshair)
 
-    // ── Bars fetch + 60s refresh ──
-    const loadBars = () => {
-      api.get(`/bars/${symbol}?timeframe=${timeframe}&limit=300`).then(r => {
-        candle.setData(r.data)
-        volume.setData(r.data.map(b => ({
-          time: b.time, value: b.volume,
-          color: b.close >= b.open ? 'rgba(38,217,127,0.25)' : 'rgba(255,77,77,0.25)',
-        })))
-      }).catch(() => {})
-    }
-    loadBars()
-    const barInterval = setInterval(loadBars, 60_000)
-
-    // ── MACD sub-chart ──
-    let macdChart = null
-    const macdEl = macdRef.current
-    if (showMacd && macdEl) {
-      macdChart = createChart(macdEl, { ...SUB_BASE, width: macdEl.clientWidth, height: macdEl.clientHeight, localization: { timeFormatter: timeFmt } })
-      removeAttribution(macdEl)
-      macdChartRef.current = macdChart
-    } else {
-      macdChartRef.current = null
-    }
-
-    // ── Oscillator sub-chart ──
-    let oscChart = null
-    const oscEl = oscRef.current
-    if (showOsc && oscEl) {
-      oscChart = createChart(oscEl, { ...SUB_BASE, width: oscEl.clientWidth, height: oscEl.clientHeight, localization: { timeFormatter: timeFmt } })
-      removeAttribution(oscEl)
-      oscChartRef.current = oscChart
-    } else {
-      oscChartRef.current = null
-    }
-
-    const syncRange = (range) => {
-      if (!range) return
-      macdChart?.timeScale().setVisibleLogicalRange(range)
-      oscChart?.timeScale().setVisibleLogicalRange(range)
-    }
-    mainChart.timeScale().subscribeVisibleLogicalRangeChange(syncRange)
-
     const ro = new ResizeObserver(() => {
       mainChart.applyOptions({ width: mainEl.clientWidth, height: mainEl.clientHeight })
-      if (macdChart && macdEl) macdChart.applyOptions({ width: macdEl.clientWidth, height: macdEl.clientHeight })
-      if (oscChart  && oscEl)  oscChart.applyOptions( { width: oscEl.clientWidth,  height: oscEl.clientHeight  })
     })
     ro.observe(mainEl)
-    if (macdEl) ro.observe(macdEl)
-    if (oscEl)  ro.observe(oscEl)
 
     return () => {
-      clearInterval(barInterval)
       if (tip) tip.style.display = 'none'
       mainChart.unsubscribeCrosshairMove(handleCrosshair)
-      mainChart.timeScale().unsubscribeVisibleLogicalRangeChange(syncRange)
       ro.disconnect()
       mainChart.remove()
-      macdChart?.remove()
-      oscChart?.remove()
+      mainChartRef.current = null
+      candleRef.current    = null
+      volumeRef.current    = null
     }
-  }, [symbol, timeframe, showMacd, showOsc, isDaily])
+  }, [symbol, timeframe, isDaily])
 
-  // ── Live bar updates via socket ──
+  // ── MACD sub-chart (independent of main chart lifecycle) ─────────────────────
+  useEffect(() => {
+    if (!showMacd) {
+      if (macdChartRef.current) { macdChartRef.current.remove(); macdChartRef.current = null }
+      return
+    }
+    const macdEl = macdRef.current
+    if (!macdEl) return
+
+    const timeFmt  = makeTimeFmt(isDaily)
+    const macdChart = createChart(macdEl, {
+      ...SUB_BASE, width: macdEl.clientWidth, height: macdEl.clientHeight,
+      localization: { timeFormatter: timeFmt },
+    })
+    removeAttribution(macdEl)
+    macdChartRef.current = macdChart
+
+    const syncHandler = (range) => { if (range) macdChart.timeScale().setVisibleLogicalRange(range) }
+    mainChartRef.current?.timeScale().subscribeVisibleLogicalRangeChange(syncHandler)
+
+    const ro = new ResizeObserver(() => {
+      macdChart.applyOptions({ width: macdEl.clientWidth, height: macdEl.clientHeight })
+    })
+    ro.observe(macdEl)
+
+    return () => {
+      mainChartRef.current?.timeScale().unsubscribeVisibleLogicalRangeChange(syncHandler)
+      ro.disconnect()
+      macdChart.remove()
+      macdChartRef.current = null
+    }
+  }, [showMacd, symbol, timeframe, isDaily])
+
+  // ── OSC sub-chart (RSI / Stoch) ──────────────────────────────────────────────
+  useEffect(() => {
+    if (!showOsc) {
+      if (oscChartRef.current) { oscChartRef.current.remove(); oscChartRef.current = null }
+      return
+    }
+    const oscEl = oscRef.current
+    if (!oscEl) return
+
+    const timeFmt = makeTimeFmt(isDaily)
+    const oscChart = createChart(oscEl, {
+      ...SUB_BASE, width: oscEl.clientWidth, height: oscEl.clientHeight,
+      localization: { timeFormatter: timeFmt },
+    })
+    removeAttribution(oscEl)
+    oscChartRef.current = oscChart
+
+    const syncHandler = (range) => { if (range) oscChart.timeScale().setVisibleLogicalRange(range) }
+    mainChartRef.current?.timeScale().subscribeVisibleLogicalRangeChange(syncHandler)
+
+    const ro = new ResizeObserver(() => {
+      oscChart.applyOptions({ width: oscEl.clientWidth, height: oscEl.clientHeight })
+    })
+    ro.observe(oscEl)
+
+    return () => {
+      mainChartRef.current?.timeScale().unsubscribeVisibleLogicalRangeChange(syncHandler)
+      ro.disconnect()
+      oscChart.remove()
+      oscChartRef.current = null
+    }
+  }, [showOsc, symbol, timeframe, isDaily])
+
+  // ── Live bar updates via socket ──────────────────────────────────────────────
   useEffect(() => {
     if (!socket) return
     const handler = ({ symbol: s, bar }) => {
@@ -211,7 +253,7 @@ export default function Chart({ symbol, timeframe, socket, overlays }) {
     return () => socket.off('bar', handler)
   }, [socket, symbol])
 
-  // ── Overlays + indicator data ──
+  // ── Overlays + indicator data ────────────────────────────────────────────────
   useEffect(() => {
     const mainChart = mainChartRef.current
     const candle    = candleRef.current
@@ -226,7 +268,7 @@ export default function Chart({ symbol, timeframe, socket, overlays }) {
         try { macd?.removeSeries(s) } catch {}
         try { osc?.removeSeries(s)  } catch {}
       })
-      priceLinesRef.current.forEach(pl => { try { candle?.removePriceLine(pl) } catch {} })
+      priceLinesRef.current.forEach(pl => { try { candleRef.current?.removePriceLine(pl) } catch {} })
       priceLinesRef.current = []
       namedSeries.current   = {}
       setBadges({})
@@ -239,10 +281,11 @@ export default function Chart({ symbol, timeframe, socket, overlays }) {
       try { s.setData(data) } catch {}
     }
 
-    function applyData(d, creating) {
+    function applyData(d) {
       const mc   = mainChartRef.current
       const macd = macdChartRef.current
       const osc  = oscChartRef.current
+      const cv   = candleRef.current
       const newBadges = {}
 
       if (overlays.has('SMA20') && d.sma20?.length)
@@ -264,13 +307,11 @@ export default function Chart({ symbol, timeframe, socket, overlays }) {
         newBadges.vwap = { signal: d.vwap_signal, value: d.vwap_value }
       }
 
-      if (overlays.has('Proj')) {
-        setOrCreate('proj', mc, c => c.addLineSeries({ color: 'rgba(255,255,255,0.22)', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false }), d.projection)
-        if (creating && candle) {
-          priceLinesRef.current.forEach(pl => { try { candle.removePriceLine(pl) } catch {} })
-          priceLinesRef.current = []
-          if (d.support    != null) priceLinesRef.current.push(candle.createPriceLine({ price: d.support,    color: '#3ddc97aa', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'S' }))
-          if (d.resistance != null) priceLinesRef.current.push(candle.createPriceLine({ price: d.resistance, color: '#ff476faa', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'R' }))
+      // Proj: only S/R horizontal price lines, no forward path series
+      if (overlays.has('Proj') && cv) {
+        if (!priceLinesRef.current.length) {
+          if (d.support    != null) priceLinesRef.current.push(cv.createPriceLine({ price: d.support,    color: '#3ddc97aa', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'S' }))
+          if (d.resistance != null) priceLinesRef.current.push(cv.createPriceLine({ price: d.resistance, color: '#ff476faa', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'R' }))
         }
       }
 
@@ -310,16 +351,19 @@ export default function Chart({ symbol, timeframe, socket, overlays }) {
     if (!overlays || overlays.size === 0) { clearAll(); return }
 
     let cancelled = false
-    const fetchOverlays = (creating) => {
-      api.get(`/projection/${symbol}`).then(r => {
-        if (cancelled || !mainChartRef.current) return
-        if (creating) clearAll()
-        applyData(r.data, creating)
-      }).catch(() => { if (!cancelled && creating) clearAll() })
-    }
+    api.get(`/projection/${symbol}`).then(r => {
+      if (cancelled || !mainChartRef.current) return
+      clearAll()
+      applyData(r.data)
+    }).catch(() => { if (!cancelled) clearAll() })
 
-    fetchOverlays(true)
-    const overlayInterval = setInterval(() => fetchOverlays(false), 60_000)
+    const overlayInterval = setInterval(() => {
+      if (!mainChartRef.current) return
+      api.get(`/projection/${symbol}`).then(r => {
+        if (!mainChartRef.current) return
+        applyData(r.data)
+      }).catch(() => {})
+    }, 60_000)
 
     return () => {
       cancelled = true
@@ -339,7 +383,6 @@ export default function Chart({ symbol, timeframe, socket, overlays }) {
 
   return (
     <div className="chart-stack">
-      {/* Main chart + tooltip overlay */}
       <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         <div ref={mainRef} className="chart-main" />
         <div ref={tooltipEl} className="chart-tooltip" />
@@ -356,6 +399,19 @@ export default function Chart({ symbol, timeframe, socket, overlays }) {
         <div className="chart-sub chart-sub-osc">
           <span className="chart-sub-label">{oscLabel}</span>
           <div ref={oscRef} style={{ width: '100%', height: '100%' }} />
+        </div>
+      )}
+
+      {lastUpdated && (
+        <div style={{ display: 'flex', alignItems: 'center', padding: '2px 8px 4px' }}>
+          <span style={{
+            display: 'inline-block', width: '6px', height: '6px', borderRadius: '50%',
+            background: refreshFlash ? '#3ddc97' : 'rgba(61,220,151,0.25)',
+            transition: 'background 0.3s ease', marginRight: '6px', flexShrink: 0,
+          }} />
+          <span style={{ fontSize: '10px', color: 'rgba(140,170,220,0.45)', fontFamily: 'var(--font-mono)' }}>
+            Updated {lastUpdated.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          </span>
         </div>
       )}
 

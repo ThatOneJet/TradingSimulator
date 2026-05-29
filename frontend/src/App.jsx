@@ -15,6 +15,10 @@ import SetupGuideWidget from './components/SetupGuideWidget.jsx'
 import ExplorePage from './pages/ExplorePage.jsx'
 import MarketsPage from './pages/MarketsPage.jsx'
 import AnalysisPanel from './components/AnalysisPanel.jsx'
+import RiskPanel from './components/RiskPanel'
+import OptionsPanel from './components/OptionsPanel'
+import AILogPanel from './components/AILogPanel'
+import RankingsPanel from './components/RankingsPanel.jsx'
 import Settings from './pages/Settings.jsx'
 import NewsTicker from './components/NewsTicker.jsx'
 import api from './api.js'
@@ -40,6 +44,11 @@ export default function App() {
   const [railOpen,    setRailOpen]    = useState(false)
   const [widgetsOpen, setWidgetsOpen] = useState(true)
   const [railTab,     setRailTab]     = useState('chart')
+  const [leftTab,     setLeftTab]     = useState('watch') // 'watch'|'analysis'|'risk'|'rankings'
+  const [rightTab,    setRightTab]    = useState('trade') // 'trade'|'options'|'log'
+
+  // ── Projection data (fetched on symbol change, shared across panels) ──────
+  const [projectionData, setProjectionData] = useState(null)
 
   // ── Trading state ─────────────────────────────────────────────────────────
   const [symbol,    setSymbol]    = useState('AAPL')
@@ -72,8 +81,10 @@ export default function App() {
     api.post(`/subscribe/${symbol}`)
     setDelta(null)
     setCompany(null)
+    setProjectionData(null)
     api.get(`/quote/${symbol}`).then(r => setDelta(r.data)).catch(() => {})
     api.get(`/company/${symbol}`).then(r => setCompany(r.data)).catch(() => {})
+    api.get(`/projection/${symbol}`).then(r => setProjectionData(r.data)).catch(() => {})
   }, [symbol])
 
   // ── Live quote via SocketIO ───────────────────────────────────────────────
@@ -127,24 +138,70 @@ export default function App() {
       {/* ── TitleBar: row 1, all columns ── */}
       <TitleBar symbol={symbol} account={account} />
 
-      {/* ── Left widget stack: row 2, col 1 ── */}
+      {/* ── Left panel: row 2, col 1 ── */}
       <aside className="widgets-col">
-        {/* Scrollable content — footer stays pinned below */}
-        <div className="widgets-scroll">
-          <Watchlist
-            active={symbol}
-            onSelect={setSymbol}
-            socket={socket}
-            onWatchlistChange={setWatchlistSymbols}
-            portfolioId={portfolioId}
-            onPrioritySymbol={setSymbol}
-          />
-          <Positions positions={positions} onRefresh={refresh} portfolioId={portfolioId} />
-          <AnalysisPanel symbol={symbol} quote={quote} delta={delta} />
-          <SetupGuideWidget symbol={symbol} quote={quote} delta={delta} />
+        {/* Tab bar */}
+        <div style={{
+          display: 'flex', flexShrink: 0,
+          borderBottom: '1px solid rgba(140,170,220,0.08)',
+          background: 'rgba(0,0,0,0.2)',
+        }}>
+          {[
+            { key: 'watch',    label: 'Watch'    },
+            { key: 'analysis', label: 'Analysis' },
+            { key: 'rankings', label: 'Rank'     },
+            { key: 'risk',     label: 'Risk'     },
+          ].map(t => (
+            <button
+              key={t.key}
+              onClick={() => setLeftTab(t.key)}
+              style={{
+                flex: 1, padding: '7px 0', border: 'none', cursor: 'pointer',
+                background: leftTab === t.key ? 'rgba(179,157,255,0.1)' : 'transparent',
+                color: leftTab === t.key ? '#b39dff' : '#475061',
+                fontSize: '10px', fontWeight: leftTab === t.key ? 700 : 400,
+                borderBottom: leftTab === t.key ? '2px solid #b39dff' : '2px solid transparent',
+                fontFamily: 'var(--font-sans)', transition: 'color 0.15s',
+                whiteSpace: 'nowrap', overflow: 'hidden',
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
         </div>
 
-        {/* User profile footer — always visible, never scrolls away */}
+        {/* Tab content — scrollable */}
+        <div className="widgets-scroll">
+          {leftTab === 'watch' && (
+            <>
+              <Watchlist
+                active={symbol}
+                onSelect={setSymbol}
+                socket={socket}
+                onWatchlistChange={setWatchlistSymbols}
+                portfolioId={portfolioId}
+                onPrioritySymbol={setSymbol}
+              />
+              <div style={{ borderTop: '1px solid rgba(140,170,220,0.08)' }}>
+                <Positions positions={positions} onRefresh={refresh} portfolioId={portfolioId} totalValue={account?.portfolio_value} />
+              </div>
+              <div style={{ borderTop: '1px solid rgba(140,170,220,0.08)' }}>
+                <SetupGuideWidget symbol={symbol} quote={quote} delta={delta} />
+              </div>
+            </>
+          )}
+          {leftTab === 'analysis' && (
+            <AnalysisPanel symbol={symbol} quote={quote} delta={delta} />
+          )}
+          {leftTab === 'rankings' && (
+            <RankingsPanel portfolioId={portfolioId} onSelect={(sym) => { setSymbol(sym); setLeftTab('watch') }} />
+          )}
+          {leftTab === 'risk' && (
+            <RiskPanel symbol={symbol} portfolioId={portfolioId} price={midPrice} />
+          )}
+        </div>
+
+        {/* User profile footer */}
         <div className="wl-user-foot">
           <div
             className="nav-foot-avatar"
@@ -240,17 +297,96 @@ export default function App() {
               </div>
             </div>
 
+            {/* Signal strip — compact inline stats bar (no longer expandable) */}
+            {projectionData && (
+              <div style={{ height: '26px', display: 'flex', alignItems: 'center', padding: '0 10px', gap: '10px', borderTop: '1px solid rgba(140,170,220,0.07)', background: 'rgba(0,0,0,0.1)', flexShrink: 0 }}>
+                <span style={{ fontSize: '9px', color: '#475061', letterSpacing: '0.07em', textTransform: 'uppercase' }}>Signals</span>
+                {projectionData.regime && (
+                  <span style={{ fontSize: '10px', padding: '0 6px', borderRadius: '3px', background: 'rgba(140,170,220,0.08)', color: '#aab4c5' }}>
+                    {projectionData.regime.replace(/_/g, ' ')}
+                  </span>
+                )}
+                {projectionData.rsi != null && (
+                  <span style={{ fontSize: '10px', color: projectionData.rsi <= 30 ? '#3ddc97' : projectionData.rsi >= 70 ? '#ff476f' : '#6b7689' }}>
+                    RSI {Number(projectionData.rsi).toFixed(0)}
+                  </span>
+                )}
+                {projectionData.macd_cross && (
+                  <span style={{ fontSize: '10px', color: projectionData.macd_cross.startsWith('bullish') ? '#3ddc97' : '#ff476f' }}>
+                    MACD {projectionData.macd_cross.replace(/_/g, ' ')}
+                  </span>
+                )}
+                {projectionData.mtf?.alignment && (
+                  <span style={{ fontSize: '10px', padding: '0 6px', borderRadius: '3px', background: projectionData.mtf.alignment === 'bullish' ? 'rgba(61,220,151,0.1)' : projectionData.mtf.alignment === 'bearish' ? 'rgba(255,71,111,0.1)' : 'rgba(245,179,66,0.1)', color: projectionData.mtf.alignment === 'bullish' ? '#3ddc97' : projectionData.mtf.alignment === 'bearish' ? '#ff476f' : '#f5b342' }}>
+                    MTF {projectionData.mtf.alignment}
+                  </span>
+                )}
+              </div>
+            )}
+
             <div className="ch-body">
               <Chart symbol={symbol} timeframe={timeframe} socket={socket} overlays={overlays} />
-              <TradePanel
-                symbol={symbol}
-                account={account}
-                positions={positions}
-                onOrderPlaced={refresh}
-                portfolioId={portfolioId}
-                quote={quote}
-                onReset={refresh}
-              />
+
+              {/* Right panel — Trade | Options | Log tabs */}
+              <div style={{ display: 'flex', flexDirection: 'column', width: '240px', flexShrink: 0, borderLeft: '1px solid rgba(140,170,220,0.08)', overflow: 'hidden' }}>
+                {/* Tab bar */}
+                <div style={{ display: 'flex', flexShrink: 0, borderBottom: '1px solid rgba(140,170,220,0.08)', background: 'rgba(0,0,0,0.2)' }}>
+                  {[
+                    { key: 'trade',   label: 'Trade'   },
+                    { key: 'options', label: 'Options' },
+                    { key: 'log',     label: 'AI Scan', dot: account?.ai_controlled },
+                  ].map(t => (
+                    <button
+                      key={t.key}
+                      onClick={() => setRightTab(t.key)}
+                      style={{
+                        flex: 1, padding: '7px 0', border: 'none', cursor: 'pointer',
+                        background: rightTab === t.key ? 'rgba(179,157,255,0.1)' : 'transparent',
+                        color: rightTab === t.key ? '#b39dff' : '#475061',
+                        fontSize: '10px', fontWeight: rightTab === t.key ? 700 : 400,
+                        borderBottom: rightTab === t.key ? '2px solid #b39dff' : '2px solid transparent',
+                        fontFamily: 'var(--font-sans)', transition: 'color 0.15s',
+                        position: 'relative',
+                      }}
+                    >
+                      {t.label}
+                      {t.dot ? (
+                        <span style={{
+                          position: 'absolute', top: 5, right: 4,
+                          width: 5, height: 5, borderRadius: '50%',
+                          background: '#3ddc97',
+                          boxShadow: '0 0 4px #3ddc97',
+                          animation: 'aiPulse 2s infinite',
+                        }} />
+                      ) : null}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Tab content */}
+                <div style={{ flex: 1, overflowY: rightTab === 'log' ? 'hidden' : 'auto', overflowX: 'hidden', display: 'flex', flexDirection: 'column' }}>
+                  {rightTab === 'trade' && (
+                    <TradePanel
+                      symbol={symbol}
+                      account={account}
+                      positions={positions}
+                      onOrderPlaced={refresh}
+                      portfolioId={portfolioId}
+                      quote={quote}
+                      onReset={refresh}
+                    />
+                  )}
+                  {rightTab === 'options' && (
+                    <OptionsPanel symbol={symbol} />
+                  )}
+                  {rightTab === 'log' && (
+                    <AILogPanel
+                      portfolioId={portfolioId}
+                      isAiControlled={!!account?.ai_controlled}
+                    />
+                  )}
+                </div>
+              </div>
             </div>
           </>
         )}

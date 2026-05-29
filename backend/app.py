@@ -1,4 +1,4 @@
-import os, threading, sqlite3, time as _time, json as _json, csv, io, hashlib, random
+import os, threading, sqlite3, time as _time, json as _json, csv, io, hashlib, random, math
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory
@@ -139,6 +139,36 @@ def _init_db():
         # Ensure sim_state row 1 has portfolio_id = 1
         conn.execute("UPDATE sim_state SET portfolio_id = 1 WHERE id = 1 AND portfolio_id != 1")
 
+        try:
+            conn.execute('ALTER TABLE sim_trades ADD COLUMN fill_price REAL')
+        except Exception:
+            pass
+        try:
+            conn.execute('ALTER TABLE sim_trades ADD COLUMN slippage_cost REAL')
+        except Exception:
+            pass
+        try:
+            conn.execute('ALTER TABLE sim_positions ADD COLUMN stop_price REAL')
+        except Exception:
+            pass
+
+        # Signal history — tracks per-symbol state for "what changed?" detection
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS signal_history (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol       TEXT    NOT NULL,
+                portfolio_id INTEGER NOT NULL DEFAULT 0,
+                score        REAL,
+                market_state TEXT,
+                rsi          REAL,
+                macd_cross   TEXT,
+                trend        TEXT,
+                bb_position  TEXT,
+                volume_signal TEXT,
+                recorded_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        ''')
+
         # Safe migration: add priority column if not present
         try:
             conn.execute('ALTER TABLE watchlist_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0')
@@ -150,6 +180,28 @@ def _init_db():
             conn.execute('ALTER TABLE portfolios ADD COLUMN ai_controlled INTEGER NOT NULL DEFAULT 0')
         except Exception:
             pass
+
+        # Migration: fix sim_positions unique constraint (old schema had UNIQUE on symbol alone;
+        # must be UNIQUE on (symbol, portfolio_id) to allow multiple portfolios to hold the same stock)
+        try:
+            conn.execute("INSERT INTO sim_positions (symbol, shares, avg_cost, portfolio_id) VALUES ('__chk__', 0, 0, 1)")
+            conn.execute("INSERT INTO sim_positions (symbol, shares, avg_cost, portfolio_id) VALUES ('__chk__', 0, 0, 2)")
+            conn.execute("DELETE FROM sim_positions WHERE symbol = '__chk__'")
+        except Exception:
+            # UNIQUE constraint on symbol alone — rebuild without it
+            conn.execute('''
+                CREATE TABLE sim_positions_new (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol       TEXT    NOT NULL,
+                    shares       REAL    NOT NULL DEFAULT 0,
+                    avg_cost     REAL    NOT NULL DEFAULT 0,
+                    realized_pl  REAL    NOT NULL DEFAULT 0,
+                    portfolio_id INTEGER NOT NULL DEFAULT 1
+                )
+            ''')
+            conn.execute('INSERT INTO sim_positions_new (symbol, shares, avg_cost, realized_pl, portfolio_id) SELECT symbol, shares, avg_cost, realized_pl, portfolio_id FROM sim_positions')
+            conn.execute('DROP TABLE sim_positions')
+            conn.execute('ALTER TABLE sim_positions_new RENAME TO sim_positions')
 
         # AI trade log
         conn.execute('''
@@ -166,9 +218,35 @@ def _init_db():
             )
         ''')
 
+        # AI scan run history
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS ai_scan_runs (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id INTEGER NOT NULL,
+                scanned      INTEGER DEFAULT 0,
+                bought_count INTEGER DEFAULT 0,
+                sold_count   INTEGER DEFAULT 0,
+                error_count  INTEGER DEFAULT 0,
+                bought_json  TEXT,
+                sold_json    TEXT,
+                batch_json   TEXT,
+                created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        ''')
+
         # Seed default watchlist for portfolio 1
         for _sym in ('AAPL', 'TSLA', 'NVDA', 'SPY'):
             conn.execute('INSERT OR IGNORE INTO watchlist_items (portfolio_id, symbol) VALUES (1, ?)', (_sym,))
+
+        # Migrations: add columns introduced after initial schema
+        for _col, _defn in [
+            ('mode',        "TEXT DEFAULT 'full'"),
+            ('skip_reason', 'TEXT'),
+        ]:
+            try:
+                conn.execute(f'ALTER TABLE ai_scan_runs ADD COLUMN {_col} {_defn}')
+            except Exception:
+                pass  # column already exists
 
 _init_db()
 
@@ -181,6 +259,11 @@ _PRICE_TTL = 30
 _quote_cache: dict[str, tuple[dict, float]] = {}
 _QUOTE_TTL  = 60
 _subscribed_symbols: set = set()
+_stream_manager    = None  # set in __main__ after StreamManager is instantiated
+_candle_engine     = None  # set in __main__ after CandleEngine is instantiated
+_structure_engine  = None  # set in __main__ after StructureEngine is instantiated
+_portfolio_analytics = None  # set in __main__ after PortfolioAnalytics is instantiated
+_perf_engine       = None  # set in __main__ after PerformanceEngine is instantiated
 
 def _fetch_price_live(symbol: str) -> float:
     # Always use yfinance for simulation prices — no Alpaca dependency
@@ -208,6 +291,14 @@ def _sim_state(portfolio_id: int = 1) -> dict:
             )
             row = conn.execute('SELECT * FROM sim_state WHERE portfolio_id = ?', (portfolio_id,)).fetchone()
         return dict(row)
+
+def _apply_slippage(price, side, atr_val, volume_ratio=1.0):
+    base_slip = atr_val * 0.05
+    if volume_ratio < 0.5:
+        base_slip *= 2.0
+    noise = random.uniform(0.7, 1.3)
+    slip = base_slip * noise
+    return round(price + slip, 4) if side == 'buy' else round(price - slip, 4)
 
 def _sim_buy(symbol: str, qty: float, price: float, portfolio_id: int = 1):
     cost = qty * price
@@ -239,6 +330,16 @@ def _sim_buy(symbol: str, qty: float, price: float, portfolio_id: int = 1):
                 'INSERT INTO sim_positions (symbol, shares, avg_cost, realized_pl, portfolio_id) VALUES (?,?,?,0,?)',
                 (symbol, qty, price, portfolio_id)
             )
+        # Auto-add to watchlist so positions always appear in the watchlist
+        conn.execute(
+            'INSERT OR IGNORE INTO watchlist_items (portfolio_id, symbol) VALUES (?,?)',
+            (portfolio_id, symbol)
+        )
+        # Record in trade history so AI buys appear alongside manual trades
+        conn.execute(
+            'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            (symbol, 'buy', qty, price, qty, 'filled', 'market', 0, portfolio_id, price, 0)
+        )
 
 def _sim_sell(symbol: str, qty: float, price: float, portfolio_id: int = 1) -> float:
     with _get_db() as conn:
@@ -263,7 +364,87 @@ def _sim_sell(symbol: str, qty: float, price: float, portfolio_id: int = 1) -> f
                 'UPDATE sim_positions SET shares = ?, realized_pl = realized_pl + ? WHERE symbol = ? AND portfolio_id = ?',
                 (new_shares, realized_pl, symbol, portfolio_id)
             )
+        # Record in trade history
+        conn.execute(
+            'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            (symbol, 'sell', qty, price, qty, 'filled', 'market', realized_pl, portfolio_id, price, 0)
+        )
         return realized_pl
+
+def _sim_short(symbol: str, qty: float, price: float, portfolio_id: int = 1):
+    """Open a short position — credits proceeds to cash, stores negative shares."""
+    proceeds = qty * price
+    with _get_db() as conn:
+        state = conn.execute('SELECT cash FROM sim_state WHERE portfolio_id = ?', (portfolio_id,)).fetchone()
+        if not state:
+            conn.execute(
+                'INSERT INTO sim_state (cash, initial_cash, last_equity, portfolio_id) VALUES (100000,100000,100000,?)',
+                (portfolio_id,)
+            )
+        # Short margin: require at least 50% of position value as collateral
+        if state and proceeds * 0.5 > state['cash']:
+            raise ValueError(f'Insufficient margin for short: need ${proceeds*0.5:.2f} collateral, have ${state["cash"]:.2f}')
+        # Credit proceeds (will be debited when covering)
+        conn.execute('UPDATE sim_state SET cash = cash + ? WHERE portfolio_id = ?', (proceeds, portfolio_id))
+        existing = conn.execute(
+            'SELECT shares, avg_cost FROM sim_positions WHERE symbol = ? AND portfolio_id = ?',
+            (symbol, portfolio_id)
+        ).fetchone()
+        if existing:
+            if existing['shares'] > 0:
+                raise ValueError(f'Already long {symbol} — close long before shorting')
+            # Add to existing short
+            total = existing['shares'] - qty   # more negative
+            new_avg = (abs(existing['shares']) * existing['avg_cost'] + qty * price) / abs(total)
+            conn.execute(
+                'UPDATE sim_positions SET shares = ?, avg_cost = ? WHERE symbol = ? AND portfolio_id = ?',
+                (total, new_avg, symbol, portfolio_id)
+            )
+        else:
+            conn.execute(
+                'INSERT INTO sim_positions (symbol, shares, avg_cost, realized_pl, portfolio_id) VALUES (?,?,?,0,?)',
+                (symbol, -qty, price, portfolio_id)
+            )
+        conn.execute('INSERT OR IGNORE INTO watchlist_items (portfolio_id, symbol) VALUES (?,?)', (portfolio_id, symbol))
+        conn.execute(
+            'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            (symbol, 'short', qty, price, qty, 'filled', 'market', 0, portfolio_id, price, 0)
+        )
+
+
+def _sim_cover(symbol: str, qty: float, price: float, portfolio_id: int = 1) -> float:
+    """Close (cover) a short position — debits cash to buy back shares."""
+    with _get_db() as conn:
+        pos = conn.execute(
+            'SELECT shares, avg_cost FROM sim_positions WHERE symbol = ? AND portfolio_id = ?',
+            (symbol, portfolio_id)
+        ).fetchone()
+        if not pos or pos['shares'] >= 0:
+            raise ValueError(f'No short position in {symbol}')
+        short_qty = abs(pos['shares'])
+        if qty > short_qty + 0.0001:
+            raise ValueError(f'Cover qty {qty} exceeds short {short_qty:.4f}')
+        # Profit = (entry_price - cover_price) * qty  (shorted high, covered low)
+        realized_pl = (pos['avg_cost'] - price) * qty
+        cost = qty * price
+        cash_state = conn.execute('SELECT cash FROM sim_state WHERE portfolio_id = ?', (portfolio_id,)).fetchone()
+        if cash_state and cost > cash_state['cash']:
+            raise ValueError(f'Insufficient cash to cover: need ${cost:.2f}, have ${cash_state["cash"]:.2f}')
+        conn.execute('UPDATE sim_state SET cash = cash - ? WHERE portfolio_id = ?', (cost, portfolio_id))
+        remaining = pos['shares'] + qty   # shares is negative, adding qty makes it less negative
+        if abs(remaining) < 0.0001:
+            conn.execute('DELETE FROM sim_positions WHERE symbol = ? AND portfolio_id = ?', (symbol, portfolio_id))
+        else:
+            conn.execute(
+                'UPDATE sim_positions SET shares = ?, realized_pl = realized_pl + ? WHERE symbol = ? AND portfolio_id = ?',
+                (remaining, realized_pl, symbol, portfolio_id)
+            )
+        conn.execute(
+            'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            (symbol, 'cover', qty, price, qty, 'filled', 'market', realized_pl, portfolio_id, price, 0)
+        )
+        return realized_pl
+
 
 def _real_holdings_with_prices() -> list[dict]:
     with _get_db() as conn:
@@ -304,16 +485,19 @@ def _real_holdings_with_prices() -> list[dict]:
 def _sim_positions_with_prices(portfolio_id: int = 1) -> list[dict]:
     with _get_db() as conn:
         rows = conn.execute(
-            'SELECT * FROM sim_positions WHERE shares > 0.0001 AND portfolio_id = ?',
+            'SELECT * FROM sim_positions WHERE ABS(shares) > 0.0001 AND portfolio_id = ?',
             (portfolio_id,)
         ).fetchall()
     out = []
     for row in rows:
-        price = _get_current_price(row['symbol'])
-        qty   = row['shares']
-        avg   = row['avg_cost']
-        mv    = price * qty
-        upl   = (price - avg) * qty
+        price    = _get_current_price(row['symbol'])
+        qty      = row['shares']        # negative for shorts
+        avg      = row['avg_cost']
+        is_short = qty < 0
+        abs_qty  = abs(qty)
+        mv       = price * abs_qty
+        # Long P&L: (price - avg) * qty.  Short P&L: (avg - price) * abs_qty
+        upl      = (price - avg) * qty if not is_short else (avg - price) * abs_qty
         out.append({
             'symbol':          row['symbol'],
             'qty':             qty,
@@ -321,8 +505,8 @@ def _sim_positions_with_prices(portfolio_id: int = 1) -> list[dict]:
             'current_price':   price,
             'market_value':    mv,
             'unrealized_pl':   upl,
-            'unrealized_plpc': (upl / (avg * qty)) if avg and qty else 0,
-            'side':            'long',
+            'unrealized_plpc': (upl / (avg * abs_qty)) if avg and abs_qty else 0,
+            'side':            'short' if is_short else 'long',
         })
     return out
 
@@ -586,6 +770,9 @@ def update_portfolio(pid):
             conn.execute('UPDATE portfolios SET name = ? WHERE id = ?', (data['name'], pid))
         if 'color' in data:
             conn.execute('UPDATE portfolios SET color = ? WHERE id = ?', (data['color'], pid))
+        ai_controlled = data.get('ai_controlled')
+        if ai_controlled is not None:
+            conn.execute('UPDATE portfolios SET ai_controlled=? WHERE id=?', (1 if ai_controlled else 0, pid))
     return jsonify({'status': 'updated'})
 
 @app.route('/api/portfolios/<int:pid>', methods=['DELETE'])
@@ -604,7 +791,39 @@ def ai_log(pid):
         rows = conn.execute(
             'SELECT * FROM ai_log WHERE portfolio_id=? ORDER BY id DESC LIMIT 50', (pid,)
         ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get('created_at') and not d['created_at'].endswith('Z'):
+            d['created_at'] += 'Z'
+        out.append(d)
+    return jsonify(out)
+
+@app.route('/api/portfolios/<int:pid>/ai/scans')
+def ai_scans(pid):
+    """Return AI scan run history with bought/sold/batch details."""
+    import json as _json
+    limit = int(request.args.get('limit', 30))
+    with _get_db() as conn:
+        rows = conn.execute(
+            '''SELECT id, portfolio_id, scanned, bought_count, sold_count, error_count,
+                      bought_json, sold_json, batch_json, mode, skip_reason, created_at
+               FROM ai_scan_runs WHERE portfolio_id=? ORDER BY id DESC LIMIT ?''',
+            (pid, limit)
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get('created_at') and not d['created_at'].endswith('Z'):
+            d['created_at'] += 'Z'
+        for key in ('bought_json', 'sold_json', 'batch_json'):
+            try:
+                d[key] = _json.loads(d[key] or '[]')
+            except Exception:
+                d[key] = []
+        out.append(d)
+    return jsonify(out)
+
 
 @app.route('/api/portfolios/<int:pid>/ai/run', methods=['POST'])
 def ai_run(pid):
@@ -616,6 +835,47 @@ def ai_run(pid):
         return jsonify({'error': 'Portfolio is not AI-controlled'}), 400
     summary = _ai_run_portfolio(pid)
     return jsonify(summary)
+
+@app.route('/api/portfolios/<int:pid>/analytics')
+def portfolio_analytics_endpoint(pid):
+    """Portfolio-level risk analytics: sector exposure, beta, correlation clusters."""
+    if not _portfolio_analytics:
+        return jsonify({'error': 'Portfolio analytics not initialized'}), 503
+    with _get_db() as conn:
+        pos_rows = conn.execute(
+            'SELECT symbol, shares, avg_cost FROM sim_positions WHERE portfolio_id=? AND shares!=0', (pid,)
+        ).fetchall()
+    positions = [{'symbol': r['symbol'], 'shares': r['shares'], 'avg_cost': r['avg_cost'],
+                  'current_price': _get_current_price(r['symbol'])} for r in pos_rows]
+    prices = {p['symbol']: p['current_price'] for p in positions}
+    result = _portfolio_analytics.compute(positions, prices)
+    return jsonify(result)
+
+
+@app.route('/api/portfolios/<int:pid>/performance')
+def portfolio_performance_endpoint(pid):
+    """Self-analysis: win rate by regime, signal attribution, equity curve, decay check."""
+    if not _perf_engine:
+        return jsonify({'error': 'Performance engine not initialized'}), 503
+    days = request.args.get('days', 90, type=int)
+    return jsonify({
+        'summary':             _perf_engine.summary(pid),
+        'by_regime':           _perf_engine.by_regime(pid, days),
+        'by_score_bucket':     _perf_engine.by_score_bucket(pid, days),
+        'signal_attribution':  _perf_engine.signal_attribution(pid, days),
+        'equity_curve':        _perf_engine.equity_curve(pid, min(days, 30)),
+        'decay':               _perf_engine.decay_check(pid),
+    })
+
+
+@app.route('/api/analysis/<symbol>/structure')
+def symbol_structure_endpoint(symbol):
+    """Market structure snapshot: swing bias, S/R levels, FVGs, session levels."""
+    if not _structure_engine:
+        return jsonify({'error': 'Structure engine not initialized'}), 503
+    snap = _structure_engine.snapshot(symbol.upper())
+    return jsonify({'symbol': symbol.upper(), **snap})
+
 
 @app.route('/api/users/<int:uid>', methods=['PATCH'])
 def update_user(uid):
@@ -671,6 +931,9 @@ def account():
     positions = _sim_positions_with_prices(pid)
     portfolio_value = state['cash'] + sum(p['market_value'] for p in positions)
     pnl_day   = portfolio_value - state['last_equity']
+    with _get_db() as conn:
+        prow = conn.execute('SELECT ai_controlled FROM portfolios WHERE id=?', (pid,)).fetchone()
+        ai_controlled = int(prow['ai_controlled']) if prow else 0
     return jsonify({
         'equity':          portfolio_value,
         'cash':            state['cash'],
@@ -678,6 +941,7 @@ def account():
         'portfolio_value': portfolio_value,
         'daytrade_count':  0,
         'pnl_day':         pnl_day,
+        'ai_controlled':   ai_controlled,
     })
 
 @app.route('/api/positions')
@@ -705,8 +969,9 @@ def get_orders():
         'status':           row['status'],
         'limit_price':      row['limit_price'],
         'filled_avg_price': row['price'],
+        'fill_price':       row['fill_price'] if row['fill_price'] else row['price'],
         'realized_pl':      row['realized_pl'],
-        'created_at':       row['created_at'],
+        'created_at':       (row['created_at'] + 'Z') if row['created_at'] and not row['created_at'].endswith('Z') else row['created_at'],
     } for row in rows])
 
 @app.route('/api/orders', methods=['POST'])
@@ -740,15 +1005,30 @@ def place_order():
                 return jsonify({'error': f'Limit sell at ${lp:.2f} rejected: current price is ${price:.2f}.'}), 400
             fill_price = lp
 
+        # Slippage model
+        try:
+            _ind = _compute_indicators(symbol)
+            _atr = _ind.get('atr', fill_price * 0.01) if _ind else fill_price * 0.01
+            _vr  = _ind.get('volume_ratio', 1.0) if _ind else 1.0
+        except Exception:
+            _atr = fill_price * 0.01; _vr = 1.0
+        slip_fill = _apply_slippage(fill_price, side, _atr, _vr)
+        slippage_cost = round(abs(slip_fill - fill_price) * qty, 4)
+        fill_price = slip_fill
+
         if side == 'buy':
             _sim_buy(symbol, qty, fill_price, pid)
+        elif side == 'short':
+            _sim_short(symbol, qty, fill_price, pid)
+        elif side == 'cover':
+            realized_pl = _sim_cover(symbol, qty, fill_price, pid)
         else:
             realized_pl = _sim_sell(symbol, qty, fill_price, pid)
 
         with _get_db() as conn:
             cur = conn.execute(
-                'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, limit_price, realized_pl, portfolio_id) VALUES (?,?,?,?,?,?,?,?,?,?)',
-                (symbol, side, qty, fill_price, qty, status, otype, limit_price, realized_pl, pid)
+                'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, limit_price, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                (symbol, side, qty, fill_price, qty, status, otype, limit_price, realized_pl, pid, fill_price, slippage_cost)
             )
             order_id = cur.lastrowid
 
@@ -1056,6 +1336,47 @@ def get_forex():
     _markets_cache['forex'] = (data, now)
     return jsonify(data)
 
+def _bs_price(S, K, T, r, sigma, option_type='call'):
+    """Full Black-Scholes option price."""
+    if S <= 0 or K <= 0 or sigma <= 0:
+        return max(0.0, (S - K) if option_type == 'call' else (K - S))
+    if T <= 0:
+        return max(0.0, (S - K) if option_type == 'call' else (K - S))
+    try:
+        from statistics import NormalDist
+        nd = NormalDist()
+        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        if option_type == 'call':
+            return S * nd.cdf(d1) - K * math.exp(-r * T) * nd.cdf(d2)
+        else:
+            return K * math.exp(-r * T) * nd.cdf(-d2) - S * nd.cdf(-d1)
+    except Exception:
+        return max(0.0, (S - K) if option_type == 'call' else (K - S))
+
+def _bs_greeks(S, K, T, r, sigma, option_type='call'):
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'prob_itm': 0}
+    try:
+        from statistics import NormalDist
+        nd = NormalDist()
+        d1 = (math.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        pdf_d1 = nd.pdf(d1)
+        if option_type == 'call':
+            delta = nd.cdf(d1)
+            prob_itm = nd.cdf(d2)
+            theta = (-(S * pdf_d1 * sigma) / (2*math.sqrt(T)) - r*K*math.exp(-r*T)*nd.cdf(d2)) / 365
+        else:
+            delta = nd.cdf(d1) - 1
+            prob_itm = nd.cdf(-d2)
+            theta = (-(S * pdf_d1 * sigma) / (2*math.sqrt(T)) + r*K*math.exp(-r*T)*nd.cdf(-d2)) / 365
+        gamma = pdf_d1 / (S * sigma * math.sqrt(T))
+        vega = S * pdf_d1 * math.sqrt(T) / 100
+        return {'delta': round(delta,4), 'gamma': round(gamma,6), 'theta': round(theta,4), 'vega': round(vega,4), 'prob_itm': round(prob_itm,4)}
+    except Exception:
+        return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'prob_itm': 0}
+
 @app.route('/api/options/<symbol>')
 def get_options(symbol):
     symbol = symbol.upper()
@@ -1075,39 +1396,65 @@ def get_options(symbol):
         selected = expiry if expiry in expirations else expirations[0]
         chain    = ticker.option_chain(selected)
 
-        def _df(df):
-            rows = []
-            df = df.fillna(0)  # NaN is truthy; int(NaN) raises ValueError
-            for _, r in df.iterrows():
-                rows.append({
-                    'strike':     round(float(r.get('strike', 0)), 4),
-                    'bid':        round(float(r.get('bid', 0)), 4),
-                    'ask':        round(float(r.get('ask', 0)), 4),
-                    'last':       round(float(r.get('lastPrice', 0)), 4),
-                    'iv':         round(float(r.get('impliedVolatility', 0)) * 100, 1),
-                    'volume':     int(float(r.get('volume', 0))),
-                    'oi':         int(float(r.get('openInterest', 0))),
-                    'itm':        bool(r.get('inTheMoney', False)),
-                    'change':     round(float(r.get('change', 0)), 4),
-                    'change_pct': round(float(r.get('percentChange', 0)), 2),
-                })
-            return rows
+        # Compute time-to-expiry and risk-free rate
+        from datetime import datetime as _dt
+        try:
+            expiry_dt = _dt.strptime(selected, '%Y-%m-%d')
+            days_to_expiry = max((expiry_dt - _dt.utcnow()).days, 0)
+        except Exception:
+            days_to_expiry = 30
+        T = days_to_expiry / 365.0
+        r_rate = 0.045
 
         # Get current underlying price for ATM reference
         try:
-            hist  = ticker.history(period='1d')
-            closes = hist['Close'].dropna()
-            spot  = float(closes.iloc[-1]) if len(closes) else 0.0
+            _hist  = ticker.history(period='1d')
+            _hist_closes = _hist['Close'].dropna()
+            spot  = float(_hist_closes.iloc[-1]) if len(_hist_closes) else 0.0
         except Exception:
             spot = 0.0
+
+        def _df(df, opt_type='call'):
+            rows = []
+            df = df.fillna(0)  # NaN is truthy; int(NaN) raises ValueError
+            for _, r in df.iterrows():
+                raw_iv = float(r.get('impliedVolatility', 0))
+                greeks = _bs_greeks(spot, float(r.get('strike', 0)), T, r_rate, raw_iv, opt_type)
+                opt_last = float(r.get('lastPrice', 0)) or float(r.get('bid', 0))
+                scenarios = {}
+                K_strike = float(r.get('strike', 0))
+                # Use a minimum IV floor so zero-IV options still produce a smooth curve
+                iv_for_scenarios = max(raw_iv, 0.10)
+                for chg in [-0.15, -0.10, -0.05, 0.0, 0.05, 0.10, 0.15]:
+                    new_S = spot * (1 + chg)
+                    est = _bs_price(new_S, K_strike, T, r_rate, iv_for_scenarios, opt_type)
+                    chg_pct = round(chg * 100)
+                    key = f'{chg_pct:+d}%' if chg_pct != 0 else '0%'
+                    scenarios[key] = round(est, 2)
+                rows.append({
+                    'strike':          round(float(r.get('strike', 0)), 4),
+                    'bid':             round(float(r.get('bid', 0)), 4),
+                    'ask':             round(float(r.get('ask', 0)), 4),
+                    'last':            round(float(r.get('lastPrice', 0)), 4),
+                    'iv':              round(raw_iv * 100, 1),
+                    'volume':          int(float(r.get('volume', 0))),
+                    'oi':              int(float(r.get('openInterest', 0))),
+                    'itm':             bool(r.get('inTheMoney', False)),
+                    'change':          round(float(r.get('change', 0)), 4),
+                    'change_pct':      round(float(r.get('percentChange', 0)), 2),
+                    'greeks':          greeks,
+                    'scenarios':       scenarios,
+                    'days_to_expiry':  days_to_expiry,
+                })
+            return rows
 
         data = {
             'symbol':      symbol,
             'spot':        round(spot, 4),
             'expirations': expirations[:16],
             'selected':    selected,
-            'calls':       _df(chain.calls),
-            'puts':        _df(chain.puts),
+            'calls':       _df(chain.calls, 'call'),
+            'puts':        _df(chain.puts, 'put'),
         }
         _markets_cache[cache_key] = (data, now)
         return jsonify(data)
@@ -1186,25 +1533,26 @@ def market_prices():
 def subscribe_symbol(symbol):
     sym = symbol.upper()
     _subscribed_symbols.add(sym)
+    if KEYS_SET:
+        try:
+            from alpaca_stream import subscribe as alp_sub
+            alp_sub(sym)
+        except Exception:
+            pass
     if FINNHUB_KEYS_SET:
         try:
             from finnhub_stream import subscribe as fh_sub
-            fh_sub(sym, socketio)
-        except Exception:
-            pass
-    if KEYS_SET:
-        try:
-            from alpaca_stream import subscribe
-            subscribe(sym, socketio)
-        except Exception:
-            pass
-    if POLYGON_KEYS_SET:
-        try:
-            from polygon_stream import subscribe as poly_sub
-            poly_sub(sym)
+            fh_sub(sym)
         except Exception:
             pass
     return jsonify({'status': 'subscribed', 'symbol': sym})
+
+
+@app.route('/api/stream/status', methods=['GET'])
+def stream_status():
+    streaming = _stream_manager.streaming_symbols if _stream_manager else {}
+    polling   = list(_subscribed_symbols - set(streaming.keys()))
+    return jsonify({'streaming': streaming, 'polling': polling})
 
 # ── Asset search ───────────────────────────────────────────────────────────────
 @app.route('/api/assets/search')
@@ -1650,7 +1998,7 @@ def get_news_general():
 # ── AI portfolio trading ───────────────────────────────────────────────────────
 
 _AI_UNIVERSE = [
-    # Mega-cap tech
+    # ── Equities: Mega-cap tech ───────────────────────────────────────────────
     'AAPL','MSFT','NVDA','GOOGL','META','AMZN','TSLA','AVGO','ADBE','CRM',
     # Semiconductors / tech
     'AMD','INTC','QCOM','TXN','ORCL','IBM','INTU','NOW','SNOW','PLTR',
@@ -1666,13 +2014,39 @@ _AI_UNIVERSE = [
     'CAT','DE','HON','BA','GE','UPS','FDX','RTX','LMT',
     # Communication / media
     'NFLX','DIS','CMCSA','T','VZ',
-    # ETFs (liquid, indicator-friendly)
+    # Broad ETFs
     'SPY','QQQ','IWM','GLD','TLT',
+
+    # ── Futures ───────────────────────────────────────────────────────────────
+    'ES=F',   # S&P 500 E-mini
+    'NQ=F',   # NASDAQ E-mini
+    'YM=F',   # Dow Jones E-mini
+    'RTY=F',  # Russell 2000 E-mini
+    'CL=F',   # Crude Oil WTI
+    'GC=F',   # Gold
+    'SI=F',   # Silver
+    'NG=F',   # Natural Gas
+    'ZB=F',   # US 30Y T-Bond
+    'ZN=F',   # US 10Y T-Note
+    'BTC=F',  # Bitcoin Futures
+    'ETH=F',  # Ether Futures
+
+    # ── Forex ─────────────────────────────────────────────────────────────────
+    'EURUSD=X','GBPUSD=X','USDJPY=X','USDCHF=X',
+    'AUDUSD=X','USDCAD=X','NZDUSD=X',
+    'EURGBP=X','EURJPY=X','GBPJPY=X',
+
+    # ── Crypto (spot) ─────────────────────────────────────────────────────────
+    'BTC-USD','ETH-USD','SOL-USD','BNB-USD','XRP-USD',
+    'ADA-USD','AVAX-USD','DOGE-USD','DOT-USD','LINK-USD',
 ]
 _AI_UNIVERSE = list(dict.fromkeys(_AI_UNIVERSE))  # deduplicate, preserve order
 
 # Per-portfolio rotating scan cursor: {portfolio_id: int}
 _ai_scan_cursor: dict = {}
+
+# In-memory signal cache for "what changed?" detection: symbol -> last signal dict
+_prev_signals: dict = {}
 
 
 def _ema(vals, period):
@@ -1683,8 +2057,266 @@ def _ema(vals, period):
     return out
 
 
-def _ai_score(data: dict) -> float:
-    """Replicate the frontend computeDecision score. BUY ≥ 2.0, SELL ≤ -2.0."""
+def _compute_indicators_fast(symbol: str) -> dict:
+    """Lightweight indicator fetch for AI scanning — skips Monte Carlo projection.
+    Returns the same keys as _compute_indicators but projection fields are omitted.
+    Checks CandleEngine first (live streaming bars), falls back to yfinance."""
+    # CandleEngine live data takes priority (sub-second freshness for streaming symbols)
+    if _candle_engine:
+        ce_data = _candle_engine.latest(symbol, '1m')
+        if ce_data:
+            return ce_data
+
+    # Use full cache if warm
+    now = _time.time()
+    if symbol in _proj_cache:
+        payload, ts = _proj_cache[symbol]
+        if now - ts < _PROJ_TTL:
+            return payload
+
+    import yfinance as yf
+    hist = yf.Ticker(symbol).history(period='60d')
+    if hist.empty or len(hist) < 20:
+        raise ValueError(f'Insufficient data for {symbol}')
+
+    closes  = list(hist['Close'].dropna())
+    highs   = list(hist['High'].dropna())
+    lows    = list(hist['Low'].dropna())
+    volumes = list(hist['Volume'].dropna())
+    n = min(len(closes), len(highs), len(lows), len(volumes))
+    closes = closes[-n:]; highs = highs[-n:]; lows = lows[-n:]; volumes = volumes[-n:]
+
+    last_c = closes[-1]
+
+    # RSI (14)
+    gains  = [max(closes[i]-closes[i-1], 0) for i in range(1, n)]
+    losses = [max(closes[i-1]-closes[i], 0) for i in range(1, n)]
+    avg_g  = sum(gains[-14:]) / 14; avg_l = sum(losses[-14:]) / 14
+    rsi    = round(100 - (100 / (1 + avg_g / avg_l)) if avg_l else 100.0, 2)
+
+    # MACD (12, 26, 9)
+    ema12 = _ema(closes, 12); ema26 = _ema(closes, 26)
+    macd_vals = [ema12[i] - ema26[i] for i in range(25, n)]
+    sig_vals  = _ema(macd_vals, 9)
+    last_m = macd_vals[-1]; last_s = sig_vals[-1]
+    prev_m = macd_vals[-2] if len(macd_vals) > 1 else last_m
+    prev_s = sig_vals[-2]  if len(sig_vals)  > 1 else last_s
+    curr_h = last_m - last_s; prev_h = prev_m - prev_s
+    if   curr_h > 0 and prev_h <= 0: macd_cross = 'bullish_cross'
+    elif curr_h < 0 and prev_h >= 0: macd_cross = 'bearish_cross'
+    elif curr_h > 0:                 macd_cross = 'bullish'
+    else:                            macd_cross = 'bearish'
+
+    # Stochastic (14)
+    stoch_k_arr = []
+    for i in range(13, n):
+        ph = max(highs[i-13:i+1]); pl = min(lows[i-13:i+1])
+        stoch_k_arr.append(((closes[i]-pl)/(ph-pl)*100) if ph > pl else 50.0)
+    last_k = stoch_k_arr[-1] if stoch_k_arr else 50.0
+
+    # Bollinger Bands (20, 2σ)
+    bb_pos = 'unknown'
+    if n >= 20:
+        w = closes[-20:]; mean = sum(w)/20
+        std = (sum((c-mean)**2 for c in w)/20)**0.5
+        bb_u = mean + 2*std; bb_l = mean - 2*std
+        bw = bb_u - bb_l
+        if   bw < last_c * 0.03:     bb_pos = 'squeeze'
+        elif last_c >= bb_u * 0.995: bb_pos = 'overbought'
+        elif last_c <= bb_l * 1.005: bb_pos = 'oversold'
+        elif last_c > mean:          bb_pos = 'upper_half'
+        else:                        bb_pos = 'lower_half'
+
+    # VWAP (20-day rolling)
+    vwap_signal = ''
+    if n >= 20:
+        tp  = [(highs[i]+lows[i]+closes[i])/3 for i in range(n-20, n)]
+        vol = volumes[n-20:n]
+        tv  = sum(vol)
+        if tv > 0:
+            vwap_val = sum(p*v for p,v in zip(tp, vol)) / tv
+            vwap_signal = 'above' if last_c > vwap_val else 'below'
+
+    # Volume
+    last_vol = volumes[-1] if volumes else 0
+    avg_vol  = sum(volumes[-20:]) / min(20, len(volumes)) if volumes else 0
+    vol_ratio = round(last_vol / avg_vol, 2) if avg_vol > 0 else 1.0
+    price_chg = last_c - closes[-2] if n >= 2 else 0
+    if   vol_ratio >= 1.5: vol_signal = 'high_up' if price_chg > 0 else 'high_down'
+    elif vol_ratio <= 0.5: vol_signal = 'low'
+    else:                  vol_signal = 'normal'
+
+    # Trend (linear regression slope, 20-day)
+    last20 = closes[-20:]; x_mean = 9.5; y_mean = sum(last20)/20
+    num = sum((i-x_mean)*(last20[i]-y_mean) for i in range(20))
+    denom = sum((i-x_mean)**2 for i in range(20))
+    slope = num/denom if denom else 0
+    trend = 'up' if slope > 0.05 else 'down' if slope < -0.05 else 'sideways'
+
+    # ATR (14)
+    tr_vals = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+               for i in range(1, n)]
+    atr = round(sum(tr_vals[-14:])/14, 4) if len(tr_vals) >= 14 else last_c * 0.02
+
+    # EMA50 — used for falling-knife prevention
+    ema50_arr = _ema(closes, min(50, n))
+    ema50 = ema50_arr[-1]
+
+    # Slope as % per bar — more comparable across price levels
+    slope_pct = round((slope / last_c) * 100, 4) if last_c else 0.0
+
+    # ADX approximation (directional strength)
+    adx_val = 0.0
+    if n >= 15:
+        plus_dm  = [max(highs[i]-highs[i-1], 0) if (highs[i]-highs[i-1]) > (lows[i-1]-lows[i]) else 0 for i in range(1,n)]
+        minus_dm = [max(lows[i-1]-lows[i], 0) if (lows[i-1]-lows[i]) > (highs[i]-highs[i-1]) else 0 for i in range(1,n)]
+        atr14s   = tr_vals[-14:]
+        atr14    = sum(atr14s) / 14 if atr14s else 1
+        pdm14    = sum(plus_dm[-14:]) / 14; mdm14 = sum(minus_dm[-14:]) / 14
+        pdi = 100 * pdm14 / atr14 if atr14 else 0
+        mdi = 100 * mdm14 / atr14 if atr14 else 0
+        dx  = abs(pdi - mdi) / (pdi + mdi) * 100 if (pdi + mdi) else 0
+        adx_val = round(dx, 1)
+
+    return {
+        'last_price':    last_c,
+        'rsi':           rsi,
+        'macd_cross':    macd_cross,
+        'macd_value':    round(last_m, 4),
+        'macd_signal_value': round(last_s, 4),
+        'stoch_k_val':   round(last_k, 2),
+        'stoch_d_val':   round(last_k, 2),
+        'bb_position':   bb_pos,
+        'vwap_signal':   vwap_signal,
+        'volume_signal': vol_signal,
+        'volume_ratio':  vol_ratio,
+        'trend':         trend,
+        'slope':         round(slope, 6),
+        'slope_pct':     slope_pct,
+        'atr':           atr,
+        'atr_pct':       round(atr / last_c * 100, 2) if last_c else 2.0,
+        'ema50':         round(ema50, 4),
+        'adx':           adx_val,
+        'regime':        'neutral',
+    }
+
+
+def _compute_mtf_bias(symbol: str) -> dict:
+    """Classify market directional bias across 1h, 5m, 1m timeframes."""
+    if not _candle_engine:
+        return {'h1': 'neutral', 'm5': 'neutral', 'm1': 'neutral', 'alignment': 0.5, 'bias': 'neutral'}
+
+    def _classify_tf(data):
+        if not data:
+            return 'neutral'
+        rsi   = float(data.get('rsi', 50) or 50)
+        trend = data.get('trend', 'sideways') or 'sideways'
+        macd  = data.get('macd_cross', '') or ''
+        bull  = sum([rsi < 50, trend == 'up', 'bullish' in macd])
+        bear  = sum([rsi > 50, trend == 'down', 'bearish' in macd])
+        if bull >= 2: return 'bullish'
+        if bear >= 2: return 'bearish'
+        return 'neutral'
+
+    h1 = _classify_tf(_candle_engine.latest(symbol, '1h'))
+    m5 = _classify_tf(_candle_engine.latest(symbol, '5m'))
+    m1 = _classify_tf(_candle_engine.latest(symbol, '1m'))
+
+    states = [h1, m5, m1]
+    bull_n = states.count('bullish')
+    bear_n = states.count('bearish')
+
+    if bull_n >= 2:   bias = 'bullish';  alignment = bull_n / 3
+    elif bear_n >= 2: bias = 'bearish';  alignment = bear_n / 3
+    else:             bias = 'neutral';  alignment = 0.33
+
+    return {'h1': h1, 'm5': m5, 'm1': m1, 'alignment': round(alignment, 2), 'bias': bias}
+
+
+def _classify_market_state(data: dict) -> str:
+    """Classify current market conditions into a named regime."""
+    rsi     = float(data.get('rsi', 50) or 50)
+    trend   = data.get('trend', 'sideways') or 'sideways'
+    bb_pos  = data.get('bb_position', '') or ''
+    vol_sig = data.get('volume_signal', '') or ''
+    atr_pct = float(data.get('atr_pct', 2.0) or 2.0)
+    adx     = float(data.get('adx', 0) or 0)
+    macd_x  = data.get('macd_cross', '') or ''
+    stoch   = float(data.get('stoch_k_val', 50) or 50)
+
+    # Panic: extreme oversold + high volatility + heavy selling volume
+    if rsi < 25 and atr_pct > 3.5 and vol_sig == 'high_down':
+        return 'panic'
+
+    # Extreme overbought
+    if rsi > 80 and stoch > 85 and bb_pos == 'overbought':
+        return 'overbought_extreme'
+
+    # Extreme oversold (not panic — no volume spike)
+    if rsi < 22 and stoch < 20:
+        return 'oversold_extreme'
+
+    # Breakout: price at BB upper + volume spike + bullish momentum
+    if bb_pos == 'overbought' and vol_sig == 'high_up' and 'bullish' in macd_x:
+        return 'breakout'
+
+    # Trending markets (ADX > 20 is a reasonable directional threshold from our approx)
+    if adx > 20 and trend == 'up':
+        return 'trending_up'
+    if adx > 20 and trend == 'down':
+        return 'trending_down'
+
+    # Accumulation: RSI 30-48, flat/rising trend, volume building
+    if 28 <= rsi <= 48 and trend in ('sideways', 'up') and vol_sig in ('high_up', 'normal'):
+        return 'accumulation'
+
+    # Ranging / BB squeeze
+    if bb_pos == 'squeeze' or (trend == 'sideways' and adx < 15):
+        return 'ranging'
+
+    # Euphoric: parabolic extension — mean-reversion risk
+    if rsi > 85 and atr_pct > 2.0 and vol_sig in ('high_up', 'normal'):
+        return 'euphoric'
+
+    # Distribution: price stalling at highs with selling volume
+    if 50 <= rsi <= 68 and vol_sig == 'high_down' and trend == 'sideways':
+        return 'distribution'
+
+    # News-driven: explosive volume spike in either direction
+    if vol_sig in ('high_up', 'high_down') and float(data.get('volume_ratio', 1.0) or 1.0) >= 3.0:
+        return 'news_driven'
+
+    # Mild trends without ADX confirmation
+    if trend == 'up':   return 'mild_uptrend'
+    if trend == 'down': return 'mild_downtrend'
+    return 'neutral'
+
+
+def _adaptive_weights(market_state: str) -> dict:
+    """Return per-indicator weight multipliers based on market state."""
+    base = {'rsi': 1.0, 'macd': 1.0, 'stoch': 1.0, 'bb': 1.0, 'volume': 1.0,
+            'vwap': 1.0, 'trend': 1.0}
+    if market_state in ('trending_up', 'trending_down'):
+        return {**base, 'macd': 1.4, 'trend': 1.4, 'rsi': 0.7, 'bb': 0.7}
+    if market_state in ('ranging', 'accumulation'):
+        return {**base, 'rsi': 1.4, 'bb': 1.4, 'stoch': 1.2, 'macd': 0.6}
+    if market_state in ('panic', 'oversold_extreme'):
+        return {**base, 'rsi': 0.5, 'macd': 0.5, 'stoch': 0.5, 'bb': 0.5,
+                'volume': 0.5, 'trend': 0.5}  # all signals unreliable in panic
+    if market_state == 'breakout':
+        return {**base, 'volume': 1.5, 'macd': 1.3, 'trend': 1.2, 'rsi': 0.8}
+    if market_state == 'euphoric':
+        return {**base, 'rsi': 1.5, 'stoch': 1.3, 'bb': 1.3, 'macd': 0.6, 'trend': 0.5}
+    if market_state == 'distribution':
+        return {**base, 'volume': 1.5, 'macd': 1.2, 'rsi': 0.8, 'trend': 0.7}
+    if market_state == 'news_driven':
+        return {**base, 'volume': 2.0, 'macd': 0.4, 'rsi': 0.3, 'stoch': 0.3, 'bb': 0.4}
+    return base
+
+
+def _ai_score_detailed(data: dict) -> dict:
+    """Full traceable analysis. Returns score, per-signal breakdown, uncertainty,
+    market_state, plain-English summary, and what-changed list."""
     rsi      = float(data.get('rsi', 50) or 50)
     macd_x   = data.get('macd_cross', '') or ''
     stoch_k  = float(data.get('stoch_k_val', 50) or 50)
@@ -1693,43 +2325,223 @@ def _ai_score(data: dict) -> float:
     bb_pos   = data.get('bb_position', '') or ''
     vwap_sig = data.get('vwap_signal', '') or ''
     trend    = data.get('trend', '') or ''
+    slope    = float(data.get('slope', 0) or 0)
+    price    = float(data.get('last_price', 0) or 0)
+    ema50    = float(data.get('ema50', price) or price)
+    atr_pct  = float(data.get('atr_pct', 2.0) or 2.0)
+    symbol   = data.get('symbol', '')
 
+    market_state = _classify_market_state(data)
+    weights = _adaptive_weights(market_state)
+
+    # Trend gate: RSI/BB buy signals at 40% weight in confirmed downtrend
+    trend_penalty = 0.4 if slope < -0.05 else 1.0
+
+    breakdown = {}
     score = 0.0
 
-    if   rsi <= 20: score += 3.0
-    elif rsi <= 28: score += 2.0
-    elif rsi <= 38: score += 1.0
-    elif rsi >= 80: score -= 3.0
-    elif rsi >= 72: score -= 2.0
-    elif rsi >= 62: score -= 1.0
+    # ── RSI ──────────────────────────────────────────────────────────────────
+    if   rsi <= 20: raw = 3.0; sig = 'extreme_oversold'
+    elif rsi <= 28: raw = 2.0; sig = 'oversold'
+    elif rsi <= 38: raw = 1.0; sig = 'mild_oversold'
+    elif rsi >= 80: raw = -3.0; sig = 'extreme_overbought'
+    elif rsi >= 72: raw = -2.0; sig = 'overbought'
+    elif rsi >= 62: raw = -1.0; sig = 'mild_overbought'
+    else:           raw = 0.0;  sig = 'neutral'
+    contrib = raw * weights['rsi'] * (trend_penalty if raw > 0 else 1.0)
+    breakdown['rsi'] = {'value': round(rsi, 1), 'signal': sig,
+                        'contribution': round(contrib, 2), 'weight': weights['rsi'],
+                        'trend_penalty_applied': trend_penalty < 1.0 and raw > 0}
+    score += contrib
 
-    if   macd_x == 'bullish_cross': score += 3.0
-    elif macd_x == 'bullish':       score += 1.5
-    elif macd_x == 'bearish_cross': score -= 3.0
-    elif macd_x == 'bearish':       score -= 1.5
+    # ── MACD ─────────────────────────────────────────────────────────────────
+    if   macd_x == 'bullish_cross': raw = 2.0; sig = 'bullish_crossover'
+    elif macd_x == 'bullish':       raw = 1.0; sig = 'bullish'
+    elif macd_x == 'bearish_cross': raw = -2.0; sig = 'bearish_crossover'
+    elif macd_x == 'bearish':       raw = -1.0; sig = 'bearish'
+    else:                           raw = 0.0;  sig = 'neutral'
+    contrib = raw * weights['macd']
+    breakdown['macd'] = {'value': round(data.get('macd_value', 0) or 0, 4),
+                         'signal': sig, 'contribution': round(contrib, 2),
+                         'weight': weights['macd']}
+    score += contrib
 
-    if   stoch_k <= 15: score += 1.5
-    elif stoch_k <= 25: score += 1.0
-    elif stoch_k >= 85: score -= 1.5
-    elif stoch_k >= 75: score -= 1.0
+    # ── Stochastic ───────────────────────────────────────────────────────────
+    if   stoch_k <= 15: raw = 1.5; sig = 'deep_oversold'
+    elif stoch_k <= 25: raw = 1.0; sig = 'oversold'
+    elif stoch_k >= 85: raw = -1.5; sig = 'deep_overbought'
+    elif stoch_k >= 75: raw = -1.0; sig = 'overbought'
+    else:               raw = 0.0;  sig = 'neutral'
+    contrib = raw * weights['stoch'] * (trend_penalty if raw > 0 else 1.0)
+    breakdown['stoch'] = {'value': round(stoch_k, 1), 'signal': sig,
+                          'contribution': round(contrib, 2), 'weight': weights['stoch']}
+    score += contrib
 
+    # ── Volume ───────────────────────────────────────────────────────────────
     vol_mult = min(vol_r / 1.5, 1.5) if vol_r > 1.5 else 1.0
-    if   vol_sig == 'high_up':   score += 2.0 * vol_mult
-    elif vol_sig == 'high_down': score -= 2.0 * vol_mult
-    elif vol_sig == 'low':       score *= 0.65
+    if   vol_sig == 'high_up':   raw = 2.0 * vol_mult; sig = 'high_buying'
+    elif vol_sig == 'high_down': raw = -2.0 * vol_mult; sig = 'high_selling'
+    elif vol_sig == 'low':       raw = 0.0; sig = 'low_volume'; score *= 0.65
+    else:                        raw = 0.0; sig = 'normal'
+    if vol_sig not in ('low', ''):
+        contrib = raw * weights['volume']
+        breakdown['volume'] = {'value': round(vol_r, 2), 'signal': sig,
+                               'contribution': round(contrib, 2), 'weight': weights['volume']}
+        score += contrib
+    else:
+        breakdown['volume'] = {'value': round(vol_r, 2), 'signal': sig,
+                               'contribution': 0.0, 'weight': weights['volume']}
 
-    if   bb_pos == 'oversold':   score += 1.5
-    elif bb_pos == 'lower_half': score += 0.5
-    elif bb_pos == 'overbought': score -= 1.5
-    elif bb_pos == 'upper_half': score -= 0.5
+    # ── Bollinger Bands ───────────────────────────────────────────────────────
+    if   bb_pos == 'oversold':   raw = 1.5; sig = 'oversold'
+    elif bb_pos == 'lower_half': raw = 0.5; sig = 'lower_half'
+    elif bb_pos == 'overbought': raw = -1.5; sig = 'overbought'
+    elif bb_pos == 'upper_half': raw = -0.5; sig = 'upper_half'
+    elif bb_pos == 'squeeze':    raw = 0.0; sig = 'squeeze'
+    else:                        raw = 0.0; sig = 'neutral'
+    contrib = raw * weights['bb'] * (trend_penalty if raw > 0 else 1.0)
+    breakdown['bb'] = {'value': bb_pos, 'signal': sig,
+                       'contribution': round(contrib, 2), 'weight': weights['bb']}
+    score += contrib
 
-    if   vwap_sig == 'above': score += 1.0
-    elif vwap_sig == 'below': score -= 1.0
+    # ── VWAP ─────────────────────────────────────────────────────────────────
+    if   vwap_sig == 'above': raw = 1.0; sig = 'above_vwap'
+    elif vwap_sig == 'below': raw = -1.0; sig = 'below_vwap'
+    else:                     raw = 0.0; sig = 'neutral'
+    contrib = raw * weights['vwap']
+    breakdown['vwap'] = {'value': vwap_sig, 'signal': sig,
+                         'contribution': round(contrib, 2), 'weight': weights['vwap']}
+    score += contrib
 
-    if   trend == 'up':   score += 1.5
-    elif trend == 'down': score -= 1.5
+    # ── Trend ────────────────────────────────────────────────────────────────
+    if   trend == 'up':       raw = 1.5; sig = 'uptrend'
+    elif trend == 'down':     raw = -1.5; sig = 'downtrend'
+    else:                     raw = 0.0; sig = 'sideways'
+    contrib = raw * weights['trend']
+    breakdown['trend'] = {'value': trend, 'signal': sig,
+                          'contribution': round(contrib, 2), 'weight': weights['trend']}
+    score += contrib
 
-    return round(score, 2)
+    # ── EMA50 falling-knife gate ──────────────────────────────────────────────
+    ema50_gate = False
+    if ema50 > 0 and price < ema50 * 0.85:
+        score = min(score, 1.0)
+        ema50_gate = True
+    breakdown['ema50_gate'] = {'price_vs_ema50': round((price / ema50 - 1) * 100, 1) if ema50 else 0,
+                               'gate_triggered': ema50_gate}
+
+    score = round(score, 2)
+
+    # ── Multi-timeframe alignment ─────────────────────────────────────────────
+    mtf = _compute_mtf_bias(symbol) if symbol else {'h1': 'neutral', 'm5': 'neutral', 'm1': 'neutral', 'alignment': 0.5, 'bias': 'neutral'}
+    score_dir = 1 if score > 0 else (-1 if score < 0 else 0)
+    bias_dir  = 1 if mtf['bias'] == 'bullish' else (-1 if mtf['bias'] == 'bearish' else 0)
+    if score_dir != 0 and bias_dir != 0:
+        if score_dir == bias_dir:
+            score = score * (0.8 + mtf['alignment'] * 0.2)   # up to 1.0x — confirming
+        else:
+            score = score * (1.0 - mtf['alignment'] * 0.4)   # as low as 0.6x — opposing
+    score = round(score, 2)
+    breakdown['mtf'] = {'h1': mtf['h1'], 'm5': mtf['m5'], 'm1': mtf['m1'],
+                        'bias': mtf['bias'], 'alignment': mtf['alignment']}
+
+    # ── Uncertainty score ─────────────────────────────────────────────────────
+    bull_count = sum(1 for k, v in breakdown.items()
+                     if isinstance(v, dict) and v.get('contribution', 0) > 0)
+    bear_count = sum(1 for k, v in breakdown.items()
+                     if isinstance(v, dict) and v.get('contribution', 0) < 0)
+    conflicts = min(bull_count, bear_count)
+    uncertainty = 0.25
+    uncertainty += conflicts * 0.08          # conflicting signals add uncertainty
+    if vol_sig == 'low':     uncertainty += 0.10
+    if bb_pos == 'squeeze':  uncertainty += 0.08
+    if atr_pct > 4.0:        uncertainty += 0.10
+    if market_state in ('ranging', 'neutral'): uncertainty += 0.12
+    if market_state == 'panic': uncertainty += 0.20
+    if abs(score) >= 5.0:    uncertainty -= 0.10  # strong alignment = more certain
+    if ema50_gate:           uncertainty += 0.15
+    uncertainty = round(max(0.05, min(0.95, uncertainty)), 2)
+
+    # ── Plain-English summary ─────────────────────────────────────────────────
+    parts = []
+    rsi_sig = breakdown['rsi']['signal']
+    if rsi_sig in ('extreme_oversold', 'oversold'):
+        parts.append(f"RSI at {rsi:.0f} is {'extremely ' if rsi_sig == 'extreme_oversold' else ''}oversold")
+    elif rsi_sig in ('extreme_overbought', 'overbought'):
+        parts.append(f"RSI at {rsi:.0f} is {'extremely ' if rsi_sig == 'extreme_overbought' else ''}overbought")
+
+    macd_sig = breakdown['macd']['signal']
+    if macd_sig == 'bullish_crossover':  parts.append("MACD just crossed bullish — momentum shift")
+    elif macd_sig == 'bearish_crossover': parts.append("MACD just crossed bearish — selling pressure building")
+    elif macd_sig == 'bullish':          parts.append("MACD bullish but no fresh crossover")
+    elif macd_sig == 'bearish':          parts.append("MACD bearish")
+
+    trend_sig = breakdown['trend']['signal']
+    if trend_sig == 'downtrend' and trend_penalty < 1.0:
+        parts.append("downtrend reduces confidence in buy signals")
+    elif trend_sig == 'uptrend':
+        parts.append("price in uptrend supporting bullish case")
+
+    vol_sig2 = breakdown['volume']['signal']
+    if vol_sig2 == 'high_buying':   parts.append(f"volume {vol_r:.1f}× average on an up day — institutional buying")
+    elif vol_sig2 == 'high_selling': parts.append(f"volume {vol_r:.1f}× average on a down day — distribution")
+    elif vol_sig2 == 'low_volume':  parts.append("thin volume reduces signal reliability")
+
+    state_msgs = {
+        'panic': "Panic-level selling detected — extreme caution, signals unreliable.",
+        'breakout': "Breakout pattern: price clearing resistance on high volume.",
+        'accumulation': "Accumulation pattern: smart money likely building positions.",
+        'overbought_extreme': "Extreme overbought — pullback risk elevated.",
+        'oversold_extreme': "Extreme oversold — snap-back likely but timing uncertain.",
+        'ranging': "Market ranging — momentum strategies less effective.",
+        'trending_up': "Strong uptrend — trend-following indicators weighted higher.",
+        'trending_down': "Strong downtrend — exercise extra caution on buy signals.",
+    }
+    if market_state in state_msgs:
+        parts.append(state_msgs[market_state])
+
+    if ema50_gate:
+        parts.append(f"price {abs(breakdown['ema50_gate']['price_vs_ema50']):.1f}% below 50-day EMA — buy signal capped")
+
+    if score >= 5.0:      qualifier = "Strong BUY signal."
+    elif score >= 2.5:    qualifier = "Moderate BUY opportunity."
+    elif score <= -5.0:   qualifier = "Strong SELL signal."
+    elif score <= -2.5:   qualifier = "Moderate SELL pressure."
+    else:                 qualifier = "Mixed signals — no clear edge."
+
+    summary = qualifier + (" " + ". ".join(parts) + "." if parts else "")
+
+    # ── What changed? ─────────────────────────────────────────────────────────
+    changes = []
+    prev = _prev_signals.get(symbol, {})
+    watch_keys = [('macd_cross', 'MACD'), ('trend', 'Trend'),
+                  ('bb_position', 'BB position'), ('volume_signal', 'Volume'),
+                  ('market_state', 'Market state')]
+    check_data = {**data, 'market_state': market_state}
+    for key, label in watch_keys:
+        old_v = prev.get(key)
+        new_v = check_data.get(key)
+        if old_v and new_v and old_v != new_v:
+            changes.append(f"{label}: {old_v} → {new_v}")
+    if symbol:
+        _prev_signals[symbol] = {k: check_data.get(k) for k, _ in watch_keys}
+        _prev_signals[symbol]['score'] = score
+
+    return {
+        'score':        score,
+        'market_state': market_state,
+        'breakdown':    breakdown,
+        'uncertainty':  uncertainty,
+        'summary':      summary,
+        'what_changed': changes,
+        'weights_used': weights,
+        'mtf_bias':     mtf,
+    }
+
+
+def _ai_score(data: dict) -> float:
+    """Return just the numeric score (backward-compatible wrapper)."""
+    return _ai_score_detailed(data)['score']
 
 
 def _ai_log_entry(pid: int, symbol: str, action: str, score: float,
@@ -1741,52 +2553,176 @@ def _ai_log_entry(pid: int, symbol: str, action: str, score: float,
         )
 
 
+def _score_to_pct(score: float) -> float:
+    """Scale position size to signal conviction. High-score trades get more capital."""
+    if score >= 7.0: return 0.12
+    if score >= 5.0: return 0.10
+    if score >= 3.5: return 0.07
+    return 0.05
+
+
+def _compute_corr_factor(new_sym: str, held_syms: list) -> float:
+    """Return 0.5 if new symbol is highly correlated (r>0.7) with any held position."""
+    if not _candle_engine or not held_syms:
+        return 1.0
+    new_closes = _candle_engine.get_recent_closes(new_sym, '1m', 20)
+    if len(new_closes) < 8:
+        return 1.0
+    for held in held_syms:
+        hc = _candle_engine.get_recent_closes(held, '1m', 20)
+        n = min(len(new_closes), len(hc))
+        if n < 8:
+            continue
+        a, b = new_closes[-n:], hc[-n:]
+        ma, mb = sum(a)/n, sum(b)/n
+        num = sum((a[i]-ma)*(b[i]-mb) for i in range(n))
+        sa  = (sum((x-ma)**2 for x in a)/n)**0.5
+        sb  = (sum((x-mb)**2 for x in b)/n)**0.5
+        if sa > 0 and sb > 0 and abs(num / (n * sa * sb)) > 0.7:
+            return 0.5
+    return 1.0
+
+
+def _is_fractional_asset(sym: str) -> bool:
+    return sym.endswith('-USD') or sym.endswith('=X')
+
+
+def _seed_daily_candles(symbols: list) -> None:
+    """Seed CandleEngine's 1d history from yfinance for MTF alignment on daily timeframe."""
+    if not _candle_engine:
+        return
+    try:
+        import yfinance as yf
+        from candle_engine import _OHLCV
+    except ImportError:
+        return
+    for sym in symbols:
+        try:
+            df = yf.download(sym, period='90d', interval='1d', progress=False, auto_adjust=True)
+            if df.empty:
+                continue
+            with _candle_engine._lock:
+                hist = _candle_engine._history[sym]['1d']
+                for ts, row in df.iterrows():
+                    bar_ts = ts.timestamp() if hasattr(ts, 'timestamp') else float(ts)
+                    o = float(row.get('Open', row.iloc[0]))
+                    h = float(row.get('High', row.iloc[0]))
+                    l = float(row.get('Low',  row.iloc[0]))
+                    cl = float(row.get('Close', row.iloc[0]))
+                    v = float(row.get('Volume', 0) or 0)
+                    hist.append(_OHLCV(open=o, high=h, low=l, close=cl, volume=v, ts=bar_ts))
+            print(f'[SEED] {sym}: {len(df)} daily bars loaded')
+        except Exception as e:
+            print(f'[SEED] {sym} failed: {e}')
+
+
+def _market_is_open() -> bool:
+    """Return True if US equity market is currently open (Mon–Fri 09:30–16:00 ET)."""
+    import datetime, zoneinfo
+    now = datetime.datetime.now(zoneinfo.ZoneInfo('America/New_York'))
+    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    open_t  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_t = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_t <= now < close_t
+
+
 def _ai_run_portfolio(pid: int) -> dict:
     """One AI scan cycle: check existing positions, then scan a batch for buys."""
-    MAX_POS      = 8
-    POS_PCT      = 0.10    # max 10% equity per new position
-    CASH_RESERVE = 0.10    # keep ≥10% equity in cash
+    MAX_POS      = 12   # raised from 8 — allow more concurrent positions
+    CASH_RESERVE = 0.10    # keep ≥10% of CASH in reserve (not equity — bug fix)
     ATR_STOP_M   = 1.5
     ATR_TGT_M    = 2.5
-    BATCH_SIZE   = 15
+    BATCH_SIZE   = 30   # raised from 25 — scan more symbols per cycle
+    BUY_THRESH   = 2.5     # raised from 2.0 — require stronger conviction
+    SELL_THRESH  = -2.5    # raised from -2.0 — don't exit winners too early
+    SHORT_THRESH = -3.0    # strong bearish signal required to open a short
+    COVER_THRESH = 1.0     # close short when signal turns neutral/bullish
 
-    summary = {'pid': pid, 'scanned': 0, 'bought': [], 'sold': [], 'errors': []}
+    market_open = _market_is_open()
+    mode        = 'full' if market_open else 'crypto_forex'
+    summary     = {'pid': pid, 'scanned': 0, 'bought': [], 'sold': [],
+                   'shorted': [], 'covered': [],
+                   'errors': [], 'mode': mode, 'skip_reason': None}
+    batch_data  = []
 
     try:
-        # ── 1. Check held positions for exits ──────────────────────────────
+        # ── 1. Check held positions for exits + cover shorts ───────────────
+        # Exits run regardless of market hours (stops/signals still evaluated)
         with _get_db() as conn:
             pos_rows = conn.execute(
-                'SELECT symbol, shares, avg_cost FROM sim_positions WHERE portfolio_id=? AND shares>0',
+                'SELECT id, symbol, shares, avg_cost, stop_price FROM sim_positions WHERE portfolio_id=? AND shares!=0',
                 (pid,)
             ).fetchall()
 
         for row in pos_rows:
-            sym = row['symbol']
+            sym       = row['symbol']
+            is_short  = row['shares'] < 0
             try:
-                data  = _compute_indicators(sym)
-                price = data.get('last_price') or _get_current_price(sym)
-                score = _ai_score(data)
-                atr   = data.get('atr') or (price * 0.02)
-                stop  = row['avg_cost'] - ATR_STOP_M * atr
-                tgt   = row['avg_cost'] + ATR_TGT_M  * atr
+                data  = _compute_indicators_fast(sym)
+                data['symbol'] = sym
+                price  = data.get('last_price') or _get_current_price(sym)
+                detail = _ai_score_detailed(data)
+                score  = detail['score']
+                atr    = data.get('atr') or (price * 0.02)
+                tradeable = market_open or _is_fractional_asset(sym)
 
-                if score <= -2.0 or price <= stop or price >= tgt:
-                    reason = ('sell_signal' if score <= -2.0
-                              else 'stop_loss' if price <= stop
-                              else 'take_profit')
-                    _sim_sell(sym, row['shares'], price, pid)
-                    summary['sold'].append({'symbol': sym, 'price': round(price, 2),
-                                            'score': score, 'reason': reason})
-                    _ai_log_entry(pid, sym, 'SELL', score, price, row['shares'], reason)
+                if is_short:
+                    # ── Short position: trailing stop trails DOWN as price falls ──
+                    short_qty    = abs(row['shares'])
+                    entry_price  = row['avg_cost']
+                    # Trailing stop for shorts: min(current_stop, price + ATR_STOP_M*atr)
+                    # — stop trails downward as price falls, protecting profit
+                    new_stop     = price + ATR_STOP_M * atr
+                    current_stop = row['stop_price'] if row['stop_price'] else (entry_price + ATR_STOP_M * atr)
+                    trailing_stop = min(current_stop, new_stop)
+                    if trailing_stop < current_stop:
+                        with _get_db() as conn:
+                            conn.execute('UPDATE sim_positions SET stop_price=? WHERE id=?',
+                                         (trailing_stop, row['id']))
+                    # Target: price falling ATR_TGT_M below entry
+                    tgt_price    = entry_price - ATR_TGT_M * atr
+                    if tradeable and (score >= COVER_THRESH or price >= trailing_stop or price <= tgt_price):
+                        reason = ('cover_signal' if score >= COVER_THRESH
+                                  else 'stop_loss' if price >= trailing_stop
+                                  else 'take_profit')
+                        fill = _apply_slippage(price, 'buy', atr, data.get('volume_ratio', 1.0))
+                        _sim_cover(sym, short_qty, fill, pid)
+                        summary['covered'].append({'symbol': sym, 'price': round(fill, 2),
+                                                   'score': score, 'reason': reason,
+                                                   'market_state': detail['market_state']})
+                        _ai_log_entry(pid, sym, 'COVER', score, fill, short_qty,
+                                      f"{reason} | short closed | {detail['summary'][:80]}")
+                else:
+                    # ── Long position: sell on signal or stop ──────────────────────
+                    tgt    = row['avg_cost'] + ATR_TGT_M * atr
+                    new_stop     = price - ATR_STOP_M * atr
+                    current_stop = row['stop_price'] if row['stop_price'] else (row['avg_cost'] - ATR_STOP_M * atr)
+                    trailing     = max(current_stop, new_stop)
+                    if trailing > current_stop:
+                        with _get_db() as conn:
+                            conn.execute('UPDATE sim_positions SET stop_price=? WHERE id=?',
+                                         (trailing, row['id']))
+                    if tradeable and (score <= SELL_THRESH or price <= trailing or price >= tgt):
+                        reason = ('sell_signal' if score <= SELL_THRESH
+                                  else 'stop_loss' if price <= trailing
+                                  else 'take_profit')
+                        fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0))
+                        _sim_sell(sym, row['shares'], fill, pid)
+                        summary['sold'].append({'symbol': sym, 'price': round(fill, 2),
+                                                'score': score, 'reason': reason,
+                                                'market_state': detail['market_state']})
+                        _ai_log_entry(pid, sym, 'SELL', score, fill, row['shares'],
+                                      f"{reason} | {detail['summary'][:80]}")
             except Exception as e:
                 summary['errors'].append(f'exit {sym}: {e}')
 
-        # ── 2. Compute equity for position sizing ──────────────────────────
+        # ── 2. Compute equity and available cash ───────────────────────────
         state = _sim_state(pid)
         cash  = state['cash']
         with _get_db() as conn:
             held = [r['symbol'] for r in conn.execute(
-                'SELECT symbol FROM sim_positions WHERE portfolio_id=? AND shares>0', (pid,)
+                'SELECT symbol FROM sim_positions WHERE portfolio_id=? AND shares!=0', (pid,)
             ).fetchall()]
 
         equity = cash
@@ -1798,65 +2734,158 @@ def _ai_run_portfolio(pid: int) -> dict:
             except Exception:
                 pass
 
-        available = cash - equity * CASH_RESERVE
-        if len(held) >= MAX_POS or available <= 100:
-            return summary
+        # FIX: reserve is a % of CASH, not equity
+        available = cash - cash * CASH_RESERVE
+        can_buy   = len(held) < MAX_POS and available > 100
+        if not can_buy:
+            summary['skip_reason'] = 'max_positions' if len(held) >= MAX_POS else 'low_cash'
 
-        # ── 3. Scan batch of universe symbols for buys ─────────────────────
-        universe = [s for s in _AI_UNIVERSE if s not in held]
+        # ── 3. Scan batch of universe symbols ──────────────────────────────
+        # Always scan regardless of buy eligibility — gives visibility into market state.
+        # Merge AI universe with portfolio's watchlist so any watchlisted symbol gets scanned
+        with _get_db() as conn:
+            wl_syms = [r['symbol'] for r in conn.execute(
+                'SELECT symbol FROM watchlist_items WHERE portfolio_id=?', (pid,)
+            ).fetchall()]
+        combined_universe = list(dict.fromkeys(_AI_UNIVERSE + wl_syms))
+        universe = [s for s in combined_universe if s not in held]
+        # Outside market hours only scan crypto/forex (24/7 assets)
+        if not market_open:
+            universe = [s for s in universe if _is_fractional_asset(s)]
+        if not universe:
+            return summary
         cursor   = _ai_scan_cursor.get(pid, 0)
         batch    = [universe[(cursor + i) % len(universe)] for i in range(min(BATCH_SIZE, len(universe)))]
         _ai_scan_cursor[pid] = (cursor + BATCH_SIZE) % max(len(universe), 1)
 
         candidates = []
+        batch_data = []
         for sym in batch:
             try:
-                data  = _compute_indicators(sym)
+                data  = _compute_indicators_fast(sym)
+                data['symbol'] = sym
                 price = data.get('last_price')
                 if not price or price <= 0:
                     continue
-                score = _ai_score(data)
+                detail = _ai_score_detailed(data)
+                score  = detail['score']
                 summary['scanned'] += 1
-                if score >= 2.0:
-                    candidates.append({'symbol': sym, 'score': score,
-                                       'price': price, 'atr': data.get('atr')})
+                qualifies_long  = score >= BUY_THRESH
+                qualifies_short = score <= SHORT_THRESH
+                batch_data.append({
+                    'symbol': sym, 'score': round(score, 2), 'price': round(price, 2),
+                    'market_state': detail['market_state'],
+                    'rsi': round(data.get('rsi', 50), 1),
+                    'trend': data.get('trend', ''),
+                    'qualifies': qualifies_long,
+                    'qualifies_short': qualifies_short,
+                })
+                print(f'[AI]   {sym:12s} score={score:+.1f}  state={detail["market_state"]:16s}  '
+                      f'rsi={data.get("rsi",50):.0f}  macd={data.get("macd_cross","")}  trend={data.get("trend","")}')
+                if qualifies_long:
+                    candidates.append({'symbol': sym, 'score': score, 'price': price,
+                                       'atr': data.get('atr'), 'atr_pct': float(data.get('atr_pct', 2.0) or 2.0),
+                                       'detail': detail,
+                                       'volume_ratio': data.get('volume_ratio', 1.0),
+                                       'side': 'long'})
+                elif qualifies_short:
+                    candidates.append({'symbol': sym, 'score': score, 'price': price,
+                                       'atr': data.get('atr'), 'atr_pct': float(data.get('atr_pct', 2.0) or 2.0),
+                                       'detail': detail,
+                                       'volume_ratio': data.get('volume_ratio', 1.0),
+                                       'side': 'short'})
             except Exception as e:
                 summary['errors'].append(f'scan {sym}: {e}')
 
-        candidates.sort(key=lambda x: x['score'], reverse=True)
+        candidates.sort(key=lambda x: abs(x['score']), reverse=True)
 
-        # ── 4. Buy top candidates ──────────────────────────────────────────
+        # ── 4. Buy top candidates (only if eligible) ───────────────────────
         n_pos = len(held)
-        for c in candidates:
+        for c in candidates if can_buy else []:
             if n_pos >= MAX_POS or available <= 100:
                 break
-            alloc  = min(equity * POS_PCT, available)
-            shares = alloc / c['price']
-            if shares < 0.001:
+            base_pct   = _score_to_pct(abs(c['score']))
+            vol_scale  = max(0.5, float(c.get('atr_pct', 2.0)) / 2.0)
+            corr_scale = _compute_corr_factor(c['symbol'], held)
+            pos_pct    = max(0.03, min(0.12, base_pct / vol_scale * corr_scale))
+            alloc      = min(equity * pos_pct, available)
+            raw_shares = alloc / c['price']
+            shares     = raw_shares if _is_fractional_asset(c['symbol']) else max(1, int(raw_shares))
+            if alloc < 10:
+                continue
+            alloc = shares * c['price']
+            if alloc > available:
                 continue
             try:
-                _sim_buy(c['symbol'], shares, c['price'], pid)
+                side = c.get('side', 'long')
+                atr_val = c.get('atr') or c['price'] * 0.02
+                if side == 'long':
+                    fill = _apply_slippage(c['price'], 'buy', atr_val, c.get('volume_ratio', 1.0))
+                    _sim_buy(c['symbol'], shares, fill, pid)
+                    init_stop = fill - ATR_STOP_M * atr_val
+                    with _get_db() as conn:
+                        conn.execute(
+                            'UPDATE sim_positions SET stop_price=? WHERE symbol=? AND portfolio_id=? AND stop_price IS NULL',
+                            (init_stop, c['symbol'], pid)
+                        )
+                    summary['bought'].append({
+                        'symbol': c['symbol'], 'price': round(fill, 2),
+                        'shares': round(shares, 4), 'score': c['score'],
+                        'market_state': c['detail']['market_state'],
+                        'summary': c['detail']['summary'][:100],
+                    })
+                    _ai_log_entry(pid, c['symbol'], 'BUY', c['score'], fill, shares,
+                                  f"score {c['score']:+.1f} | {c['detail']['summary'][:80]}")
+                else:  # short
+                    fill = _apply_slippage(c['price'], 'sell', atr_val, c.get('volume_ratio', 1.0))
+                    _sim_short(c['symbol'], shares, fill, pid)
+                    summary['shorted'].append({
+                        'symbol': c['symbol'], 'price': round(fill, 2),
+                        'shares': round(shares, 4), 'score': c['score'],
+                        'market_state': c['detail']['market_state'],
+                        'summary': c['detail']['summary'][:100],
+                    })
+                    _ai_log_entry(pid, c['symbol'], 'SHORT', c['score'], fill, shares,
+                                  f"score {c['score']:+.1f} | bearish short | {c['detail']['summary'][:80]}")
                 n_pos    += 1
                 available -= alloc
-                summary['bought'].append({'symbol': c['symbol'], 'price': round(c['price'], 2),
-                                          'shares': round(shares, 4), 'score': c['score']})
-                _ai_log_entry(pid, c['symbol'], 'BUY', c['score'], c['price'], shares,
-                              f"score {c['score']:+.1f}")
             except Exception as e:
-                summary['errors'].append(f'buy {c["symbol"]}: {e}')
+                summary['errors'].append(f'open {c["symbol"]}: {e}')
 
     except Exception as e:
         summary['errors'].append(f'portfolio error: {e}')
+    finally:
+        # Always record the scan run (even when early-returning due to max positions)
+        import json as _json
+        try:
+            with _get_db() as conn:
+                conn.execute(
+                    '''INSERT INTO ai_scan_runs
+                       (portfolio_id, scanned, bought_count, sold_count, error_count,
+                        bought_json, sold_json, batch_json, mode, skip_reason)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                    (pid, summary['scanned'],
+                     len(summary['bought']) + len(summary['shorted']),
+                     len(summary['sold'])   + len(summary['covered']),
+                     len(summary['errors']),
+                     _json.dumps(summary['bought'] + summary['shorted']),
+                     _json.dumps(summary['sold']   + summary['covered']),
+                     _json.dumps(batch_data),
+                     summary.get('mode', 'full'),
+                     summary.get('skip_reason'))
+                )
+        except Exception:
+            pass
 
     return summary
 
 
 # ── AI background worker ───────────────────────────────────────────────────────
-_AI_INTERVAL = 600   # seconds between scans (10 min)
+_AI_INTERVAL = 90   # seconds between scans
 
 def _ai_worker():
-    """Daemon thread: every _AI_INTERVAL seconds scan all AI portfolios."""
-    _time.sleep(30)   # let app finish startup
+    """Daemon thread: scan all AI portfolios every _AI_INTERVAL seconds."""
+    _time.sleep(10)   # let app finish startup
     while True:
         try:
             with _get_db() as conn:
@@ -1865,7 +2894,14 @@ def _ai_worker():
                 ).fetchall()
             for row in rows:
                 try:
-                    _ai_run_portfolio(row['id'])
+                    result = _ai_run_portfolio(row['id'])
+                    if result['bought'] or result['sold'] or result['errors']:
+                        print(f'[AI] pid={row["id"]} scanned={result["scanned"]} '
+                              f'bought={[b["symbol"] for b in result["bought"]]} '
+                              f'sold={[s["symbol"] for s in result["sold"]]} '
+                              f'errors={result["errors"][:3]}')
+                    else:
+                        print(f'[AI] pid={row["id"]} scanned={result["scanned"]} — no trades')
                 except Exception as e:
                     print(f'[AI] portfolio {row["id"]} error: {e}')
         except Exception as e:
@@ -1910,7 +2946,7 @@ def _compute_indicators(symbol: str, force: bool = False) -> dict:
     sma50 = ([{'time': times[i], 'value': round(sum(closes[i-49:i+1]) / 50, 4)} for i in range(49, n)]
              if n >= 50 else [])
 
-    # ── Linear regression → 10-day projection ──
+    # ── Linear regression (slope/intercept for indicators) ──
     last20_y  = closes[-20:]
     x_mean    = 9.5
     y_mean    = sum(last20_y) / 20
@@ -1918,12 +2954,6 @@ def _compute_indicators(symbol: str, force: bool = False) -> dict:
     denom     = sum((i - x_mean) ** 2 for i in range(20))
     slope     = num / denom if denom else 0
     intercept = y_mean - slope * x_mean
-    last_time = times[-1]
-    projection = [
-        {'time': last_time + (i + 1) * 86400,
-         'value': round(intercept + slope * (19 + i + 1), 4)}
-        for i in range(10)
-    ]
 
     # ── RSI (14-period) ──
     gains  = [max(closes[i] - closes[i-1], 0) for i in range(1, n)]
@@ -2004,6 +3034,56 @@ def _compute_indicators(symbol: str, force: bool = False) -> dict:
     atr     = round(sum(tr_vals[-14:]) / 14, 4) if len(tr_vals) >= 14 else None
     atr_pct = round(atr / last_c * 100, 2)       if atr and last_c   else None
 
+    # Monte Carlo projection (300 paths, 10-day horizon)
+    _price = closes[-1] if closes[-1] > 0 else 1.0
+    daily_vol = (atr / _price) if (atr and _price > 0) else 0.01
+    drift = slope / _price if _price > 0 else 0
+    _n_paths = 300
+    _horizon = 10
+    _all_paths = []
+    for _ in range(_n_paths):
+        _path = [_price]
+        for _d in range(_horizon):
+            _shock = random.gauss(0, daily_vol)
+            _path.append(_path[-1] * (1 + drift + _shock))
+        _all_paths.append(_path[1:])
+
+    def _pct(lst, p):
+        s = sorted(lst)
+        k = (len(s)-1) * p / 100
+        f, c = int(k), min(int(k)+1, len(s)-1)
+        return s[f] + (s[c]-s[f])*(k-f)
+
+    _bull_path, _base_path, _bear_path = [], [], []
+    _conf_upper, _conf_lower = [], []
+    for _day_vals in zip(*_all_paths):
+        _dv = list(_day_vals)
+        _bull_path.append(round(_pct(_dv, 75), 4))
+        _base_path.append(round(_pct(_dv, 50), 4))
+        _bear_path.append(round(_pct(_dv, 25), 4))
+        _conf_upper.append(round(_pct(_dv, 84), 4))
+        _conf_lower.append(round(_pct(_dv, 16), 4))
+
+    prob_up = sum(1 for _p in _all_paths if _p[-1] > _price) / _n_paths
+    _day_sec = 86400
+    _lt = times[-1]
+    bull_proj = [{'time': _lt + (i+1)*_day_sec, 'value': v} for i, v in enumerate(_bull_path)]
+    base_proj = [{'time': _lt + (i+1)*_day_sec, 'value': v} for i, v in enumerate(_base_path)]
+    bear_proj = [{'time': _lt + (i+1)*_day_sec, 'value': v} for i, v in enumerate(_bear_path)]
+    conf_upper_proj = [{'time': _lt + (i+1)*_day_sec, 'value': v} for i, v in enumerate(_conf_upper)]
+    conf_lower_proj = [{'time': _lt + (i+1)*_day_sec, 'value': v} for i, v in enumerate(_conf_lower)]
+    projection = base_proj  # backward compat
+
+    _bull_chg = round((_bull_path[-1]/_price-1)*100, 2) if _price else 0
+    _base_chg = round((_base_path[-1]/_price-1)*100, 2) if _price else 0
+    _bear_chg = round((_bear_path[-1]/_price-1)*100, 2) if _price else 0
+    scenarios_proj = {
+        'bull': {'path': bull_proj, 'label': f'Bullish ({_bull_chg:+.1f}%)', 'prob': round(prob_up, 2)},
+        'base': {'path': base_proj, 'label': f'Neutral ({_base_chg:+.1f}%)', 'prob': round(1 - abs(prob_up-0.5)*2, 2)},
+        'bear': {'path': bear_proj, 'label': f'Bearish ({_bear_chg:+.1f}%)', 'prob': round(1-prob_up, 2)},
+    }
+    confidence_band = {'upper': conf_upper_proj, 'lower': conf_lower_proj}
+
     # ── VWAP (20-day rolling) ──
     vwap_arr = []
     for i in range(19, n):
@@ -2013,7 +3093,12 @@ def _compute_indicators(symbol: str, force: bool = False) -> dict:
         if tv > 0:
             vwap_arr.append({'time': times[i], 'value': round(sum(p*v for p,v in zip(tp, vol)) / tv, 4)})
     last_vwap   = vwap_arr[-1]['value'] if vwap_arr else None
-    vwap_signal = 'above' if (last_vwap and last_c > last_vwap) else 'below'
+    if last_vwap is None:
+        vwap_signal = ''       # no volume data (forex) — treat as neutral
+    elif last_c > last_vwap:
+        vwap_signal = 'above'
+    else:
+        vwap_signal = 'below'
 
     # ── Volume ──
     last_vol  = volumes[-1] if volumes else 0
@@ -2030,6 +3115,113 @@ def _compute_indicators(symbol: str, force: bool = False) -> dict:
     resistance = round(sorted_c[int(len(sorted_c) * 0.90)], 2)
 
     trend = 'up' if slope > 0.05 else 'down' if slope < -0.05 else 'sideways'
+
+    # Market regime detection
+    def _adx(h_list, l_list, c_list, period=14):
+        if len(c_list) < period + 1:
+            return 20.0
+        tr_list, pdm_list, ndm_list = [], [], []
+        for i in range(1, len(c_list)):
+            h, l, pc = h_list[i], l_list[i], c_list[i-1]
+            tr_list.append(max(h-l, abs(h-pc), abs(l-pc)))
+            pdm_list.append(max(h_list[i]-h_list[i-1], 0))
+            ndm_list.append(max(l_list[i-1]-l_list[i], 0))
+        def _wilders(lst, p):
+            r = [sum(lst[:p])]
+            for v in lst[p:]:
+                r.append(r[-1] - r[-1]/p + v)
+            return r
+        _atr14 = _wilders(tr_list, period)
+        _pdi = [100*p/a if a else 0 for p, a in zip(_wilders(pdm_list, period), _atr14)]
+        _ndi = [100*n/a if a else 0 for n, a in zip(_wilders(ndm_list, period), _atr14)]
+        _dx = [100*abs(p-n)/(p+n) if (p+n) else 0 for p, n in zip(_pdi, _ndi)]
+        return round(sum(_dx[-period:]) / period, 1) if len(_dx) >= period else 20.0
+
+    adx_val = _adx(highs, lows, closes)
+
+    # BB squeeze detection using bb_widths history
+    _bb_widths = []
+    for _i in range(20, min(len(closes), 80)):
+        _w = closes[_i-20:_i]
+        _m = sum(_w)/20
+        _s = (sum((x-_m)**2 for x in _w)/20)**0.5
+        _bb_widths.append((4*_s)/_m if _m else 0)
+    # Use mean and std from BB loop (last iteration values)
+    _current_bb_w = (4*std/mean) if mean else 0
+    _bb_threshold = sorted(_bb_widths)[int(len(_bb_widths)*0.2)] if len(_bb_widths) >= 5 else 0.03
+    _consolidating = _current_bb_w < _bb_threshold
+    _high_vol = (atr / closes[-1] * 100) > 4.0 if closes[-1] else False
+
+    if adx_val > 25 and slope > 0.02:
+        regime = 'trending_up'
+    elif adx_val > 25 and slope < -0.02:
+        regime = 'trending_down'
+    elif _consolidating:
+        regime = 'consolidating'
+    elif _high_vol:
+        regime = 'high_volatility'
+    else:
+        regime = 'neutral'
+
+    # Multi-timeframe analysis
+    def _rsi_quick(c, p=14):
+        if len(c) < p+1: return 50.0
+        gains = [max(c[i]-c[i-1], 0) for i in range(1, len(c))]
+        losses = [max(c[i-1]-c[i], 0) for i in range(1, len(c))]
+        ag = sum(gains[-p:])/p; al = sum(losses[-p:])/p
+        return round(100 - 100/(1+ag/al), 1) if al else 100.0
+
+    # 1D: use existing data
+    _d_trend = 'up' if slope > 0.02 else ('down' if slope < -0.02 else 'sideways')
+    mtf_1d = {'rsi': round(rsi, 1), 'trend': _d_trend, 'bb': bb_pos}
+
+    # 1W: weekly bars
+    try:
+        import yfinance as yf
+        _df_w = yf.download(symbol, period='52wk', interval='1wk', progress=False, auto_adjust=True)
+        if isinstance(_df_w.columns, type(_df_w.columns)) and hasattr(_df_w.columns, 'levels'):
+            _df_w.columns = _df_w.columns.droplevel(1)
+        if len(_df_w) >= 14:
+            _wc = _df_w['Close'].values.tolist()
+            _w_rsi = _rsi_quick(_wc)
+            _wm5 = sum(_wc[-5:])/5 if len(_wc)>=5 else _wc[-1]
+            _wm10 = sum(_wc[-10:])/10 if len(_wc)>=10 else _wc[-1]
+            _w_trend = 'up' if _wm5 > _wm10 else 'down'
+            mtf_1w = {'rsi': _w_rsi, 'trend': _w_trend}
+        else:
+            mtf_1w = {'rsi': 50, 'trend': 'sideways'}
+    except Exception:
+        mtf_1w = {'rsi': 50, 'trend': 'sideways'}
+
+    # 1H: hourly bars
+    try:
+        _df_h = yf.download(symbol, period='5d', interval='1h', progress=False, auto_adjust=True)
+        if isinstance(_df_h.columns, type(_df_h.columns)) and hasattr(_df_h.columns, 'levels'):
+            _df_h.columns = _df_h.columns.droplevel(1)
+        if len(_df_h) >= 14:
+            _hc = _df_h['Close'].values.tolist()
+            _h_rsi = _rsi_quick(_hc)
+            _hm5 = sum(_hc[-5:])/5 if len(_hc)>=5 else _hc[-1]
+            _hm10 = sum(_hc[-10:])/10 if len(_hc)>=10 else _hc[-1]
+            _h_trend = 'up' if _hm5 > _hm10 else 'down'
+            mtf_1h = {'rsi': round(_h_rsi,1), 'trend': _h_trend}
+        else:
+            mtf_1h = {'rsi': 50, 'trend': 'sideways'}
+    except Exception:
+        mtf_1h = {'rsi': 50, 'trend': 'sideways'}
+
+    _bull_count = sum([
+        1 if mtf_1h.get('trend') == 'up' else 0,
+        1 if mtf_1d.get('trend') == 'up' else 0,
+        1 if mtf_1w.get('trend') == 'up' else 0,
+    ])
+    _bear_count = sum([
+        1 if mtf_1h.get('trend') == 'down' else 0,
+        1 if mtf_1d.get('trend') == 'down' else 0,
+        1 if mtf_1w.get('trend') == 'down' else 0,
+    ])
+    _alignment = 'bullish' if _bull_count >= 2 else ('bearish' if _bear_count >= 2 else 'mixed')
+    mtf = {'1H': mtf_1h, '1D': mtf_1d, '1W': mtf_1w, 'alignment': _alignment, 'bull_count': _bull_count, 'bear_count': _bear_count}
 
     payload = {
         'last_price':  round(last_c, 4),
@@ -2054,6 +3246,16 @@ def _compute_indicators(symbol: str, force: bool = False) -> dict:
         'vwap_signal': vwap_signal,
         'avg_volume':  round(avg_vol), 'last_volume': round(last_vol),
         'volume_ratio': vol_ratio,     'volume_signal': vol_signal,
+        'price':            round(last_c, 4),
+        'scenarios':        scenarios_proj,
+        'confidence_band':  confidence_band,
+        'prob_up':          round(prob_up, 2),
+        'bull_proj':        bull_proj,
+        'base_proj':        base_proj,
+        'bear_proj':        bear_proj,
+        'regime':           regime,
+        'adx':              adx_val,
+        'mtf':              mtf,
     }
     _proj_cache[symbol] = (payload, _time.time())
     return payload
@@ -2067,6 +3269,55 @@ def get_projection(symbol):
         return jsonify(_compute_indicators(symbol, force=force))
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/risk/<symbol>')
+def api_risk(symbol):
+    portfolio_id = request.args.get('portfolio_id', 1, type=int)
+    data = _compute_indicators(symbol)
+    if not data:
+        return jsonify({'error': 'no data'}), 400
+    price = data.get('price', data.get('last_price', 0))
+    atr = data.get('atr', 0) or 0
+    atr_pct = data.get('atr_pct', 1.0) or 1.0
+    support = data.get('support', price * 0.95)
+    with _get_db() as conn:
+        state = conn.execute('SELECT cash, last_equity FROM sim_state WHERE portfolio_id=?', (portfolio_id,)).fetchone()
+    equity = (state['last_equity'] or 10000) if state else 10000
+    cash = (state['cash'] or 10000) if state else 10000
+    max_dd_pct = round(atr_pct * 2, 2)
+    daily_vol = atr / price if price else 0.01
+    var_95 = round(price * daily_vol * 1.645, 2)
+    ideal_stop = price - 1.5 * atr
+    stop_to_support = abs(ideal_stop - support)
+    stop_quality = 'tight' if stop_to_support < atr * 0.5 else ('adequate' if stop_to_support < atr * 1.5 else 'loose')
+    risk_per_share = 1.5 * atr
+    risk_budget = equity * 0.02
+    suggested_shares = int(risk_budget / risk_per_share) if risk_per_share > 0 else 0
+    suggested_shares = min(suggested_shares, int(cash * 0.15 / price) if price else 0)
+    target = price + 2.5 * atr
+    stop = price - 1.5 * atr
+    rr = round((target - price) / (price - stop), 2) if (price - stop) > 0 else 0
+    grade_score = 0
+    if rr >= 2.5: grade_score += 2
+    elif rr >= 1.5: grade_score += 1
+    if max_dd_pct < 3: grade_score += 2
+    elif max_dd_pct < 6: grade_score += 1
+    if stop_quality == 'adequate': grade_score += 1
+    elif stop_quality == 'tight': grade_score -= 1
+    if atr_pct < 2: grade_score += 1
+    grade_map = {6:'A', 5:'A', 4:'B+', 3:'B', 2:'C', 1:'D', 0:'F'}
+    risk_grade = grade_map.get(min(max(grade_score,0), 6), 'F')
+    return jsonify({
+        'risk_grade': risk_grade,
+        'max_drawdown_pct': max_dd_pct,
+        'var_95': var_95,
+        'stop_quality': stop_quality,
+        'suggested_shares': suggested_shares,
+        'rr_ratio': rr,
+        'invalidation_price': round(price - 2.0 * atr, 2),
+        'atr_pct': round(atr_pct, 2),
+        'regime': data.get('regime', 'neutral'),
+    })
 
 # ── Company info ─────────────────────────────────────────────────────────────
 @app.route('/api/company/<symbol>')
@@ -2109,6 +3360,174 @@ def _poll_worker():
             except Exception:
                 pass
 
+# ── Analysis / Rankings / Market-state endpoints ──────────────────────────────
+# Must be registered BEFORE the serve_frontend catch-all.
+
+@app.route('/api/analysis/<symbol>', methods=['GET'])
+def get_analysis(symbol):
+    """Full traceable analysis for a symbol — breakdown, uncertainty, market state, summary."""
+    try:
+        data = _compute_indicators_fast(symbol.upper())
+        data['symbol'] = symbol.upper()
+        detail = _ai_score_detailed(data)
+        return jsonify({
+            'symbol':       symbol.upper(),
+            'price':        data.get('last_price'),
+            'score':        detail['score'],
+            'market_state': detail['market_state'],
+            'uncertainty':  detail['uncertainty'],
+            'breakdown':    detail['breakdown'],
+            'summary':      detail['summary'],
+            'what_changed': detail['what_changed'],
+            'weights_used': detail['weights_used'],
+            'indicators': {
+                'rsi':          data.get('rsi'),
+                'macd_cross':   data.get('macd_cross'),
+                'macd_value':   data.get('macd_value'),
+                'stoch_k':      data.get('stoch_k_val'),
+                'bb_position':  data.get('bb_position'),
+                'vwap_signal':  data.get('vwap_signal'),
+                'volume_signal':data.get('volume_signal'),
+                'volume_ratio': data.get('volume_ratio'),
+                'trend':        data.get('trend'),
+                'atr':          data.get('atr'),
+                'atr_pct':      data.get('atr_pct'),
+                'ema50':        data.get('ema50'),
+                'adx':          data.get('adx'),
+            }
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/rankings', methods=['GET'])
+def get_rankings():
+    """Rank all watchlist + held symbols by AI score.
+    cached_only=1 skips network fetches and returns only already-cached symbols."""
+    portfolio_id = int(request.args.get('portfolio_id', 1))
+    cached_only  = request.args.get('cached_only', '0') == '1'
+    try:
+        # portfolio_id=0 is the real Alpaca account; its watchlist lives under pid=1
+        watchlist_pid = 1 if portfolio_id == 0 else portfolio_id
+        with _get_db() as conn:
+            watch_syms = [r['symbol'] for r in conn.execute(
+                'SELECT symbol FROM watchlist_items WHERE portfolio_id=?', (watchlist_pid,)
+            ).fetchall()]
+            held_syms = [r['symbol'] for r in conn.execute(
+                'SELECT symbol FROM sim_positions WHERE portfolio_id=? AND shares>0', (portfolio_id,)
+            ).fetchall()]
+        # For real account, also include Alpaca positions as "held"
+        if portfolio_id == 0:
+            try:
+                real_pos = _alpaca_positions()
+                held_syms = list(dict.fromkeys(held_syms + [p['symbol'] for p in real_pos]))
+            except Exception:
+                pass
+        symbols = list(dict.fromkeys(watch_syms + held_syms))
+
+        now = _time.time()
+        results = []
+        uncached = []
+        for sym in symbols:
+            if sym in _proj_cache:
+                payload, ts = _proj_cache[sym]
+                if now - ts < _PROJ_TTL:
+                    try:
+                        data = dict(payload)
+                        data['symbol'] = sym
+                        detail = _ai_score_detailed(data)
+                        results.append({
+                            'symbol':       sym,
+                            'score':        detail['score'],
+                            'market_state': detail['market_state'],
+                            'uncertainty':  detail['uncertainty'],
+                            'summary':      detail['summary'],
+                            'price':        round(data.get('last_price', 0), 2),
+                            'rsi':          round(data.get('rsi', 50), 1),
+                            'trend':        data.get('trend', ''),
+                            'atr_pct':      data.get('atr_pct', 0),
+                            'held':         sym in held_syms,
+                            'what_changed': detail['what_changed'],
+                            'cached':       True,
+                        })
+                    except Exception:
+                        uncached.append(sym)
+                else:
+                    uncached.append(sym)
+            else:
+                uncached.append(sym)
+
+        if not cached_only:
+            for sym in uncached:
+                try:
+                    data = _compute_indicators_fast(sym)
+                    data['symbol'] = sym
+                    detail = _ai_score_detailed(data)
+                    results.append({
+                        'symbol':       sym,
+                        'score':        detail['score'],
+                        'market_state': detail['market_state'],
+                        'uncertainty':  detail['uncertainty'],
+                        'summary':      detail['summary'],
+                        'price':        round(data.get('last_price', 0), 2),
+                        'rsi':          round(data.get('rsi', 50), 1),
+                        'trend':        data.get('trend', ''),
+                        'atr_pct':      data.get('atr_pct', 0),
+                        'held':         sym in held_syms,
+                        'what_changed': detail['what_changed'],
+                        'cached':       False,
+                    })
+                except Exception:
+                    pass
+
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/market-state', methods=['GET'])
+def get_market_state():
+    """Overall market conditions based on SPY/QQQ/VIX proxy signals."""
+    try:
+        spy = _compute_indicators_fast('SPY')
+        spy['symbol'] = 'SPY'
+        spy_detail = _ai_score_detailed(spy)
+
+        qqq = _compute_indicators_fast('QQQ')
+        qqq['symbol'] = 'QQQ'
+        qqq_detail = _ai_score_detailed(qqq)
+
+        # Aggregate market score
+        avg_score = round((spy_detail['score'] + qqq_detail['score']) / 2, 2)
+        # Dominant regime: pick whichever is more extreme
+        spy_state = spy_detail['market_state']
+        qqq_state = qqq_detail['market_state']
+        priority_order = ['panic', 'breakout', 'overbought_extreme', 'oversold_extreme',
+                          'trending_up', 'trending_down', 'accumulation', 'ranging',
+                          'mild_uptrend', 'mild_downtrend', 'neutral']
+        market_regime = spy_state
+        for s in priority_order:
+            if spy_state == s or qqq_state == s:
+                market_regime = s
+                break
+
+        return jsonify({
+            'market_score':  avg_score,
+            'market_regime': market_regime,
+            'spy': {'score': spy_detail['score'], 'state': spy_state,
+                    'rsi': spy.get('rsi'), 'trend': spy.get('trend'),
+                    'summary': spy_detail['summary']},
+            'qqq': {'score': qqq_detail['score'], 'state': qqq_state,
+                    'rsi': qqq.get('rsi'), 'trend': qqq.get('trend'),
+                    'summary': qqq_detail['summary']},
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Static frontend (catch-all — must be last) ────────────────────────────────
+
 DIST_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
 
 @app.route('/', defaults={'path': ''})
@@ -2122,32 +3541,127 @@ def serve_frontend(path):
         return send_from_directory(DIST_DIR, path)
     return send_from_directory(DIST_DIR, 'index.html')
 
+
 if __name__ == '__main__':
     threading.Thread(target=_load_ticker_db, daemon=True).start()
+
+    # ── Real-time streaming infrastructure ──────────────────────────────────────
+    global _stream_manager, _candle_engine, _structure_engine, _portfolio_analytics, _perf_engine
+    from event_bus import event_bus
+    from stream_manager import StreamManager, CRYPTO_SYMBOLS
+    from candle_engine import CandleEngine
+
+    _stream_manager = StreamManager(event_bus)
+    _stream_manager.start()
+
+    # CandleEngine: tick → OHLCV + indicators server-side
+    _candle_engine = CandleEngine(event_bus)
+    _candle_engine.start()
+
+    # Seed daily candles for MTF analysis (runs in background, ~30s)
+    _seed_symbols = list(set(CRYPTO_SYMBOLS) | {'SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'TSLA', 'META', 'GOOGL', 'AMZN', 'JPM'})
+    threading.Thread(target=_seed_daily_candles, args=(_seed_symbols,), daemon=True).start()
+    print(f'[TradeSimulator] Seeding daily candles for {len(_seed_symbols)} symbols in background...')
+
+    # ── Structure Engine — market structure per symbol ─────────────────────────
+    try:
+        import structure_engine as _se_mod
+        _structure_engine = _se_mod.init(event_bus)
+        print('[TradeSimulator] StructureEngine started (swing detection, S/R, FVG, session levels).')
+    except Exception as e:
+        print(f'[TradeSimulator] StructureEngine failed to start: {e}')
+
+    # ── Portfolio Analytics ────────────────────────────────────────────────────
+    try:
+        from portfolio_analytics import PortfolioAnalytics
+        _portfolio_analytics = PortfolioAnalytics(_candle_engine)
+        print('[TradeSimulator] PortfolioAnalytics initialized (sector, beta, correlation).')
+    except Exception as e:
+        print(f'[TradeSimulator] PortfolioAnalytics failed: {e}')
+
+    # ── Performance Engine ─────────────────────────────────────────────────────
+    try:
+        import performance_engine as _pe_mod
+        _perf_engine = _pe_mod.init_engine(DB_PATH)
+        print('[TradeSimulator] PerformanceEngine initialized (regime stats, equity curve, decay).')
+    except Exception as e:
+        print(f'[TradeSimulator] PerformanceEngine failed: {e}')
+
+    # Broadcast ticks and bars to connected browsers
+    event_bus.subscribe('tick:*',    lambda ch, d: socketio.emit('quote', d))
+    event_bus.subscribe('bar:*:1m',  lambda ch, d: socketio.emit('bar',   {'symbol': d['symbol'], 'bar': d}))
+
+    # Phase 3: event-triggered AI scoring — score each symbol within 2s of its 1m bar close
+    def _on_bar_for_ai(channel: str, bar: dict) -> None:
+        symbol = bar.get('symbol', '')
+        if not symbol or not bar.get('closed'):
+            return
+        try:
+            data   = _compute_indicators_fast(symbol)
+            detail = _ai_score_detailed(data)
+            _proj_cache[symbol] = (data, _time.time())
+        except Exception:
+            pass
+
+    event_bus.subscribe('bar:*:1m', _on_bar_for_ai)
+
+    # Binance — primary crypto source (no API key needed)
+    try:
+        from binance_ws import BinanceWS
+        crypto_syms = list(CRYPTO_SYMBOLS)
+        _binance = BinanceWS(crypto_syms, _stream_manager)
+        _stream_manager.register_provider('binance', 'crypto')
+        _binance.start()
+        print(f'[TradeSimulator] Binance crypto stream starting ({len(crypto_syms)} symbols).')
+    except Exception as e:
+        print(f'[TradeSimulator] Binance stream failed: {e}')
+
+    # Polygon — forex primary + crypto failover
+    if POLYGON_KEYS_SET:
+        try:
+            from polygon_stream import start_stream as poly_start, activate_crypto_failover
+            _stream_manager.register_provider('polygon', 'forex')
+            _stream_manager.register_provider('polygon', 'crypto')
+            threading.Thread(
+                target=poly_start, args=(POLYGON_KEY, _stream_manager), daemon=True
+            ).start()
+            # When Binance dies, activate Polygon crypto failover
+            def _on_failover(symbol, old_src, new_src):
+                if old_src == 'binance' and new_src == 'polygon':
+                    activate_crypto_failover([symbol])
+            _stream_manager.on_failover(_on_failover)
+            print('[TradeSimulator] Polygon forex + crypto-failover stream starting.')
+        except Exception as e:
+            print(f'[TradeSimulator] Polygon stream failed: {e}')
+
+    # Alpaca — equity primary (real-time IEX)
+    if KEYS_SET:
+        try:
+            from alpaca_stream import start_stream as alp_start
+            _stream_manager.register_provider('alpaca', 'equity')
+            threading.Thread(
+                target=alp_start, args=(API_KEY, SECRET_KEY, _stream_manager), daemon=True
+            ).start()
+            print('[TradeSimulator] Alpaca equity stream starting (iex feed).')
+        except Exception as e:
+            print(f'[TradeSimulator] Alpaca stream failed: {e}')
+
+    # Finnhub — equity failover
     if FINNHUB_KEYS_SET:
         try:
             from finnhub_stream import start_stream as fh_start
-            fh_start(FINNHUB_KEY, socketio)
-            print('[TradeSimulator] Finnhub real-time WebSocket stream starting.')
+            _stream_manager.register_provider('finnhub', 'equity')
+            fh_start(FINNHUB_KEY, _stream_manager)
+            print('[TradeSimulator] Finnhub equity-failover stream starting.')
         except Exception as e:
             print(f'[TradeSimulator] Finnhub stream failed: {e}')
-    elif KEYS_SET:
-        try:
-            from alpaca_stream import start_stream
-            threading.Thread(target=start_stream, args=(API_KEY, SECRET_KEY, socketio), daemon=True).start()
-        except Exception as e:
-            print(f'[TradeSimulator] Alpaca stream failed: {e}')
-    elif POLYGON_KEYS_SET:
-        try:
-            from polygon_stream import start_stream as poly_start
-            threading.Thread(target=poly_start, args=(POLYGON_KEY, socketio), daemon=True).start()
-            print('[TradeSimulator] Polygon.io real-time feed starting.')
-        except Exception as e:
-            print(f'[TradeSimulator] Polygon stream failed: {e}')
-    else:
-        print('[TradeSimulator] No live price feed — using yfinance (delayed).')
-    # Poll worker runs always: fills gaps outside market hours and handles watchlist price updates
+
+    if not (KEYS_SET or POLYGON_KEYS_SET or FINNHUB_KEYS_SET):
+        print('[TradeSimulator] No equity/forex keys — using yfinance polling (delayed).')
+
+    # Poll worker fills gaps for non-streaming symbols and outside market hours
     threading.Thread(target=_poll_worker, daemon=True).start()
+
     if AV_KEYS_SET:
         print('[TradeSimulator] Alpha Vantage key configured — comprehensive symbol search enabled.')
     socketio.run(app, host='0.0.0.0', port=8765, debug=False)

@@ -1,55 +1,79 @@
 import asyncio
+import logging
 from alpaca.data.live import StockDataStream
+from stream_manager import Bar, StreamManager, Tick, normalize_alpaca
 
-_stream      = None
-_subscribed  = set()
-_socketio    = None
-_loop        = None
+log = logging.getLogger(__name__)
 
-def bar_to_dict(bar):
-    return {
-        'time':   int(bar.timestamp.timestamp()),
-        'open':   float(bar.open),
-        'high':   float(bar.high),
-        'low':    float(bar.low),
-        'close':  float(bar.close),
-        'volume': float(bar.volume),
-    }
+_stream:         StockDataStream | None = None
+_subscribed:     set = set()
+_stream_manager: StreamManager | None = None
+_loop:           asyncio.AbstractEventLoop | None = None
 
-async def on_bar(bar):
-    if _socketio:
-        _socketio.emit('bar', {'symbol': bar.symbol, 'bar': bar_to_dict(bar)})
 
-async def on_quote(quote):
-    if _socketio:
-        _socketio.emit('quote', {
-            'symbol':   quote.symbol,
-            'bid':      float(quote.bid_price),
-            'bid_size': float(quote.bid_size),
-            'ask':      float(quote.ask_price),
-            'ask_size': float(quote.ask_size),
-        })
+def _make_bar_handler(sm: StreamManager):
+    async def on_bar(bar):
+        b = Bar(
+            symbol=normalize_alpaca(bar.symbol),
+            interval='1m',
+            open=float(bar.open),
+            high=float(bar.high),
+            low=float(bar.low),
+            close=float(bar.close),
+            volume=float(bar.volume),
+            vwap=float(bar.vwap) if bar.vwap else None,
+            timestamp=bar.timestamp.timestamp(),
+            closed=True,
+            source='alpaca',
+        )
+        sm.on_bar(b)
+    return on_bar
 
-def subscribe(symbol: str, sio=None):
-    global _stream, _subscribed, _socketio, _loop
-    if sio:
-        _socketio = sio
-    if symbol not in _subscribed and _stream:
-        _subscribed.add(symbol)
-        # Schedule subscription on the stream's event loop
+
+def _make_quote_handler(sm: StreamManager):
+    async def on_quote(quote):
+        bid = float(quote.bid_price or 0)
+        ask = float(quote.ask_price or 0)
+        mid = (bid + ask) / 2 if bid and ask else bid or ask
+        if not mid:
+            return
+        tick = Tick(
+            symbol=normalize_alpaca(quote.symbol),
+            price=mid,
+            size=float(quote.bid_size or 0),
+            timestamp=quote.timestamp.timestamp(),
+            source='alpaca',
+            bid=bid or None,
+            ask=ask or None,
+        )
+        sm.on_tick(tick)
+    return on_quote
+
+
+def subscribe(symbol: str, sio=None) -> None:
+    global _stream, _subscribed, _loop
+    sym = normalize_alpaca(symbol.upper())
+    if sym not in _subscribed and _stream and _stream_manager:
+        _subscribed.add(sym)
         if _loop and _loop.is_running():
-            asyncio.run_coroutine_threadsafe(_do_subscribe(symbol), _loop)
+            on_bar   = _make_bar_handler(_stream_manager)
+            on_quote = _make_quote_handler(_stream_manager)
+            asyncio.run_coroutine_threadsafe(_do_subscribe(sym, on_bar, on_quote), _loop)
 
-async def _do_subscribe(symbol):
+
+async def _do_subscribe(symbol: str, on_bar, on_quote) -> None:
     _stream.subscribe_bars(on_bar, symbol)
     _stream.subscribe_quotes(on_quote, symbol)
 
-def start_stream(api_key: str, secret_key: str, sio):
-    global _stream, _socketio, _loop
-    _socketio = sio
-    _stream   = StockDataStream(api_key, secret_key, feed='iex')
 
-    # Subscribe defaults
+def start_stream(api_key: str, secret_key: str, stream_manager: StreamManager) -> None:
+    global _stream, _stream_manager, _loop
+    _stream_manager = stream_manager
+    _stream = StockDataStream(api_key, secret_key, feed='iex')
+
+    on_bar   = _make_bar_handler(stream_manager)
+    on_quote = _make_quote_handler(stream_manager)
+
     for sym in ['AAPL', 'TSLA', 'NVDA', 'SPY']:
         _subscribed.add(sym)
         _stream.subscribe_bars(on_bar, sym)
@@ -57,4 +81,5 @@ def start_stream(api_key: str, secret_key: str, sio):
 
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)
+    log.info("[ALPACA] Stream starting (iex feed)")
     _stream.run()
