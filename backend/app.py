@@ -2549,52 +2549,26 @@ def get_news_general():
 # ── AI portfolio trading ───────────────────────────────────────────────────────
 
 _AI_UNIVERSE = [
-    # ── Mega-cap tech ─────────────────────────────────────────────────────────
+    # ── Equities ──────────────────────────────────────────────────────────────
     'AAPL','MSFT','NVDA','GOOGL','META','AMZN','TSLA','AVGO','ADBE','CRM',
     'AMD','INTC','QCOM','TXN','ORCL','IBM','INTU','NOW','SNOW','PLTR',
-    'NET','CRWD','ZS','PANW','DDOG','MDB','OKTA','FTNT','HUBS','TEAM',
-    'COIN','UBER','LYFT','ABNB','BKNG','DASH','RBLX','U','SPOT','ARM',
-    'SMCI','ANET','MRVL','KLAC','LRCX','AMAT','ASML','MU','WDC','HOOD',
-    # ── Financials ────────────────────────────────────────────────────────────
     'JPM','BAC','GS','MS','V','MA','AXP','BLK','C','WFC',
-    'SCHW','BX','KKR','APO','SPGI','MCO','ICE','CME','CBOE',
-    # ── Healthcare ────────────────────────────────────────────────────────────
     'UNH','LLY','JNJ','PFE','MRK','ABBV','TMO','DHR','AMGN','GILD',
-    'REGN','VRTX','ISRG','BSX','ELV','CI','HUM','CVS','BIIB','MRNA',
-    # ── Consumer ──────────────────────────────────────────────────────────────
-    'WMT','COST','HD','TGT','NKE','MCD','SBUX','CMG','LOW','TJX',
-    'ROST','DLTR','DG','YUM','DKNG','CHWY','ETSY','EBAY',
-    # ── Energy ────────────────────────────────────────────────────────────────
-    'XOM','CVX','COP','SLB','OXY','EOG','PSX','MPC','VLO','HES',
-    'HAL','BKR','DVN','AR','EQT',
-    # ── Industrials ───────────────────────────────────────────────────────────
-    'CAT','DE','HON','BA','GE','UPS','FDX','RTX','LMT','NOC',
-    'EMR','ETN','PH','ROK','XYL','IR','TT','CARR','OTIS','GD',
-    # ── Communication / Media ─────────────────────────────────────────────────
-    'NFLX','DIS','CMCSA','T','VZ','SNAP','PINS','RDDT',
-    # ── Materials ─────────────────────────────────────────────────────────────
-    'LIN','APD','ECL','SHW','NEM','FCX','NUE','CF','MOS','ALB',
-    # ── Real Estate ───────────────────────────────────────────────────────────
-    'PLD','AMT','EQIX','WELL','SPG','O','DLR','CCI','EXR',
-    # ── Sector ETFs ───────────────────────────────────────────────────────────
-    'SPY','QQQ','IWM','DIA','VTI',
-    'XLK','XLF','XLE','XLV','XLI','XLU','XLY','XLP','XLB','XLRE',
-    'SMH','SOXX','IBB','XBI','ARKK','ARKW','ARKG',
-    'KRE','XRT','KWEB','GLD','SLV','TLT','HYG','LQD',
+    'WMT','COST','HD','TGT','NKE','MCD','SBUX','CMG',
+    'XOM','CVX','COP','SLB','OXY','EOG',
+    'CAT','DE','HON','BA','GE','UPS','FDX','RTX','LMT',
+    'NFLX','DIS','CMCSA','T','VZ',
+    'SPY','QQQ','IWM','GLD','TLT',
 
     # ── Futures ───────────────────────────────────────────────────────────────
     'ES=F','NQ=F','YM=F','RTY=F',
-    'CL=F','BZ=F','GC=F','SI=F','HG=F','PL=F',
-    'NG=F','ZC=F','ZS=F','ZW=F',
+    'CL=F','GC=F','SI=F','NG=F',
     'ZB=F','ZN=F','BTC=F','ETH=F',
 
     # ── Forex ─────────────────────────────────────────────────────────────────
     'EURUSD=X','GBPUSD=X','USDJPY=X','USDCHF=X',
     'AUDUSD=X','USDCAD=X','NZDUSD=X',
     'EURGBP=X','EURJPY=X','GBPJPY=X',
-    'EURCAD=X','AUDCAD=X','AUDNZD=X','NZDCAD=X','CADJPY=X',
-    'USDSEK=X','USDNOK=X','USDMXN=X','USDZAR=X',
-    'EURAUD=X','EURCHF=X','GBPAUD=X','GBPCAD=X',
 
     # ── Crypto (spot) ─────────────────────────────────────────────────────────
     'BTC-USD','ETH-USD','SOL-USD','BNB-USD','XRP-USD',
