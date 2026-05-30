@@ -208,22 +208,31 @@ class OptionsChain:
             raise
 
     def get_contracts(self, underlying: str, dte_min: int = 20, dte_max: int = 60,
-                      opt_type: str | None = None) -> list[dict]:
-        """Fetch tradable contracts within DTE range."""
+                      opt_type: str | None = None,
+                      underlying_price: float | None = None) -> list[dict]:
+        """Fetch tradable contracts within DTE range, filtered near ATM."""
         try:
-            today    = date.today()
-            date_lo  = (today + timedelta(days=dte_min)).isoformat()
-            date_hi  = (today + timedelta(days=dte_max)).isoformat()
-            url = (
-                f'https://paper-api.alpaca.markets/v2/options/contracts'
-                f'?underlying_symbols={underlying}'
-                f'&expiration_date_gte={date_lo}&expiration_date_lte={date_hi}'
-                f'&status=active&limit=50'
-            )
+            today   = date.today()
+            date_lo = (today + timedelta(days=dte_min)).isoformat()
+            date_hi = (today + timedelta(days=dte_max)).isoformat()
+            url = (f'https://paper-api.alpaca.markets/v2/options/contracts'
+                   f'?underlying_symbols={underlying}'
+                   f'&expiration_date_gte={date_lo}&expiration_date_lte={date_hi}'
+                   f'&status=active&limit=100')
             if opt_type:
                 url += f'&type={opt_type}'
             data = self._fetch(url)
-            return [c for c in data.get('option_contracts', []) if c.get('tradable')]
+            contracts = [c for c in data.get('option_contracts', []) if c.get('tradable')]
+
+            # Filter near-ATM strikes (within 20% of underlying price)
+            if underlying_price and underlying_price > 0 and contracts:
+                lo = underlying_price * 0.80
+                hi = underlying_price * 1.20
+                atm = [c for c in contracts
+                       if lo <= float(c.get('strike_price', 0)) <= hi]
+                contracts = atm if atm else contracts
+
+            return contracts
         except Exception as e:
             log.debug('[OPTIONS_CHAIN] get_contracts error for %s: %s', underlying, e)
             return []
@@ -245,22 +254,48 @@ class OptionsChain:
             log.debug('[OPTIONS_CHAIN] get_quote error for %s: %s', option_symbol, e)
             return None
 
-    def enrich_contract(self, contract: dict, underlying_price: float) -> dict:
-        """Add Greeks, IV, and mid-price to a raw contract dict."""
+    def _hist_vol(self, underlying: str) -> float:
+        """Compute 20-day historical volatility from yfinance as IV fallback."""
         try:
-            quote = self.get_quote(contract['symbol'])
-            if not quote or quote['mid'] <= 0:
-                return contract
+            import yfinance as yf, math
+            hist = yf.Ticker(underlying).history(period='30d', interval='1d')
+            if hist.empty or len(hist) < 5:
+                return 0.30
+            closes = list(hist['Close'].dropna())
+            rets   = [math.log(closes[i] / closes[i-1]) for i in range(1, len(closes))]
+            mean   = sum(rets) / len(rets)
+            var    = sum((r - mean) ** 2 for r in rets) / len(rets)
+            return round(max(0.05, min(2.0, (var ** 0.5) * (252 ** 0.5))), 4)
+        except Exception:
+            return 0.30
 
+    def enrich_contract(self, contract: dict, underlying_price: float) -> dict:
+        """Add Greeks, IV, and theoretical price to a contract dict.
+        Uses live bid/ask when valid; falls back to Black-Scholes with
+        historical volatility when paper trading quotes are stale."""
+        try:
             K        = float(contract['strike_price'])
             exp      = date.fromisoformat(contract['expiration_date'])
             T        = max(0.001, (exp - date.today()).days / 365.0)
             S        = underlying_price
             r        = self.RISK_FREE_RATE
             opt_type = contract.get('type', 'call')
+            dte_days = (exp - date.today()).days
 
-            iv     = implied_vol(quote['mid'], S, K, T, r, opt_type)
-            greeks = bs_greeks(S, K, T, r, iv or 0.3, opt_type) if iv else {}
+            # Always use theoretical pricing in paper trading —
+            # live option quotes are stale and unreliable in paper accounts.
+            # Use live quote only to check if contract is actively traded.
+            quote = self.get_quote(contract['symbol'])
+            is_liquid = (quote and quote.get('bid', 0) > 0 and quote.get('ask', 0) > 0)
+
+            underlying_sym = contract.get('underlying_symbol') or contract.get('root_symbol', '')
+            iv = self._hist_vol(underlying_sym) if underlying_sym else 0.30
+            mid_price  = bs_price(S, K, T, r, iv, opt_type)
+            spread_pct = quote.get('spread_pct', 5.0) if is_liquid else 5.0
+            bid        = round(mid_price * 0.975, 4)
+            ask        = round(mid_price * 1.025, 4)
+
+            greeks = bs_greeks(S, K, T, r, iv or 0.30, opt_type)
 
             return {**contract,
                     'mid': quote['mid'], 'bid': quote['bid'], 'ask': quote['ask'],
@@ -313,7 +348,8 @@ class OptionsEngine:
 
             # Fetch chain
             contracts_raw = self.chain.get_contracts(
-                underlying, dte_min=25, dte_max=50, opt_type=opt_type
+                underlying, dte_min=15, dte_max=90,
+                opt_type=opt_type, underlying_price=underlying_price
             )
             if not contracts_raw:
                 return self._empty(strategy, 'No tradable contracts in 25-50 DTE window')
