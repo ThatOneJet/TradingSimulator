@@ -932,7 +932,7 @@ def ai_scans(pid):
         d = dict(r)
         if d.get('created_at') and not d['created_at'].endswith('Z'):
             d['created_at'] += 'Z'
-        for key in ('bought_json', 'sold_json', 'batch_json'):
+        for key in ('bought_json', 'sold_json', 'batch_json', 'skipped_json'):
             try:
                 d[key] = _json.loads(d[key] or '[]')
             except Exception:
@@ -1376,15 +1376,19 @@ def account():
         })
     state     = _sim_state(pid)
     positions = _sim_positions_with_prices(pid)
+    # market_value is positive for longs, negative for shorts (signed after equity fix)
     portfolio_value = state['cash'] + sum(p['market_value'] for p in positions)
-    pnl_day   = portfolio_value - state['last_equity']
+    # Buying power = equity (what you actually own, not inflated cash from short proceeds)
+    # Short sale proceeds are locked as collateral and cannot be freely spent
+    buying_power = round(portfolio_value * 0.90, 2)  # keep 10% reserve
+    pnl_day      = portfolio_value - state['last_equity']
     with _get_db() as conn:
         prow = conn.execute('SELECT ai_controlled FROM portfolios WHERE id=?', (pid,)).fetchone()
         ai_controlled = int(prow['ai_controlled']) if prow else 0
     return jsonify({
         'equity':          portfolio_value,
-        'cash':            state['cash'],
-        'buying_power':    state['cash'],
+        'cash':            round(state['cash'], 2),
+        'buying_power':    buying_power,
         'portfolio_value': portfolio_value,
         'daytrade_count':  0,
         'pnl_day':         pnl_day,
