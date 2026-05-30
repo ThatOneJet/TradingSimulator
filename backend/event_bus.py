@@ -104,7 +104,7 @@ class _RedisEventBus:
                 self._patterns.add(p)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        log.info("[EVENTBUS] Redis backend started at %s", self._pub.connection_pool.connection_kwargs.get('host', '?'))
+        log.debug("[EVENTBUS] Redis backend started at %s", self._pub.connection_pool.connection_kwargs.get('host', '?'))
 
     def _run(self) -> None:
         for msg in self._ps.listen():
@@ -139,12 +139,12 @@ def create_event_bus():
         try:
             import redis
             bus = _RedisEventBus(url)
-            log.info("[EVENTBUS] Using Redis backend: %s", url)
+            log.debug("[EVENTBUS] Using Redis backend: %s", url)
             return bus
         except ImportError:
-            log.warning("[EVENTBUS] REDIS_URL set but redis package not installed; using in-process bus")
+            log.debug("[EVENTBUS] REDIS_URL set but redis package not installed; using in-process bus")
     bus = _AsyncioEventBus()
-    log.info("[EVENTBUS] Using in-process asyncio bus")
+    log.debug("[EVENTBUS] Using in-process asyncio bus")
     return bus
 
 

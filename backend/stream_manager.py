@@ -114,7 +114,7 @@ class StreamManager:
                 'symbols': set(),
                 'dead': False,
             }
-        log.info("[STREAM] Registered provider '%s' for %s", name, asset_class)
+        log.debug("[STREAM] Registered provider '%s' for %s", name, asset_class)
 
     def on_failover(self, callback: Callable) -> None:
         """Register a callback(symbol, old_source, new_source) for failover events."""
@@ -221,7 +221,7 @@ class StreamManager:
 
     def start(self) -> None:
         self._bus.start()
-        log.info("[STREAM] StreamManager started")
+        log.debug("[STREAM] StreamManager started")
 
     # ------------------------------------------------------------------
     # Internal

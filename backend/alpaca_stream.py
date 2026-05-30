@@ -81,5 +81,5 @@ def start_stream(api_key: str, secret_key: str, stream_manager: StreamManager) -
 
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)
-    log.info("[ALPACA] Stream starting (iex feed)")
+    log.debug("[ALPACA] Stream starting (iex feed)")
     _stream.run()

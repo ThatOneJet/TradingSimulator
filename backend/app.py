@@ -1,4 +1,4 @@
-import os, threading, sqlite3, time as _time, json as _json, csv, io, hashlib, random, math
+import os, threading, sqlite3, time as _time, json as _json, csv, io, hashlib, random, math, logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory
@@ -7,6 +7,12 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ── Logging — only show WARNING+ in terminal; silence noisy libraries ─────────
+logging.basicConfig(level=logging.WARNING, format='%(levelname)s %(name)s: %(message)s')
+for _noisy in ('werkzeug', 'engineio', 'socketio', 'urllib3', 'yfinance',
+               'peewee', 'alpaca', 'websocket', 'asyncio'):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
 
 # ── Optional Alpaca clients (data feeds only — portfolio is handled locally) ───
 from alpaca.trading.client import TradingClient

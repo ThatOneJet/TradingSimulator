@@ -44,7 +44,7 @@ class BinanceWS:
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True, name='binance-ws')
         self._thread.start()
-        log.info("[BINANCE] Starting stream for %d symbols: %s", len(self._symbols), self._symbols)
+        log.debug("[BINANCE] Starting stream for %d symbols: %s", len(self._symbols), self._symbols)
 
     def stop(self) -> None:
         self._stop.set()
@@ -69,7 +69,7 @@ class BinanceWS:
 
         while not self._stop.is_set():
             url = self._build_url()
-            log.info("[BINANCE] Connecting to %d streams", len(self._symbols) * 2)
+            log.debug("[BINANCE] Connecting to %d streams", len(self._symbols) * 2)
             try:
                 ws = websocket.WebSocketApp(
                     url,
@@ -95,7 +95,7 @@ class BinanceWS:
             backoff = min(backoff * 2, 60.0)
 
     def _on_open(self, ws) -> None:
-        log.info("[BINANCE] Connected, streaming %d symbols", len(self._symbols))
+        log.debug("[BINANCE] Connected, streaming %d symbols", len(self._symbols))
         # reset backoff on successful connect — can't easily reset from here,
         # but we track in _run loop; reconnect path resets when _run restarts
 

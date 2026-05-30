@@ -256,7 +256,7 @@ class CandleEngine:
 
     def start(self) -> None:
         self._bus.subscribe('tick:*', self._on_tick)
-        log.info("[CANDLE] CandleEngine started — tracking intervals: %s", self.TRACKED_INTERVALS)
+        log.debug("[CANDLE] CandleEngine started — tracking intervals: %s", self.TRACKED_INTERVALS)
 
     def latest(self, symbol: str, interval: str = '1m') -> dict | None:
         """Return the most recent closed bar's indicator dict, or None if not available."""

@@ -41,7 +41,7 @@ def _on_message(ws, message):
 
 
 def _on_open(ws):
-    log.info("[FINNHUB] Connected — subscribing symbols")
+    log.debug("[FINNHUB] Connected — subscribing symbols")
     with _lock:
         for sym in _subscribed:
             ws.send(json.dumps({'type': 'subscribe', 'symbol': sym}))
@@ -93,4 +93,4 @@ def start_stream(api_key: str, stream_manager: StreamManager) -> None:
             time.sleep(5)
 
     threading.Thread(target=_run, daemon=True, name='finnhub-ws').start()
-    log.info("[FINNHUB] Stream starting")
+    log.debug("[FINNHUB] Stream starting")

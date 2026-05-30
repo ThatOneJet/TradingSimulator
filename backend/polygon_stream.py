@@ -86,7 +86,7 @@ class _PolygonCluster:
         import websocket
         backoff = 1.0
         while not self._stop.is_set():
-            log.info("[POLYGON/%s] Connecting to %s", self._cluster, self._url)
+            log.debug("[POLYGON/%s] Connecting to %s", self._cluster, self._url)
             try:
                 ws = websocket.WebSocketApp(
                     self._url,
@@ -108,7 +108,7 @@ class _PolygonCluster:
             backoff = min(backoff * 2, 60.0)
 
     def _on_open(self, ws) -> None:
-        log.info("[POLYGON/%s] Connected — authenticating", self._cluster)
+        log.debug("[POLYGON/%s] Connected — authenticating", self._cluster)
         ws.send(json.dumps({'action': 'auth', 'params': self._api_key}))
 
     def _on_message(self, ws, raw: str) -> None:
@@ -128,7 +128,7 @@ class _PolygonCluster:
     def _handle_status(self, ws, ev: dict) -> None:
         s = ev.get('status', '')
         if s == 'auth_success':
-            log.info("[POLYGON/%s] Authenticated", self._cluster)
+            log.debug("[POLYGON/%s] Authenticated", self._cluster)
             self._authenticated = True
             with self._lock:
                 subs = list(self._subscribed)
@@ -226,7 +226,7 @@ class _PolygonCluster:
         params = ','.join(symbols)
         try:
             ws.send(json.dumps({'action': 'subscribe', 'params': params}))
-            log.info("[POLYGON/%s] Subscribed: %s", self._cluster, params)
+            log.debug("[POLYGON/%s] Subscribed: %s", self._cluster, params)
         except Exception as e:
             log.error("[POLYGON/%s] Subscribe error: %s", self._cluster, e)
 
@@ -312,7 +312,7 @@ def activate_crypto_failover(symbols: list[str]) -> None:
                 poly_syms.append(f"XT.{base}-USD")
     if poly_syms:
         _crypto_cluster.subscribe(poly_syms)
-        log.info("[POLYGON/crypto] Failover subscribed: %s", poly_syms)
+        log.debug("[POLYGON/crypto] Failover subscribed: %s", poly_syms)
 
 
 def subscribe(symbol: str) -> None:
