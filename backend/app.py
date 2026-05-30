@@ -2617,19 +2617,16 @@ def _compute_indicators_fast(symbol: str) -> dict:
             return payload
 
     import yfinance as yf
-    # Check for pre-fetched bulk data from scan batch prefetch
+    # Check for pre-fetched bulk DataFrame from scan batch prefetch
+    hist = None
     if symbol in _proj_cache:
         payload, ts = _proj_cache[symbol]
         if now - ts < _PROJ_TTL and '_yf_bulk' in payload:
             hist = payload['_yf_bulk']
-            del _proj_cache[symbol]  # consume it, will recompute indicators below
-        else:
-            hist = None
-    else:
-        hist = None
+            del _proj_cache[symbol]  # consume bulk entry; indicators computed below
     if hist is None:
         try:
-            hist = yf.Ticker(symbol).history(period='60d', threads=True)
+            hist = yf.Ticker(symbol).history(period='60d')
         except Exception:
             hist = None
     if hist is None or hist.empty or len(hist) < 20:
