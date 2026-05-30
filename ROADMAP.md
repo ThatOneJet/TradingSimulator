@@ -31,9 +31,11 @@
 | # | What | Why here |
 |---|------|---------|
 | 13 | Performance self-optimization: auto-reduce strategy weight when decay detected | `performance_engine.py` tracks it — needs feedback loop wired in |
-| 14 | Backtesting engine: historical replay with realistic fill model | Validates everything built in Tiers 1–2 before going live |
-| 15 | Market breadth signals: advance-decline, TICK, TRIN into scoring engine | Needs breadth data feed built first |
-| 16 | ML scoring layer: logistic regression trained on `sim_trades` outcomes | Needs 200+ trades of labeled regime data first |
+| 14 | Circuit breakers: consecutive loss pause, drawdown halt (8% reduced / 15% full stop), strategy disabling below 40% win rate | Requires performance history — meaningless without 20+ trades per strategy |
+| 15 | News engine (`news_engine.py`): Finnhub sentiment scoring, news velocity → regime flag, earnings calendar blackout, FOMC/CPI detection | Finnhub key already in `.env`; needs regime system stable before wiring sentiment into score |
+| 16 | Backtesting engine: historical replay with realistic fill model | Validates everything built in Tiers 1–2 before going live |
+| 17 | Market breadth signals: advance-decline, TICK, TRIN into scoring engine | Needs breadth data feed built first |
+| 18 | ML scoring layer: logistic regression trained on `sim_trades` outcomes | Needs 200+ trades of labeled regime data first |
 
 ---
 

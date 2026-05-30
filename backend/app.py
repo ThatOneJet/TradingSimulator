@@ -2106,8 +2106,24 @@ def _compute_indicators_fast(symbol: str) -> dict:
             return payload
 
     import yfinance as yf
-    hist = yf.Ticker(symbol).history(period='60d')
-    if hist.empty or len(hist) < 20:
+    try:
+        hist = yf.Ticker(symbol).history(period='60d')
+    except Exception:
+        hist = None
+    if hist is None or hist.empty or len(hist) < 20:
+        # Last resort: return minimal dict with just current price so scan can proceed
+        try:
+            price = _get_current_price(symbol)
+            if price and price > 0:
+                return {'last_price': price, 'rsi': 50.0, 'macd_cross': 'neutral',
+                        'macd_value': 0.0, 'macd_signal_value': 0.0,
+                        'stoch_k_val': 50.0, 'stoch_d_val': 50.0,
+                        'bb_position': 'unknown', 'vwap_signal': '', 'volume_signal': 'normal',
+                        'volume_ratio': 1.0, 'trend': 'sideways', 'slope': 0.0, 'slope_pct': 0.0,
+                        'atr': price * 0.02, 'atr_pct': 2.0, 'ema50': price, 'adx': 0.0,
+                        'regime': 'neutral', '_source': 'price_only'}
+        except Exception:
+            pass
         raise ValueError(f'Insufficient data for {symbol}')
 
     closes  = list(hist['Close'].dropna())
@@ -3015,6 +3031,10 @@ def _ai_run_portfolio(pid: int) -> dict:
                 data['symbol'] = sym
                 price = data.get('last_price')
                 if not price or price <= 0:
+                    batch_data.append({'symbol': sym, 'score': 0, 'price': 0,
+                                       'market_state': 'neutral', 'rsi': 50,
+                                       'trend': '—', 'qualifies': False,
+                                       'qualifies_short': False, 'error': 'no_price'})
                     continue
                 detail = _ai_score_detailed(data)
                 score  = detail['score']
@@ -3059,6 +3079,10 @@ def _ai_run_portfolio(pid: int) -> dict:
                                        'side': 'short', 'confidence': confidence})
             except Exception as e:
                 summary['errors'].append(f'scan {sym}: {e}')
+                batch_data.append({'symbol': sym, 'score': 0, 'price': 0,
+                                   'market_state': 'neutral', 'rsi': 50,
+                                   'trend': '—', 'qualifies': False,
+                                   'qualifies_short': False, 'error': str(e)[:40]})
 
         candidates.sort(key=lambda x: abs(x['score']), reverse=True)
 

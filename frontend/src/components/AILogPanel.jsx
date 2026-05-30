@@ -223,6 +223,11 @@ function ScanModal({ run, onClose }) {
               >
                 <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--t-3)', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
                   Scanned Batch ({batch.length})
+                  {batch.filter(b => b.error).length > 0 && (
+                    <span style={{ color: '#f5b342', fontWeight: 400, marginLeft: 6 }}>
+                      · {batch.filter(b => !b.error).length} w/ data · {batch.filter(b => b.error).length} failed
+                    </span>
+                  )}
                 </span>
                 <span style={{ fontSize: 9, color: 'var(--t-4)' }}>{batchOpen ? '▲' : '▼'}</span>
               </button>
@@ -236,26 +241,32 @@ function ScanModal({ run, onClose }) {
                     ))}
                   </div>
                   {batch.map((b, i) => {
-                    const stCfg     = MARKET_STATE_CFG[b.market_state] ?? MARKET_STATE_CFG.neutral
+                    const failed     = !!b.error
+                    const stCfg      = MARKET_STATE_CFG[b.market_state] ?? MARKET_STATE_CFG.neutral
                     const scoreColor = b.score >= 2.5 ? '#3ddc97' : b.score <= -2.5 ? '#ff476f' : b.score > 0 ? '#5ee8a9' : 'var(--t-4)'
                     return (
                       <div key={i} style={{
                         display: 'grid', gridTemplateColumns: '2fr 1fr 1.2fr 1fr',
                         padding: '5px 8px',
-                        background: b.qualifies ? 'rgba(61,220,151,0.04)' : 'transparent',
+                        background: b.qualifies ? 'rgba(61,220,151,0.04)' : b.qualifies_short ? 'rgba(255,71,111,0.04)' : 'transparent',
                         borderRadius: 5,
                         borderBottom: '1px solid rgba(140,170,220,0.04)',
+                        opacity: failed ? 0.4 : 1,
                       }}>
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: b.qualifies ? 700 : 400, color: b.qualifies ? '#3ddc97' : 'var(--t-2)' }}>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: b.qualifies || b.qualifies_short ? 700 : 400, color: b.qualifies ? '#3ddc97' : b.qualifies_short ? '#ff476f' : failed ? 'var(--t-4)' : 'var(--t-2)' }}>
                           {b.symbol}
-                          {b.qualifies && <span style={{ fontSize: 8, color: '#3ddc97', marginLeft: 4 }}>★</span>}
+                          {b.qualifies       && <span style={{ fontSize: 8, color: '#3ddc97', marginLeft: 4 }}>★</span>}
+                          {b.qualifies_short && <span style={{ fontSize: 8, color: '#ff476f', marginLeft: 4 }}>↓</span>}
+                          {failed            && <span style={{ fontSize: 8, color: '#475061', marginLeft: 4 }}>✕</span>}
                         </span>
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: 700, color: scoreColor }}>
-                          {b.score >= 0 ? '+' : ''}{f(b.score, 1)}
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: 700, color: failed ? 'var(--t-4)' : scoreColor }}>
+                          {failed ? '—' : (b.score >= 0 ? '+' : '') + f(b.score, 1)}
                         </span>
-                        <span style={{ fontSize: 8, fontFamily: 'var(--font-mono)', color: stCfg.color }}>{stCfg.label}</span>
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: b.rsi <= 30 ? '#3ddc97' : b.rsi >= 70 ? '#ff476f' : 'var(--t-3)' }}>
-                          {f(b.rsi, 0)}
+                        <span style={{ fontSize: 8, fontFamily: 'var(--font-mono)', color: failed ? 'var(--t-4)' : stCfg.color }}>
+                          {failed ? 'NO DATA' : stCfg.label}
+                        </span>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: failed ? 'var(--t-4)' : b.rsi <= 30 ? '#3ddc97' : b.rsi >= 70 ? '#ff476f' : 'var(--t-3)' }}>
+                          {failed ? '—' : f(b.rsi, 0)}
                         </span>
                       </div>
                     )
