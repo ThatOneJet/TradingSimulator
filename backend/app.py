@@ -697,6 +697,26 @@ _SPARKLINE_TTL = 3600
 def health():
     return jsonify({'status': 'ok'})
 
+@app.route('/api/version')
+def version():
+    """Debug: confirm which backend version is running and what it can see."""
+    import datetime, zoneinfo
+    now_et = datetime.datetime.now(zoneinfo.ZoneInfo('America/New_York'))
+    with _get_db() as conn:
+        ai_pids = [r[0] for r in conn.execute('SELECT id FROM portfolios WHERE ai_controlled=1').fetchall()]
+        recent = conn.execute(
+            'SELECT portfolio_id, scanned, error_count, created_at FROM ai_scan_runs ORDER BY id DESC LIMIT 5'
+        ).fetchall()
+    return jsonify({
+        'version':         '2026-05-30-tiers1-6',
+        'candle_engine':   _candle_engine is not None,
+        'stream_manager':  _stream_manager is not None,
+        'market_open':     _market_is_open(),
+        'et_time':         now_et.strftime('%H:%M ET'),
+        'ai_portfolios':   ai_pids,
+        'recent_scans':    [dict(r) for r in recent],
+    })
+
 @app.route('/api/status')
 def status():
     return jsonify({
@@ -3501,6 +3521,7 @@ def _ai_run_portfolio(pid: int) -> dict:
                                        'anomaly_mult': data.get('_anomaly_mult', 1.0)})
             except Exception as e:
                 summary['errors'].append(f'scan {sym}: {e}')
+                print(f'[AI]   {sym:12s} ERROR: {e}')
                 batch_data.append({'symbol': sym, 'score': 0, 'price': 0,
                                    'market_state': 'neutral', 'rsi': 50,
                                    'trend': '—', 'qualifies': False,
