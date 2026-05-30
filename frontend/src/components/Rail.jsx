@@ -136,6 +136,20 @@ export default function Rail({ activeTab, onTabChange, sideOpen, onToggleSide, o
         <MarketsIcon />
       </button>
 
+      <button
+        className={`rail-btn${activeTab === 'map' ? ' active' : ''}`}
+        title="Market Map"
+        onClick={() => onTabChange('map')}
+      >
+        <svg width="17" height="17" viewBox="0 0 17 17" fill="none">
+          <rect x="1" y="1" width="6" height="5" rx="1" fill="currentColor" opacity="0.9"/>
+          <rect x="9" y="1" width="7" height="5" rx="1" fill="currentColor" opacity="0.9"/>
+          <rect x="1" y="8" width="4" height="8" rx="1" fill="currentColor" opacity="0.9"/>
+          <rect x="7" y="8" width="9" height="3.5" rx="1" fill="currentColor" opacity="0.9"/>
+          <rect x="7" y="13" width="9" height="2.5" rx="1" fill="currentColor" opacity="0.45"/>
+        </svg>
+      </button>
+
       {/* Push remaining buttons to the bottom */}
       <div className="rail-spacer" />
 

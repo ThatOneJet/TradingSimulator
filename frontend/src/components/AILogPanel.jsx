@@ -296,11 +296,22 @@ function Chip({ label, color }) {
 // ── Main panel ────────────────────────────────────────────────────────────────
 
 export default function AILogPanel({ portfolioId, isAiControlled }) {
-  const [runs,    setRuns]    = useState([])
-  const [loading, setLoading] = useState(false)
-  const [modal,   setModal]   = useState(null)   // run object for open modal
-  const [flash,   setFlash]   = useState(false)
+  const [runs,       setRuns]       = useState([])
+  const [loading,    setLoading]    = useState(false)
+  const [modal,      setModal]      = useState(null)   // run object for open modal
+  const [flash,      setFlash]      = useState(false)
+  const [review,     setReview]     = useState(null)
+  const [reviewLoad, setReviewLoad] = useState(false)
+  const [reviewTab,  setReviewTab]  = useState('scans')  // 'scans' | '30d'
   const prevCountRef = useRef(0)
+
+  useEffect(() => {
+    if (reviewTab !== '30d' || !portfolioId) return
+    setReviewLoad(true)
+    api.get(`/portfolios/${portfolioId}/history/review`)
+      .then(r => { setReview(r.data); setReviewLoad(false) })
+      .catch(() => setReviewLoad(false))
+  }, [reviewTab, portfolioId])
 
   useEffect(() => {
     if (!portfolioId) return
@@ -372,8 +383,165 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
           </div>
         </div>
 
+        {/* ── Tab switcher ── */}
+        <div style={{ display: 'flex', borderBottom: '1px solid rgba(140,170,220,0.08)', flexShrink: 0 }}>
+          {[['scans', 'Scans'], ['30d', '30D Review']].map(([key, label]) => (
+            <button key={key} onClick={() => setReviewTab(key)} style={{
+              flex: 1, padding: '6px 0', border: 'none', cursor: 'pointer',
+              background: reviewTab === key ? 'rgba(179,157,255,0.08)' : 'transparent',
+              color: reviewTab === key ? '#b39dff' : '#475061',
+              fontSize: '10px', fontWeight: reviewTab === key ? 700 : 400,
+              borderBottom: reviewTab === key ? '2px solid #b39dff' : '2px solid transparent',
+              fontFamily: 'var(--font-sans)',
+            }}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* ── 30D Review panel ── */}
+        {reviewTab === '30d' && (
+          <div style={{ flex: 1, overflowY: 'auto', padding: '10px 12px' }}>
+            {reviewLoad && <div style={{ color: 'var(--t-4)', fontSize: 11, textAlign: 'center', marginTop: 20 }}>Loading…</div>}
+            {review && !reviewLoad && (
+              <>
+                {/* Summary / active adjustments */}
+                <div style={{ fontSize: 10, color: 'var(--t-3)', marginBottom: 10, lineHeight: 1.55, padding: '6px 8px', background: 'rgba(140,170,220,0.04)', borderRadius: 5, borderLeft: '2px solid rgba(179,157,255,0.4)' }}>
+                  {review.summary}
+                </div>
+
+                {/* Decay alert */}
+                {review.decay?.decay_detected && (
+                  <div style={{ background: 'rgba(245,179,66,0.1)', border: '1px solid rgba(245,179,66,0.3)', borderRadius: 5, padding: '6px 10px', marginBottom: 10, fontSize: 9.5, color: '#f5b342' }}>
+                    ⚠ {review.decay.message || `Win rate dropped to ${(review.decay.recent_win_rate * 100).toFixed(0)}% (7d) vs ${(review.decay.longterm_win_rate * 100).toFixed(0)}% (30d) — thresholds raised`}
+                  </div>
+                )}
+
+                {/* Active adjustments chips */}
+                {(review.adjustments?.buy_thresh_raised || review.adjustments?.cautious_regimes?.length > 0) && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 10 }}>
+                    {review.adjustments.buy_thresh_raised && (
+                      <span style={{ fontSize: 8.5, color: '#f59e0b', background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.25)', borderRadius: 3, padding: '2px 7px' }}>
+                        Buy threshold +0.8
+                      </span>
+                    )}
+                    {review.adjustments.cautious_regimes?.map(r => (
+                      <span key={r} style={{ fontSize: 8.5, color: '#ff6a6a', background: 'rgba(255,106,106,0.1)', border: '1px solid rgba(255,106,106,0.25)', borderRadius: 3, padding: '2px 7px' }}>
+                        ⚠ Skip: {r.replace(/_/g, ' ')}
+                      </span>
+                    ))}
+                    {review.adjustments.strong_regimes?.map(r => (
+                      <span key={r} style={{ fontSize: 8.5, color: '#4ade80', background: 'rgba(74,222,128,0.1)', border: '1px solid rgba(74,222,128,0.25)', borderRadius: 3, padding: '2px 7px' }}>
+                        ✓ {r.replace(/_/g, ' ')}
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {/* Equity curve — simple SVG line */}
+                {review.equity_curve?.length > 1 && (() => {
+                  const curve = review.equity_curve
+                  const equities = curve.map(p => p.equity)
+                  const minE = Math.min(...equities), maxE = Math.max(...equities)
+                  const range = maxE - minE || 1
+                  const W = 280, H = 60
+                  const pts = curve.map((p, i) => {
+                    const x = (i / (curve.length - 1)) * W
+                    const y = H - ((p.equity - minE) / range * (H - 8) + 4)
+                    return `${x},${y}`
+                  }).join(' ')
+                  const last = equities[equities.length - 1]
+                  const first = equities[0]
+                  const color = last >= first ? '#4ade80' : '#ff476f'
+                  return (
+                    <div style={{ marginBottom: 10 }}>
+                      <div style={{ fontSize: 9, color: 'var(--t-4)', marginBottom: 4, letterSpacing: '0.06em', textTransform: 'uppercase' }}>30-Day Equity</div>
+                      <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: 'block', borderRadius: 4, background: 'rgba(140,170,220,0.04)' }}>
+                        <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" />
+                      </svg>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 8.5, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', marginTop: 3 }}>
+                        <span>${first.toLocaleString()}</span>
+                        <span style={{ color }}>${last.toLocaleString()}</span>
+                      </div>
+                    </div>
+                  )
+                })()}
+
+                {/* Regime performance table */}
+                {review.by_regime && Object.keys(review.by_regime).filter(k => k !== '_total').length > 0 && (
+                  <div style={{ marginBottom: 10 }}>
+                    <div style={{ fontSize: 9, color: 'var(--t-4)', marginBottom: 5, letterSpacing: '0.06em', textTransform: 'uppercase' }}>Regime Performance (30d)</div>
+                    <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                      <thead>
+                        <tr>
+                          {['Regime', 'Trades', 'Win%', 'Avg P&L'].map(h => (
+                            <th key={h} style={{ fontSize: 8, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', textAlign: 'left', padding: '2px 4px', fontWeight: 400 }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Object.entries(review.by_regime)
+                          .filter(([k]) => k !== '_total')
+                          .sort((a, b) => (b[1].trades || 0) - (a[1].trades || 0))
+                          .map(([regime, stats]) => {
+                            const isCautious = review.adjustments?.cautious_regimes?.includes(regime)
+                            const isStrong   = review.adjustments?.strong_regimes?.includes(regime)
+                            const wr = stats.win_rate || 0
+                            const wrColor = wr > 0.6 ? '#4ade80' : wr < 0.4 ? '#ff6a6a' : 'var(--t-3)'
+                            return (
+                              <tr key={regime} style={{ borderBottom: '1px solid rgba(140,170,220,0.05)' }}>
+                                <td style={{ fontSize: 9, color: 'var(--t-2)', padding: '3px 4px', fontFamily: 'var(--font-mono)' }}>
+                                  {isCautious && <span style={{ color: '#ff6a6a', marginRight: 3 }}>⚠</span>}
+                                  {isStrong   && <span style={{ color: '#4ade80', marginRight: 3 }}>✓</span>}
+                                  {regime.replace(/_/g, ' ')}
+                                </td>
+                                <td style={{ fontSize: 9, color: 'var(--t-3)', padding: '3px 4px', fontFamily: 'var(--font-mono)', textAlign: 'right' }}>{stats.trades || 0}</td>
+                                <td style={{ fontSize: 9, color: wrColor, padding: '3px 4px', fontFamily: 'var(--font-mono)', textAlign: 'right', fontWeight: 700 }}>{(wr * 100).toFixed(0)}%</td>
+                                <td style={{ fontSize: 9, color: (stats.avg_pl || 0) >= 0 ? 'var(--ok)' : 'var(--err)', padding: '3px 4px', fontFamily: 'var(--font-mono)', textAlign: 'right' }}>
+                                  {(stats.avg_pl || 0) >= 0 ? '+' : ''}{(stats.avg_pl || 0).toFixed(0)}
+                                </td>
+                              </tr>
+                            )
+                          })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {/* Signal attribution */}
+                {review.attribution && Object.keys(review.attribution).length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 9, color: 'var(--t-4)', marginBottom: 5, letterSpacing: '0.06em', textTransform: 'uppercase' }}>Signal Attribution</div>
+                    {Object.entries(review.attribution)
+                      .sort((a, b) => (b[1].trades || 0) - (a[1].trades || 0))
+                      .slice(0, 6)
+                      .map(([signal, stats]) => {
+                        const wr = stats.win_rate || 0
+                        const barW = Math.min(100, wr * 100)
+                        const barColor = wr > 0.6 ? '#4ade80' : wr < 0.4 ? '#ff6a6a' : '#f5b342'
+                        return (
+                          <div key={signal} style={{ marginBottom: 5 }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                              <span style={{ fontSize: 8.5, color: 'var(--t-3)', fontFamily: 'var(--font-mono)' }}>{signal}</span>
+                              <span style={{ fontSize: 8.5, color: barColor, fontFamily: 'var(--font-mono)' }}>
+                                {(wr * 100).toFixed(0)}% · {stats.trades} trades · avg {(stats.avg_pl || 0) >= 0 ? '+' : ''}{(stats.avg_pl || 0).toFixed(0)}
+                              </span>
+                            </div>
+                            <div style={{ height: 3, background: 'rgba(140,170,220,0.1)', borderRadius: 2 }}>
+                              <div style={{ width: `${barW}%`, height: '100%', background: barColor, borderRadius: 2, transition: 'width 0.4s' }} />
+                            </div>
+                          </div>
+                        )
+                      })}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
         {/* ── Scan feed ── */}
-        <div style={{ flex: 1, overflowY: 'auto' }}>
+        {reviewTab === 'scans' && <div style={{ flex: 1, overflowY: 'auto' }}>
           {loading && runs.length === 0 && (
             <div style={{ padding: 24, textAlign: 'center', fontSize: 11, color: 'var(--t-4)' }}>Loading…</div>
           )}
@@ -481,10 +649,10 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
               </div>
             )
           })}
-        </div>
+        </div>}
 
         {/* Footer hint */}
-        {runs.length > 0 && (
+        {reviewTab === 'scans' && runs.length > 0 && (
           <div style={{ padding: '5px 12px', borderTop: '1px solid rgba(140,170,220,0.06)', flexShrink: 0 }}>
             <span style={{ fontSize: 8, color: 'var(--t-4)' }}>Tap any row to see full scan details</span>
           </div>

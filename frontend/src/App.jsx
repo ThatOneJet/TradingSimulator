@@ -14,6 +14,7 @@ import NewsPage from './pages/NewsPage.jsx'
 import SetupGuideWidget from './components/SetupGuideWidget.jsx'
 import ExplorePage from './pages/ExplorePage.jsx'
 import MarketsPage from './pages/MarketsPage.jsx'
+import MarketMap from './pages/MarketMap.jsx'
 import AnalysisPanel from './components/AnalysisPanel.jsx'
 import RiskPanel from './components/RiskPanel'
 import OptionsPanel from './components/OptionsPanel'
@@ -409,6 +410,9 @@ export default function App() {
             symbol={symbol}
             onSelectSymbol={(sym) => { setSymbol(sym); setRailTab('chart') }}
           />
+        )}
+        {railTab === 'map' && (
+          <MarketMap onSymbolSelect={(sym) => { setSymbol(sym); setRailTab('chart') }} />
         )}
         {railTab === 'settings' && (
           <Settings

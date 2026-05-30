@@ -254,6 +254,11 @@ def _init_db():
             except Exception:
                 pass  # column already exists
 
+        try:
+            conn.execute("ALTER TABLE ai_scan_runs ADD COLUMN history_context TEXT")
+        except Exception:
+            pass  # column already exists
+
         conn.execute('''
             CREATE TABLE IF NOT EXISTS sim_options_positions (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1194,6 +1199,31 @@ def portfolio_performance_endpoint(pid):
     })
 
 
+@app.route('/api/portfolios/<int:pid>/history/review')
+def portfolio_history_review(pid):
+    """30-day trade review: regime perf, decay status, signal attribution, equity curve."""
+    try:
+        from performance_engine import PerformanceEngine
+        pe  = PerformanceEngine(DB_PATH)
+        ctx = _build_history_context(pid)
+        return jsonify({
+            'by_regime':    pe.by_regime(pid, 30),
+            'decay':        pe.decay_check(pid, 7, 30),
+            'attribution':  pe.signal_attribution(pid, 30),
+            'equity_curve': pe.equity_curve(pid, 30),
+            'adjustments':  {
+                'buy_thresh_raised': ctx['buy_thresh_adj'] > 0,
+                'sell_thresh_raised': ctx['sell_thresh_adj'] > 0,
+                'cautious_regimes': list(ctx['cautious_regimes']),
+                'strong_regimes':   list(ctx['strong_regimes']),
+                'decay_detected':   ctx['decay_detected'],
+            },
+            'summary': ctx['summary'],
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/portfolios/<int:pid>/positions/protection')
 def positions_protection(pid):
     """Protection status for each open position — stage, stop, bearish risk."""
@@ -1651,6 +1681,62 @@ _FOREX_LIST = [
 _markets_cache: dict = {}
 _MARKETS_TTL = 45  # seconds
 
+_HEATMAP_CACHE: tuple | None = None
+_HEATMAP_TTL   = 300  # 5 minutes
+
+_MCAP_WEIGHTS = {
+    'AAPL':100,'MSFT':100,'NVDA':95,'GOOGL':80,'AMZN':80,
+    'META':65,'TSLA':55,'AVGO':50,'LLY':48,'JPM':45,
+    'V':40,'UNH':40,'XOM':38,'COST':35,'MA':35,
+    'HD':32,'WMT':32,'NFLX':30,'ORCL':30,'BAC':28,
+    'JNJ':28,'ABBV':26,'CRM':25,'AMD':25,'GS':22,
+    'ADBE':22,'QCOM':20,'T':18,'VZ':16,'AMGN':15,
+    'TMO':15,'DHR':14,'CVX':14,'COP':13,'MS':13,
+    'AXP':12,'BLK':12,'SCHW':11,'REGN':11,'VRTX':10,
+}
+_SECTOR_MAP = {
+    'AAPL':'Technology','MSFT':'Technology','NVDA':'Technology','GOOGL':'Technology',
+    'META':'Technology','TSLA':'Technology','AVGO':'Technology','ADBE':'Technology',
+    'CRM':'Technology','AMD':'Technology','INTC':'Technology','QCOM':'Technology',
+    'TXN':'Technology','ORCL':'Technology','IBM':'Technology','INTU':'Technology',
+    'NOW':'Technology','SNOW':'Technology','PLTR':'Technology','NET':'Technology',
+    'CRWD':'Technology','ZS':'Technology','PANW':'Technology','DDOG':'Technology',
+    'MDB':'Technology','COIN':'Technology','UBER':'Technology','LYFT':'Technology',
+    'ABNB':'Consumer','BKNG':'Consumer','DASH':'Consumer','RBLX':'Technology',
+    'ARM':'Technology','SMCI':'Technology','ANET':'Technology','MRVL':'Technology',
+    'KLAC':'Technology','LRCX':'Technology','AMAT':'Technology','ASML':'Technology',
+    'MU':'Technology','WDC':'Technology','HOOD':'Financials',
+    'JPM':'Financials','BAC':'Financials','GS':'Financials','MS':'Financials',
+    'V':'Financials','MA':'Financials','AXP':'Financials','BLK':'Financials',
+    'C':'Financials','WFC':'Financials','SCHW':'Financials','BX':'Financials',
+    'KKR':'Financials','APO':'Financials','SPGI':'Financials','MCO':'Financials',
+    'UNH':'Healthcare','LLY':'Healthcare','JNJ':'Healthcare','PFE':'Healthcare',
+    'MRK':'Healthcare','ABBV':'Healthcare','TMO':'Healthcare','DHR':'Healthcare',
+    'AMGN':'Healthcare','GILD':'Healthcare','REGN':'Healthcare','VRTX':'Healthcare',
+    'ISRG':'Healthcare','BSX':'Healthcare','ELV':'Healthcare','CI':'Healthcare',
+    'HUM':'Healthcare','CVS':'Healthcare','BIIB':'Healthcare','MRNA':'Healthcare',
+    'WMT':'Consumer','COST':'Consumer','HD':'Consumer','TGT':'Consumer',
+    'NKE':'Consumer','MCD':'Consumer','SBUX':'Consumer','CMG':'Consumer',
+    'LOW':'Consumer','TJX':'Consumer','ROST':'Consumer','DG':'Consumer',
+    'DKNG':'Consumer','YUM':'Consumer',
+    'NFLX':'Communication','DIS':'Communication','CMCSA':'Communication',
+    'T':'Communication','VZ':'Communication','SNAP':'Communication','PINS':'Communication',
+    'RDDT':'Communication',
+    'XOM':'Energy','CVX':'Energy','COP':'Energy','SLB':'Energy','OXY':'Energy',
+    'EOG':'Energy','PSX':'Energy','MPC':'Energy','VLO':'Energy','HES':'Energy',
+    'HAL':'Energy','BKR':'Energy','DVN':'Energy','AR':'Energy','EQT':'Energy',
+    'CAT':'Industrials','DE':'Industrials','HON':'Industrials','BA':'Industrials',
+    'GE':'Industrials','UPS':'Industrials','FDX':'Industrials','RTX':'Industrials',
+    'LMT':'Industrials','NOC':'Industrials','EMR':'Industrials','ETN':'Industrials',
+    'LIN':'Materials','APD':'Materials','NEM':'Materials','FCX':'Materials',
+    'NUE':'Materials','CF':'Materials','MOS':'Materials','ALB':'Materials',
+    'PLD':'Real Estate','AMT':'Real Estate','EQIX':'Real Estate',
+    'WELL':'Real Estate','SPG':'Real Estate','O':'Real Estate',
+    'SPY':'ETF','QQQ':'ETF','IWM':'ETF','DIA':'ETF','VTI':'ETF',
+    'XLK':'ETF','XLF':'ETF','XLE':'ETF','XLV':'ETF','XLI':'ETF',
+    'SMH':'ETF','SOXX':'ETF','IBB':'ETF','ARKK':'ETF','GLD':'ETF','TLT':'ETF',
+}
+
 def _get_market_quotes(instruments: list) -> list:
     import yfinance as yf
     result = []
@@ -1705,6 +1791,78 @@ def get_forex():
     data = _get_market_quotes(_FOREX_LIST)
     _markets_cache['forex'] = (data, now)
     return jsonify(data)
+
+@app.route('/api/market/heatmap')
+def market_heatmap():
+    """Market heatmap: top companies by sector with % change. Cached 5 min."""
+    global _HEATMAP_CACHE
+    now = _time.time()
+    if _HEATMAP_CACHE and now - _HEATMAP_CACHE[1] < _HEATMAP_TTL:
+        return jsonify(_HEATMAP_CACHE[0])
+
+    equity_syms = [s for s in _AI_UNIVERSE
+                   if not s.endswith('-USD') and not s.endswith('=X')
+                   and not s.endswith('=F')][:80]
+    crypto_syms = [s for s in _AI_UNIVERSE if s.endswith('-USD')][:15]
+    forex_syms  = ['EURUSD=X','GBPUSD=X','USDJPY=X','AUDUSD=X','USDCAD=X',
+                   'USDCHF=X','NZDUSD=X','EURGBP=X','EURJPY=X','GBPJPY=X']
+    futures_syms = ['ES=F','NQ=F','CL=F','BZ=F','GC=F','SI=F','NG=F','ZC=F','ZS=F']
+
+    result = {'sectors': {}, 'crypto': [], 'forex': [], 'futures': [], 'updated_at': now}
+
+    try:
+        import yfinance as yf
+        bulk = yf.download(equity_syms, period='2d', interval='1d',
+                           auto_adjust=True, progress=False, threads=True,
+                           group_by='ticker', timeout=25)
+        for sym in equity_syms:
+            try:
+                df = bulk[sym] if len(equity_syms) > 1 else bulk
+                if df is None or df.empty or len(df) < 2:
+                    continue
+                closes = list(df['Close'].dropna())
+                if len(closes) < 2:
+                    continue
+                chg = (closes[-1] - closes[-2]) / closes[-2] * 100
+                sector = _SECTOR_MAP.get(sym, 'Other')
+                weight = _MCAP_WEIGHTS.get(sym, 8)
+                if sector not in result['sectors']:
+                    result['sectors'][sector] = []
+                result['sectors'][sector].append({
+                    'symbol': sym, 'chg_pct': round(chg, 2),
+                    'price': round(closes[-1], 2), 'weight': weight,
+                })
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    for sym in crypto_syms:
+        try:
+            p = _get_current_price(sym)
+            if p: result['crypto'].append({'symbol': sym, 'chg_pct': 0,
+                                           'price': round(p, 4), 'weight': 10})
+        except Exception:
+            pass
+
+    for sym in forex_syms:
+        try:
+            p = _get_current_price(sym)
+            if p: result['forex'].append({'symbol': sym.replace('=X',''),
+                                          'chg_pct': 0, 'price': round(p, 5), 'weight': 5})
+        except Exception:
+            pass
+
+    for sym in futures_syms:
+        try:
+            p = _get_current_price(sym)
+            if p: result['futures'].append({'symbol': sym, 'chg_pct': 0,
+                                            'price': round(p, 2), 'weight': 8})
+        except Exception:
+            pass
+
+    _HEATMAP_CACHE = (result, now)
+    return jsonify(result)
 
 def _bs_price(S, K, T, r, sigma, option_type='call'):
     """Full Black-Scholes option price."""
@@ -2368,47 +2526,59 @@ def get_news_general():
 # ── AI portfolio trading ───────────────────────────────────────────────────────
 
 _AI_UNIVERSE = [
-    # ── Equities: Mega-cap tech ───────────────────────────────────────────────
+    # ── Mega-cap tech ─────────────────────────────────────────────────────────
     'AAPL','MSFT','NVDA','GOOGL','META','AMZN','TSLA','AVGO','ADBE','CRM',
-    # Semiconductors / tech
     'AMD','INTC','QCOM','TXN','ORCL','IBM','INTU','NOW','SNOW','PLTR',
-    # Financials
+    'NET','CRWD','ZS','PANW','DDOG','MDB','OKTA','FTNT','HUBS','TEAM',
+    'COIN','UBER','LYFT','ABNB','BKNG','DASH','RBLX','U','SPOT','ARM',
+    'SMCI','ANET','MRVL','KLAC','LRCX','AMAT','ASML','MU','WDC','HOOD',
+    # ── Financials ────────────────────────────────────────────────────────────
     'JPM','BAC','GS','MS','V','MA','AXP','BLK','C','WFC',
-    # Healthcare
+    'SCHW','BX','KKR','APO','SPGI','MCO','ICE','CME','CBOE',
+    # ── Healthcare ────────────────────────────────────────────────────────────
     'UNH','LLY','JNJ','PFE','MRK','ABBV','TMO','DHR','AMGN','GILD',
-    # Consumer
-    'WMT','COST','HD','TGT','NKE','MCD','SBUX','CMG',
-    # Energy
-    'XOM','CVX','COP','SLB','OXY','EOG',
-    # Industrials
-    'CAT','DE','HON','BA','GE','UPS','FDX','RTX','LMT',
-    # Communication / media
-    'NFLX','DIS','CMCSA','T','VZ',
-    # Broad ETFs
-    'SPY','QQQ','IWM','GLD','TLT',
+    'REGN','VRTX','ISRG','BSX','ELV','CI','HUM','CVS','BIIB','MRNA',
+    # ── Consumer ──────────────────────────────────────────────────────────────
+    'WMT','COST','HD','TGT','NKE','MCD','SBUX','CMG','LOW','TJX',
+    'ROST','DLTR','DG','YUM','DKNG','CHWY','ETSY','EBAY',
+    # ── Energy ────────────────────────────────────────────────────────────────
+    'XOM','CVX','COP','SLB','OXY','EOG','PSX','MPC','VLO','HES',
+    'HAL','BKR','DVN','AR','EQT',
+    # ── Industrials ───────────────────────────────────────────────────────────
+    'CAT','DE','HON','BA','GE','UPS','FDX','RTX','LMT','NOC',
+    'EMR','ETN','PH','ROK','XYL','IR','TT','CARR','OTIS','GD',
+    # ── Communication / Media ─────────────────────────────────────────────────
+    'NFLX','DIS','CMCSA','T','VZ','SNAP','PINS','RDDT',
+    # ── Materials ─────────────────────────────────────────────────────────────
+    'LIN','APD','ECL','SHW','NEM','FCX','NUE','CF','MOS','ALB',
+    # ── Real Estate ───────────────────────────────────────────────────────────
+    'PLD','AMT','EQIX','WELL','SPG','O','DLR','CCI','EXR',
+    # ── Sector ETFs ───────────────────────────────────────────────────────────
+    'SPY','QQQ','IWM','DIA','VTI',
+    'XLK','XLF','XLE','XLV','XLI','XLU','XLY','XLP','XLB','XLRE',
+    'SMH','SOXX','IBB','XBI','ARKK','ARKW','ARKG',
+    'KRE','XRT','KWEB','GLD','SLV','TLT','HYG','LQD',
 
     # ── Futures ───────────────────────────────────────────────────────────────
-    'ES=F',   # S&P 500 E-mini
-    'NQ=F',   # NASDAQ E-mini
-    'YM=F',   # Dow Jones E-mini
-    'RTY=F',  # Russell 2000 E-mini
-    'CL=F',   # Crude Oil WTI
-    'GC=F',   # Gold
-    'SI=F',   # Silver
-    'NG=F',   # Natural Gas
-    'ZB=F',   # US 30Y T-Bond
-    'ZN=F',   # US 10Y T-Note
-    'BTC=F',  # Bitcoin Futures
-    'ETH=F',  # Ether Futures
+    'ES=F','NQ=F','YM=F','RTY=F',
+    'CL=F','BZ=F','GC=F','SI=F','HG=F','PL=F',
+    'NG=F','ZC=F','ZS=F','ZW=F',
+    'ZB=F','ZN=F','BTC=F','ETH=F',
 
     # ── Forex ─────────────────────────────────────────────────────────────────
     'EURUSD=X','GBPUSD=X','USDJPY=X','USDCHF=X',
     'AUDUSD=X','USDCAD=X','NZDUSD=X',
     'EURGBP=X','EURJPY=X','GBPJPY=X',
+    'EURCAD=X','AUDCAD=X','AUDNZD=X','NZDCAD=X','CADJPY=X',
+    'USDSEK=X','USDNOK=X','USDMXN=X','USDZAR=X',
+    'EURAUD=X','EURCHF=X','GBPAUD=X','GBPCAD=X',
 
     # ── Crypto (spot) ─────────────────────────────────────────────────────────
     'BTC-USD','ETH-USD','SOL-USD','BNB-USD','XRP-USD',
     'ADA-USD','AVAX-USD','DOGE-USD','DOT-USD','LINK-USD',
+    'MATIC-USD','ATOM-USD','NEAR-USD','APT-USD',
+    'OP-USD','ARB-USD','SUI-USD','INJ-USD',
+    'AAVE-USD','UNI-USD','FTM-USD','ALGO-USD','HBAR-USD',
 ]
 _AI_UNIVERSE = list(dict.fromkeys(_AI_UNIVERSE))  # deduplicate, preserve order
 
@@ -2437,18 +2607,29 @@ def _compute_indicators_fast(symbol: str) -> dict:
         if ce_data:
             return ce_data
 
-    # Use full cache if warm
+    # Use full cache if warm (skip entries that only hold bulk prefetch data)
     now = _time.time()
     if symbol in _proj_cache:
         payload, ts = _proj_cache[symbol]
-        if now - ts < _PROJ_TTL:
+        if now - ts < _PROJ_TTL and '_yf_bulk' not in payload:
             return payload
 
     import yfinance as yf
-    try:
-        hist = yf.Ticker(symbol).history(period='60d')
-    except Exception:
+    # Check for pre-fetched bulk data from scan batch prefetch
+    if symbol in _proj_cache:
+        payload, ts = _proj_cache[symbol]
+        if now - ts < _PROJ_TTL and '_yf_bulk' in payload:
+            hist = payload['_yf_bulk']
+            del _proj_cache[symbol]  # consume it, will recompute indicators below
+        else:
+            hist = None
+    else:
         hist = None
+    if hist is None:
+        try:
+            hist = yf.Ticker(symbol).history(period='60d', threads=True)
+        except Exception:
+            hist = None
     if hist is None or hist.empty or len(hist) < 20:
         # Last resort: return minimal dict with just current price so scan can proceed
         try:
@@ -3400,6 +3581,50 @@ def _session_size_factor(sym: str) -> float:
     return 1.0
 
 
+def _build_history_context(pid: int) -> dict:
+    """Read 30-day trade history, return threshold adjustments for this scan cycle."""
+    default = {'buy_thresh_adj': 0.0, 'sell_thresh_adj': 0.0,
+                'cautious_regimes': set(), 'strong_regimes': set(),
+                'decay_detected': False, 'summary': ''}
+    try:
+        from performance_engine import PerformanceEngine
+        pe = PerformanceEngine(DB_PATH)
+        by_regime = pe.by_regime(pid, days=30)
+        decay     = pe.decay_check(pid, short_window=7, long_window=30)
+
+        ctx = dict(default)
+
+        # Raise thresholds if recent 7-day performance is poor
+        if decay.get('decay_detected') and decay.get('recent_win_rate', 0.5) < 0.40:
+            ctx['buy_thresh_adj']  = 0.8
+            ctx['sell_thresh_adj'] = 0.4
+            ctx['decay_detected']  = True
+
+        # Classify regimes by win rate (min 5 trades for statistical relevance)
+        for regime, stats in by_regime.items():
+            if regime == '_total':
+                continue
+            n = stats.get('trades', 0)
+            wr = stats.get('win_rate', 0.5)
+            if n >= 5 and wr < 0.35:
+                ctx['cautious_regimes'].add(regime)
+            elif n >= 5 and wr > 0.65:
+                ctx['strong_regimes'].add(regime)
+
+        parts = []
+        if ctx['decay_detected']:
+            parts.append(f"7d win rate {decay['recent_win_rate']:.0%} — thresholds raised")
+        if ctx['cautious_regimes']:
+            parts.append(f"Cautious: {', '.join(sorted(ctx['cautious_regimes']))}")
+        if ctx['strong_regimes']:
+            parts.append(f"Strong: {', '.join(sorted(ctx['strong_regimes']))}")
+        ctx['summary'] = ' | '.join(parts) or 'Normal — no history adjustments'
+
+        return ctx
+    except Exception:
+        return default
+
+
 def _ai_run_portfolio(pid: int) -> dict:
     """One AI scan cycle: check existing positions, then scan a batch for buys."""
     MAX_POS      = 12   # raised from 8 — allow more concurrent positions
@@ -3412,6 +3637,10 @@ def _ai_run_portfolio(pid: int) -> dict:
     SHORT_THRESH = -3.0    # strong bearish signal required to open a short
     COVER_THRESH = 1.0     # close short when signal turns neutral/bullish
     PROFIT_FLOOR = 0.015   # always sell if up >1.5% regardless of ATR target
+
+    history_ctx = _build_history_context(pid)
+    BUY_THRESH  = BUY_THRESH  + history_ctx['buy_thresh_adj']
+    SELL_THRESH = SELL_THRESH + history_ctx['sell_thresh_adj']
 
     market_open = _market_is_open()
     mode        = 'full' if market_open else 'crypto_forex'
@@ -3603,6 +3832,27 @@ def _ai_run_portfolio(pid: int) -> dict:
         batch    = [universe[(cursor + i) % len(universe)] for i in range(min(BATCH_SIZE, len(universe)))]
         _ai_scan_cursor[pid] = (cursor + BATCH_SIZE) % max(len(universe), 1)
 
+        # ── Bulk yfinance prefetch for equity/futures symbols ─────────────────
+        # One HTTP call for the whole batch instead of N sequential calls
+        try:
+            import yfinance as yf
+            _eq_batch = [s for s in batch
+                         if not _is_fractional_asset(s)
+                         and not (_candle_engine and _candle_engine.latest(s, '1m'))]
+            if len(_eq_batch) >= 2:
+                _bulk = yf.download(_eq_batch, period='60d', interval='1d',
+                                    auto_adjust=True, progress=False,
+                                    threads=True, group_by='ticker', timeout=20)
+                for _sym in _eq_batch:
+                    try:
+                        _df = _bulk[_sym] if len(_eq_batch) > 1 else _bulk
+                        if _df is not None and not _df.empty and len(_df) >= 20:
+                            _proj_cache[_sym] = ({'_yf_bulk': _df}, _time.time())
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         candidates = []
         batch_data = []
         for sym in batch:
@@ -3644,6 +3894,9 @@ def _ai_run_portfolio(pid: int) -> dict:
                 summary['scanned'] += 1
                 qualifies_long  = score >= BUY_THRESH
                 qualifies_short = score <= SHORT_THRESH
+                # Skip long entries in regimes with poor 30-day history
+                if qualifies_long and detail['market_state'] in history_ctx['cautious_regimes']:
+                    qualifies_long = False
                 batch_data.append({
                     'symbol': sym, 'score': round(score, 2), 'price': round(price, 2),
                     'market_state': detail['market_state'],
@@ -3889,8 +4142,9 @@ def _ai_run_portfolio(pid: int) -> dict:
                 conn.execute(
                     '''INSERT INTO ai_scan_runs
                        (portfolio_id, scanned, bought_count, sold_count, error_count,
-                        bought_json, sold_json, batch_json, mode, skip_reason)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                        bought_json, sold_json, batch_json, mode, skip_reason,
+                        history_context)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
                     (pid, summary['scanned'],
                      len(summary['bought']) + len(summary['shorted']),
                      len(summary['sold'])   + len(summary['covered']),
@@ -3899,7 +4153,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                      _json.dumps(summary['sold']   + summary['covered']),
                      _json.dumps(batch_data),
                      summary.get('mode', 'full'),
-                     summary.get('skip_reason'))
+                     summary.get('skip_reason'),
+                     history_ctx.get('summary', ''))
                 )
         except Exception:
             pass
