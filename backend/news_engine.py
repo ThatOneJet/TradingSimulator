@@ -27,8 +27,101 @@ log = logging.getLogger(__name__)
 
 SENTIMENT_TTL  = 900    # 15 min cache for sentiment
 EARNINGS_TTL   = 3600   # 1 hour cache for earnings dates
+EVENT_TTL      = 1800   # 30 min cache for headline event detection
 NEWS_WINDOW_H  = 4      # look at news in last 4 hours for velocity
 HIGH_VELOCITY  = 5      # articles in window = news_driven flag
+
+# ---------------------------------------------------------------------------
+# Rule-based event detection (keyword -> causal impact)
+# ---------------------------------------------------------------------------
+#
+# Specific event types in headlines map to a directional score, a label, and a
+# typical horizon.  These are more reliable than raw aggregate sentiment for
+# known, well-understood catalysts.
+#
+#   EVENT_KEYWORDS[key] = (score, label, horizon)
+#
+EVENT_KEYWORDS = {
+    # (keywords) : (score, label, horizon)
+    'earnings_beat':   (1.5,  'earnings beat',          'swing'),
+    'earnings_miss':   (-2.0, 'earnings miss',          'swing'),
+    'guidance_raise':  (1.5,  'raised guidance',        'multi-day'),
+    'guidance_cut':    (-1.8, 'cut guidance',           'multi-day'),
+    'upgrade':         (1.0,  'analyst upgrade',        'swing'),
+    'downgrade':       (-1.0, 'analyst downgrade',      'swing'),
+    'acquisition':     (1.2,  'M&A / buyout',           'multi-day'),
+    'investigation':   (-1.5, 'regulatory/legal risk',  'multi-day'),
+    'lawsuit':         (-0.8, 'lawsuit',                'swing'),
+    'partnership':     (0.8,  'partnership/deal',        'swing'),
+    'layoffs':         (0.3,  'cost cutting (mild pos)', 'swing'),
+    'recall':          (-1.0, 'product recall',          'swing'),
+    'bankruptcy':      (-2.0, 'bankruptcy risk',         'multi-day'),
+}
+
+# Phrase fragments that, when found in a headline (case-insensitive), map to one
+# of the EVENT_KEYWORDS keys above.  Order does not matter — detection keeps the
+# highest-magnitude match across all headlines.
+EVENT_PHRASES = {
+    'earnings_beat': (
+        'beat', 'beats', 'tops estimates', 'beats expectations',
+        'beats estimates', 'tops expectations', 'tops forecast',
+        'better than expected', 'earnings beat', 'crushes estimates',
+    ),
+    'earnings_miss': (
+        'misses', 'miss estimates', 'misses estimates', 'falls short',
+        'misses expectations', 'worse than expected', 'earnings miss',
+        'disappointing results', 'disappoints',
+    ),
+    'guidance_raise': (
+        'raises guidance', 'raises outlook', 'raises forecast',
+        'lifts guidance', 'boosts outlook', 'raises full-year',
+        'hikes guidance', 'upbeat guidance', 'raised guidance',
+    ),
+    'guidance_cut': (
+        'cuts guidance', 'lowers outlook', 'lowers guidance',
+        'cuts forecast', 'lowers forecast', 'slashes guidance',
+        'warns on', 'profit warning', 'cut guidance',
+    ),
+    'upgrade': (
+        'upgrades', 'upgraded', 'buy rating', 'raises price target',
+        'raised to buy', 'overweight rating', 'outperform rating',
+        'initiates buy', 'analyst upgrade',
+    ),
+    'downgrade': (
+        'downgrades', 'downgraded', 'sell rating', 'cuts price target',
+        'cut to sell', 'underweight rating', 'underperform rating',
+        'initiates sell', 'analyst downgrade',
+    ),
+    'acquisition': (
+        'to acquire', 'acquires', 'merger', 'buyout', 'takeover',
+        'to buy', 'acquisition of', 'agrees to acquire', 'm&a',
+    ),
+    'investigation': (
+        'sec probe', 'investigation', 'probe', 'doj investigation',
+        'regulatory probe', 'antitrust', 'under investigation',
+        'ftc probe', 'subpoena',
+    ),
+    'lawsuit': (
+        'lawsuit', 'sued', 'sues', 'class action', 'legal action',
+        'files suit', 'litigation',
+    ),
+    'partnership': (
+        'partnership', 'partners with', 'strategic deal', 'signs deal',
+        'collaboration', 'teams up', 'joint venture', 'new contract',
+        'wins contract', 'inks deal',
+    ),
+    'layoffs': (
+        'layoffs', 'job cuts', 'cuts jobs', 'restructuring',
+        'cost cutting', 'cost-cutting', 'reduces workforce', 'lay off',
+    ),
+    'recall': (
+        'recall', 'recalls', 'product recall', 'safety recall',
+    ),
+    'bankruptcy': (
+        'bankruptcy', 'chapter 11', 'insolvency', 'files for bankruptcy',
+        'going concern', 'default on debt',
+    ),
+}
 
 # ---------------------------------------------------------------------------
 # Hardcoded economic event calendar (2025-2026)
@@ -84,6 +177,7 @@ class NewsEngine:
     def __init__(self):
         self._sentiment_cache: dict[str, tuple[dict, float]] = {}
         self._earnings_cache: dict[str, tuple] = {}  # sym -> (days|None, ts)
+        self._event_cache: dict[str, tuple[dict, float]] = {}  # sym -> (event_dict, ts)
 
     # ------------------------------------------------------------------
     # Sentiment
@@ -195,6 +289,154 @@ class NewsEngine:
             return None
 
     # ------------------------------------------------------------------
+    # Rule-based event detection from headlines
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _neutral_event() -> dict:
+        """A neutral (no-event) detection result."""
+        return {
+            'event': None,
+            'score': 0.0,
+            'label': 'no notable event',
+            'horizon': 'none',
+            'headline': '',
+        }
+
+    def detect_events(self, symbol: str) -> dict:
+        """
+        Scan recent company-news headlines for known causal event types.
+
+        Reuses ``get_recent_news`` (widened to a 48-hour window so freshly
+        published catalysts are not missed), matches each headline against the
+        EVENT_PHRASES keyword groups (case-insensitive), and returns the single
+        highest-magnitude event found.
+
+        Returns
+        -------
+        dict with keys:
+            event    str|None  EVENT_KEYWORDS key (e.g. 'earnings_beat') or None
+            score    float     directional impact (negative = bearish)
+            label    str        human-readable label
+            horizon  str        'swing' | 'multi-day' | 'none'
+            headline str        the headline that triggered the match ('' if none)
+
+        Cached for EVENT_TTL (30 min).  Returns a neutral default on any error.
+        """
+        try:
+            now = _time.time()
+            cached = self._event_cache.get(symbol)
+            if cached and (now - cached[1]) < EVENT_TTL:
+                return cached[0]
+
+            # Look back far enough to catch a just-released catalyst.
+            try:
+                news = self.get_recent_news(symbol, hours=48)
+            except Exception as e:
+                log.debug('[NEWS] detect_events news fetch error for %s: %s', symbol, e)
+                news = []
+
+            best = self._neutral_event()
+            best_mag = 0.0
+
+            for item in news:
+                try:
+                    headline = (item.get('headline') or item.get('summary') or '')
+                except AttributeError:
+                    continue
+                if not headline:
+                    continue
+                text = headline.lower()
+
+                for key, phrases in EVENT_PHRASES.items():
+                    if any(p in text for p in phrases):
+                        score, label, horizon = EVENT_KEYWORDS[key]
+                        mag = abs(score)
+                        if mag > best_mag:
+                            best_mag = mag
+                            best = {
+                                'event': key,
+                                'score': float(score),
+                                'label': label,
+                                'horizon': horizon,
+                                'headline': headline,
+                            }
+
+            self._event_cache[symbol] = (best, now)
+            return best
+        except Exception as e:
+            log.debug('[NEWS] detect_events failed for %s: %s', symbol, e)
+            return self._neutral_event()
+
+    # ------------------------------------------------------------------
+    # Earnings pre-drift positioning
+    # ------------------------------------------------------------------
+
+    def earnings_drift_signal(self, symbol: str) -> dict:
+        """
+        Pre-earnings drift / run-up positioning signal.
+
+        Stocks statistically drift UP in the ~5-10 trading days before an
+        earnings release.  Uses ``get_days_to_earnings``.
+
+            * 3-10 days out  -> +0.8 (pre-earnings drift window, long bias)
+            * 1-2 days out   ->  0.0 (too close — IV-crush risk handled elsewhere)
+            * 0 or negative  ->  0.0 (just reported)
+            * otherwise      ->  0.0
+
+        Returns
+        -------
+        dict with keys:
+            score             float    score contribution (0.0 or +0.8)
+            description       str       plain-English summary
+            days_to_earnings  int|None  days until next earnings (None for non-equity)
+        """
+        try:
+            try:
+                dte = self.get_days_to_earnings(symbol)
+            except Exception as e:
+                log.debug('[NEWS] earnings_drift lookup error for %s: %s', symbol, e)
+                dte = None
+
+            if dte is None:
+                return {
+                    'score': 0.0,
+                    'description': 'no earnings date available',
+                    'days_to_earnings': None,
+                }
+
+            if 3 <= dte <= 10:
+                return {
+                    'score': 0.8,
+                    'description': f'pre-earnings drift window ({dte}d out) — long bias',
+                    'days_to_earnings': dte,
+                }
+            if 1 <= dte <= 2:
+                return {
+                    'score': 0.0,
+                    'description': 'earnings imminent — IV-crush risk, no drift bias',
+                    'days_to_earnings': dte,
+                }
+            if dte <= 0:
+                return {
+                    'score': 0.0,
+                    'description': 'just reported — no pre-earnings drift',
+                    'days_to_earnings': dte,
+                }
+            return {
+                'score': 0.0,
+                'description': f'earnings {dte}d out — outside drift window',
+                'days_to_earnings': dte,
+            }
+        except Exception as e:
+            log.debug('[NEWS] earnings_drift_signal failed for %s: %s', symbol, e)
+            return {
+                'score': 0.0,
+                'description': 'earnings drift unavailable',
+                'days_to_earnings': None,
+            }
+
+    # ------------------------------------------------------------------
     # Economic event calendar
     # ------------------------------------------------------------------
 
@@ -248,6 +490,10 @@ class NewsEngine:
             days_to_earnings int|None  None for non-equities
             earnings_risk    str     'high'|'moderate'|'low'|'none'
             economic_event   str|None 'FOMC'|'CPI'|'NFP'|None
+            event            dict    headline-event detection
+                                     {event, score, label, horizon, headline}
+            pre_earnings     dict    pre-earnings drift positioning
+                                     {score, description, days_to_earnings}
             description      str     plain-English summary
         """
         signal = 0.0
@@ -333,6 +579,30 @@ class NewsEngine:
             log.debug('[NEWS] Economic event check error: %s', e)
             eco = {'event': None, 'hours_away': 0.0}
 
+        # --- Rule-based headline event (additive, independent catalyst) ---
+        event = self._neutral_event()
+        try:
+            event = self.detect_events(symbol)
+            if event.get('event'):
+                signal += float(event.get('score', 0.0))
+                description_parts.append(
+                    f"{event['label']} detected ({event['horizon']})"
+                )
+        except Exception as e:
+            log.debug('[NEWS] Event detection error for %s: %s', symbol, e)
+            event = self._neutral_event()
+
+        # --- Pre-earnings drift positioning (additive long bias) ---
+        pre_earnings = {'score': 0.0, 'description': '', 'days_to_earnings': days_to_earnings}
+        try:
+            pre_earnings = self.earnings_drift_signal(symbol)
+            if pre_earnings.get('score'):
+                signal += float(pre_earnings['score'])
+                description_parts.append(pre_earnings.get('description', 'pre-earnings drift'))
+        except Exception as e:
+            log.debug('[NEWS] Earnings drift error for %s: %s', symbol, e)
+            pre_earnings = {'score': 0.0, 'description': '', 'days_to_earnings': days_to_earnings}
+
         # --- Clamp and package ---
         signal = round(max(-2.0, min(2.0, signal)), 2)
         description = '; '.join(description_parts) if description_parts else 'no notable news signals'
@@ -345,6 +615,8 @@ class NewsEngine:
             'days_to_earnings': days_to_earnings,
             'earnings_risk': earnings_risk,
             'economic_event': economic_event,
+            'event': event,
+            'pre_earnings': pre_earnings,
             'description': description,
         }
 
@@ -362,3 +634,51 @@ def get_engine() -> NewsEngine:
     if _engine is None:
         _engine = NewsEngine()
     return _engine
+
+
+# ---------------------------------------------------------------------------
+# Module-level convenience wrappers (for the main scorer)
+# ---------------------------------------------------------------------------
+
+def event_signal(symbol: str) -> dict:
+    """
+    Detect the highest-magnitude headline event for *symbol*.
+
+    Returns dict: {event, score, label, horizon, headline}.
+    Neutral default ({event: None, score: 0.0, ...}) on any error.
+    """
+    try:
+        return get_engine().detect_events(symbol)
+    except Exception as e:
+        log.debug('[NEWS] event_signal failed for %s: %s', symbol, e)
+        return NewsEngine._neutral_event()
+
+
+def earnings_drift_signal(symbol: str) -> dict:
+    """
+    Pre-earnings drift positioning for *symbol*.
+
+    Returns dict: {score, description, days_to_earnings}.
+    Neutral default ({score: 0.0, ...}) on any error.
+    """
+    try:
+        return get_engine().earnings_drift_signal(symbol)
+    except Exception as e:
+        log.debug('[NEWS] earnings_drift_signal (module) failed for %s: %s', symbol, e)
+        return {'score': 0.0, 'description': 'earnings drift unavailable', 'days_to_earnings': None}
+
+
+def event_contrib(symbol: str) -> float:
+    """Just the numeric headline-event score contribution (0.0 on error/no event)."""
+    try:
+        return float(event_signal(symbol).get('score', 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def drift_contrib(symbol: str) -> float:
+    """Just the numeric pre-earnings drift score contribution (0.0 on error)."""
+    try:
+        return float(earnings_drift_signal(symbol).get('score', 0.0) or 0.0)
+    except Exception:
+        return 0.0

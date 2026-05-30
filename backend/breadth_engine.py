@@ -52,6 +52,11 @@ class BreadthEngine:
         self._latest  = {}       # latest breadth snapshot
         self._thread  = None
         self._running = False
+        # Short rolling history for price/breadth divergence detection.
+        # Each entry: {'price': float, 'breadth_pct': float,
+        #              'ad_ratio': float, 'ts': float}
+        self._history = []
+        self._history_max = 12
 
     # ------------------------------------------------------------------
     # Public API
@@ -73,6 +78,70 @@ class BreadthEngine:
         """Return the most recent breadth snapshot (thread-safe)."""
         with self._lock:
             return dict(self._latest)
+
+    def detect_divergence(self) -> dict:
+        """
+        Compare recent index price action against breadth participation.
+
+        Bearish divergence: price makes a new recent high but breadth (% above
+        MA20) is LOWER than at the prior swing high — fewer stocks confirming.
+        Bullish divergence: price makes a new recent low but advance/decline /
+        breadth is HOLDING UP or improving — selling exhaustion.
+
+        Returns {'divergence': 'bearish'|'bullish'|'none',
+                 'score': float, 'description': str}.
+        """
+        none = {'divergence': 'none', 'score': 0.0, 'description': ''}
+        try:
+            with self._lock:
+                hist = list(self._history)
+            if len(hist) < 4:
+                return none
+
+            prices  = [h['price'] for h in hist]
+            breadth = [h['breadth_pct'] for h in hist]
+            ad      = [h['ad_ratio'] for h in hist]
+
+            cur_price   = prices[-1]
+            cur_breadth = breadth[-1]
+            cur_ad      = ad[-1]
+
+            prior_prices  = prices[:-1]
+            prior_breadth = breadth[:-1]
+            prior_ad      = ad[:-1]
+
+            max_prior_price = max(prior_prices)
+            min_prior_price = min(prior_prices)
+
+            # --- Bearish divergence: new recent high, weaker breadth ---
+            if cur_price >= max_prior_price:
+                # breadth reading at the prior price high
+                prior_high_idx = prior_prices.index(max_prior_price)
+                breadth_at_prior_high = prior_breadth[prior_high_idx]
+                if cur_breadth < breadth_at_prior_high - 0.03:
+                    return {
+                        'divergence': 'bearish',
+                        'score': -1.0,
+                        'description': 'breadth not confirming new high',
+                    }
+
+            # --- Bullish divergence: new recent low, breadth firming ---
+            if cur_price <= min_prior_price:
+                prior_low_idx = prior_prices.index(min_prior_price)
+                ad_at_prior_low = prior_ad[prior_low_idx]
+                breadth_at_prior_low = prior_breadth[prior_low_idx]
+                if (cur_ad > ad_at_prior_low + 0.03 or
+                        cur_breadth > breadth_at_prior_low + 0.03):
+                    return {
+                        'divergence': 'bullish',
+                        'score': 1.0,
+                        'description': 'selling exhaustion, breadth firming',
+                    }
+
+            return none
+        except Exception as e:
+            log.debug('[BREADTH] detect_divergence error: %s', e)
+            return none
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -103,6 +172,8 @@ class BreadthEngine:
         declining   = 0
         above_ma20  = 0
         total_valid = 0
+        spy_last    = None          # SPY price level (preferred index proxy)
+        basket_sum  = 0.0           # sum of last closes (basket-average fallback)
 
         for sym in BREADTH_BASKET:
             try:
@@ -123,6 +194,9 @@ class BreadthEngine:
                 if last > ma20:
                     above_ma20 += 1
 
+                if sym == 'SPY':
+                    spy_last = last
+                basket_sum += last
                 total_valid += 1
 
             except Exception:
@@ -156,12 +230,16 @@ class BreadthEngine:
              0.0
         )
 
+        # Index price proxy: prefer SPY's level, else the basket average.
+        price_level = spy_last if spy_last is not None else (basket_sum / total_valid)
+
         snapshot = {
             'advancing':      advancing,
             'declining':      declining,
             'total':          total_valid,
             'ad_ratio':       round(ad_ratio, 3),
             'above_ma20_pct': round(ma20_pct, 3),
+            'price_level':    round(price_level, 4),
             'signal':         signal,
             'score_contrib':  score_contrib,
             'updated_at':     time.time(),
@@ -169,6 +247,15 @@ class BreadthEngine:
 
         with self._lock:
             self._latest = snapshot
+            # Append to rolling price/breadth history for divergence detection.
+            self._history.append({
+                'price':       price_level,
+                'breadth_pct': ma20_pct,
+                'ad_ratio':    ad_ratio,
+                'ts':          time.time(),
+            })
+            if len(self._history) > self._history_max:
+                self._history = self._history[-self._history_max:]
 
         if self._bus:
             self._bus.publish('breadth:market', snapshot)
@@ -224,3 +311,28 @@ def get_signal() -> str:
     """
     data = latest()
     return data.get('signal', 'neutral')
+
+
+def divergence_signal() -> dict:
+    """
+    Return the MARKET-WIDE price/breadth divergence signal.
+
+    This is not per-symbol — it reflects whether the index price action and
+    market breadth agree, and applies to equity/index symbols.
+
+    Returns {'divergence': 'bearish'|'bullish'|'none',
+             'score': float, 'description': str}.
+    Returns the 'none' result if the engine is not initialised / lacks history.
+    """
+    if not _engine:
+        return {'divergence': 'none', 'score': 0.0, 'description': ''}
+    return _engine.detect_divergence()
+
+
+def divergence_contrib() -> float:
+    """
+    Return just the market-wide divergence score contribution (-1.0 … +1.0).
+
+    Returns 0.0 if the engine is not initialised or there is no divergence.
+    """
+    return float(divergence_signal().get('score', 0.0))

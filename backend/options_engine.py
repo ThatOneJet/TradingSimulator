@@ -312,14 +312,33 @@ class OptionsChain:
 # OptionsEngine — main class combining everything
 # ---------------------------------------------------------------------------
 
+def _asset_class(sym: str) -> str:
+    """Coarse asset-class detection (self-contained — no app.py dependency).
+    Options PCR is only meaningful for listed equities/ETFs."""
+    s = (sym or '').upper().strip()
+    if s.endswith('-USD') or s.endswith('/USD') or s.endswith('USDT'):
+        return 'crypto'
+    if s.endswith('=X'):
+        return 'forex'
+    if s.endswith('=F'):
+        return 'futures'
+    return 'equity'
+
+
 class OptionsEngine:
     MAX_SPREAD_PCT = 8.0   # skip illiquid contracts
     MIN_DELTA_LONG = 0.30  # min delta for long options (not too far OTM)
     MAX_DELTA_LONG = 0.70  # max delta for long options (not deep ITM)
 
+    # Put/Call Ratio sentiment thresholds
+    PCR_BULLISH_BELOW = 0.7    # pcr < 0.7 → bullish positioning
+    PCR_BEARISH_ABOVE = 1.3    # pcr > 1.3 → bearish positioning
+    PCR_CACHE_TTL     = 1800   # cache live PCR for 30 minutes per symbol
+
     def __init__(self, db_path: str):
         self.chain   = OptionsChain()
         self.iv_hist = IVHistory(db_path)
+        self._pcr_cache: dict[str, tuple[float, dict]] = {}   # symbol → (ts, result)
 
     def get_signal(self, underlying: str, underlying_price: float,
                    ai_score: float, regime: str) -> dict:
@@ -454,6 +473,179 @@ class OptionsEngine:
             'max_reward':    0,
         }
 
+    # ------------------------------------------------------------------
+    # Put/Call Ratio (live sentiment from the options chain)
+    # ------------------------------------------------------------------
+
+    def _liquid_weight(self, contract: dict) -> float | None:
+        """Return the PCR weight for a near-ATM contract if it is liquid.
+
+        A contract is liquid when it has a valid bid AND ask. Weight is the
+        open interest when present, otherwise 1.0 (count-based). Returns None
+        for illiquid contracts so they are excluded from the ratio.
+        """
+        try:
+            quote = self.chain.get_quote(contract.get('symbol', ''))
+            if not quote:
+                return None
+            bid, ask = quote.get('bid', 0) or 0, quote.get('ask', 0) or 0
+            if bid <= 0 or ask <= 0:
+                return None   # not actively traded
+            oi = contract.get('open_interest')
+            try:
+                oi = float(oi) if oi not in (None, '') else 0.0
+            except (TypeError, ValueError):
+                oi = 0.0
+            return oi if oi > 0 else 1.0
+        except Exception as e:
+            log.debug('[OPTIONS_PCR] weight error for %s: %s',
+                      contract.get('symbol'), e)
+            return None
+
+    def compute_pcr(self, underlying: str, underlying_price: float) -> dict:
+        """Compute a live Put/Call Ratio from near-ATM chain liquidity.
+
+        Approximates PCR using open interest when available, otherwise a count
+        of liquid (valid bid/ask) near-ATM puts vs calls. Cached 30 min/symbol.
+
+        Returns {'pcr', 'put_count', 'call_count', 'available'}.
+        If the chain is unavailable returns {'available': False, 'pcr': 1.0}.
+        """
+        now = time.time()
+        cached = self._pcr_cache.get(underlying)
+        if cached and (now - cached[0]) < self.PCR_CACHE_TTL:
+            return cached[1]
+
+        try:
+            if not underlying_price or underlying_price <= 0:
+                result = {'available': False, 'pcr': 1.0,
+                          'put_count': 0, 'call_count': 0}
+                self._pcr_cache[underlying] = (now, result)
+                return result
+
+            calls = self.chain.get_contracts(
+                underlying, dte_min=15, dte_max=60,
+                opt_type='call', underlying_price=underlying_price)
+            puts = self.chain.get_contracts(
+                underlying, dte_min=15, dte_max=60,
+                opt_type='put', underlying_price=underlying_price)
+
+            if not calls and not puts:
+                result = {'available': False, 'pcr': 1.0,
+                          'put_count': 0, 'call_count': 0}
+                self._pcr_cache[underlying] = (now, result)
+                return result
+
+            # Limit API calls — examine the contracts closest to the money.
+            def _atm_sort(cs):
+                return sorted(
+                    cs, key=lambda c: abs(float(c.get('strike_price', 0) or 0)
+                                          - underlying_price))[:12]
+
+            call_weight = 0.0
+            call_count  = 0
+            for c in _atm_sort(calls):
+                w = self._liquid_weight(c)
+                if w is not None:
+                    call_weight += w
+                    call_count  += 1
+
+            put_weight = 0.0
+            put_count  = 0
+            for p in _atm_sort(puts):
+                w = self._liquid_weight(p)
+                if w is not None:
+                    put_weight += w
+                    put_count  += 1
+
+            if call_weight <= 0 and put_weight <= 0:
+                # No liquid contracts on either side — no signal.
+                result = {'available': False, 'pcr': 1.0,
+                          'put_count': put_count, 'call_count': call_count}
+                self._pcr_cache[underlying] = (now, result)
+                return result
+
+            # Avoid division by zero: a clean lean to one side.
+            if call_weight <= 0:
+                pcr = 2.0
+            elif put_weight <= 0:
+                pcr = 0.5
+            else:
+                pcr = put_weight / call_weight
+
+            result = {
+                'pcr':        round(pcr, 3),
+                'put_count':  put_count,
+                'call_count': call_count,
+                'available':  True,
+            }
+            self._pcr_cache[underlying] = (now, result)
+            return result
+        except Exception as e:
+            log.debug('[OPTIONS_PCR] compute_pcr error for %s: %s', underlying, e)
+            result = {'available': False, 'pcr': 1.0,
+                      'put_count': 0, 'call_count': 0}
+            self._pcr_cache[underlying] = (now, result)
+            return result
+
+    def pcr_signal(self, underlying: str,
+                   underlying_price: float | None = None) -> dict:
+        """Translate the live Put/Call Ratio into a sentiment score.
+
+        Contrarian-aware directional read:
+          pcr < 0.7  → +1.0  'low put/call ratio — bullish options positioning'
+          pcr > 1.3  → -1.0  'high put/call ratio — bearish options positioning'
+          0.7–1.3    → small proportional score trending toward 0
+
+        Only meaningful for equities/ETFs. Crypto/forex/futures and the case
+        where the caller has no underlying price both return a neutral score.
+
+        Returns {'score', 'description', 'pcr'}.
+        """
+        try:
+            if _asset_class(underlying) != 'equity':
+                return {'score': 0.0, 'pcr': 1.0,
+                        'description': 'put/call ratio n/a (non-equity)'}
+
+            if underlying_price is None or underlying_price <= 0:
+                # Caller may not have a price — skip gracefully.
+                return {'score': 0.0, 'pcr': 1.0,
+                        'description': 'put/call ratio unavailable (no price)'}
+
+            pcr_data = self.compute_pcr(underlying, underlying_price)
+            if not pcr_data.get('available'):
+                return {'score': 0.0, 'pcr': pcr_data.get('pcr', 1.0),
+                        'description': 'put/call ratio unavailable'}
+
+            pcr = pcr_data['pcr']
+
+            if pcr < self.PCR_BULLISH_BELOW:
+                return {'score': 1.0, 'pcr': pcr,
+                        'description': 'low put/call ratio — '
+                                       'bullish options positioning'}
+            if pcr > self.PCR_BEARISH_ABOVE:
+                return {'score': -1.0, 'pcr': pcr,
+                        'description': 'high put/call ratio — '
+                                       'bearish options positioning'}
+
+            # Neutral band 0.7–1.3: linearly fade toward 0 around pcr = 1.0.
+            mid = 1.0
+            if pcr <= mid:
+                # 0.7 → +1.0 boundary, 1.0 → 0.0
+                span  = mid - self.PCR_BULLISH_BELOW           # 0.3
+                score = (mid - pcr) / span if span > 0 else 0.0
+            else:
+                # 1.0 → 0.0, 1.3 → -1.0 boundary
+                span  = self.PCR_BEARISH_ABOVE - mid           # 0.3
+                score = -(pcr - mid) / span if span > 0 else 0.0
+            score = round(max(-1.0, min(1.0, score)), 3)
+            return {'score': score, 'pcr': pcr,
+                    'description': f'neutral put/call ratio ({pcr:.2f})'}
+        except Exception as e:
+            log.debug('[OPTIONS_PCR] pcr_signal error for %s: %s', underlying, e)
+            return {'score': 0.0, 'pcr': 1.0,
+                    'description': 'put/call ratio error'}
+
 
 # ---------------------------------------------------------------------------
 # Module-level singleton
@@ -473,3 +665,24 @@ def init(db_path: str) -> OptionsEngine:
 def get_engine() -> OptionsEngine | None:
     """Return the module-level singleton (None if not yet initialised)."""
     return _engine
+
+
+def pcr_signal(underlying: str, underlying_price: float | None = None) -> dict:
+    """Module-level live Put/Call Ratio sentiment signal.
+
+    Returns {'score', 'description', 'pcr'}. Neutral if the engine is not
+    initialised, the asset is non-equity, or no price/chain is available.
+    """
+    eng = _engine
+    if eng is None:
+        return {'score': 0.0, 'pcr': 1.0,
+                'description': 'options engine not initialised'}
+    return eng.pcr_signal(underlying, underlying_price)
+
+
+def pcr_contrib(underlying: str, underlying_price: float | None = None) -> float:
+    """Scalar score contribution from the live Put/Call Ratio signal."""
+    try:
+        return float(pcr_signal(underlying, underlying_price).get('score', 0.0))
+    except Exception:
+        return 0.0

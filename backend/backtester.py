@@ -805,3 +805,233 @@ def run_backtest(symbol: str, start: str, end: str,
         'metrics':      result.metrics,
         'by_regime':    result.by_regime,
     }
+
+
+# ── Walk-forward validation ─────────────────────────────────────────────────────
+#
+# Walk-forward testing slices history into sequential rolling windows and runs
+# the strategy independently on each out-of-sample period. A curve-fit strategy
+# shines in one window and collapses in others; a real edge stays consistent
+# across regimes. We orchestrate many windowed BacktestEngine.run() calls and
+# aggregate consistency, return stability, and per-regime win rates.
+
+def _gen_windows(start_date: str, end_date: str,
+                 window_days: int, step_days: int) -> list:
+    """
+    Build rolling [w_start, w_end] date windows covering [start_date, end_date].
+
+    Windows are window_days wide and advance by step_days. The final window is
+    clamped so it never extends past end_date. Returns a list of
+    ('YYYY-MM-DD', 'YYYY-MM-DD') tuples (oldest first).
+    """
+    from datetime import datetime, timedelta
+
+    fmt = '%Y-%m-%d'
+    start = datetime.strptime(str(start_date)[:10], fmt)
+    end   = datetime.strptime(str(end_date)[:10], fmt)
+    if end <= start:
+        return []
+
+    window_days = max(int(window_days), 1)
+    step_days   = max(int(step_days), 1)
+
+    windows = []
+    cursor = start
+    while cursor < end:
+        w_start = cursor
+        w_end   = min(cursor + timedelta(days=window_days), end)
+        windows.append((w_start.strftime(fmt), w_end.strftime(fmt)))
+        # Stop once a window already reaches the end (avoid duplicate tail windows)
+        if w_end >= end:
+            break
+        cursor = cursor + timedelta(days=step_days)
+    return windows
+
+
+def _dominant_regime(by_regime: dict) -> str:
+    """Pick the regime with the most trades in a window's by_regime breakdown."""
+    if not by_regime:
+        return 'none'
+    return max(by_regime.items(), key=lambda kv: kv[1].get('trades', 0))[0]
+
+
+def _robustness_score(consistency: float, avg_return: float,
+                      return_std: float) -> float:
+    """
+    Blend consistency, average return, and return stability into a 0-100 score.
+
+    - consistency (fraction of profitable windows) is the backbone (up to 50 pts)
+    - positive average return adds reward, negative subtracts (up to ±30 pts)
+    - high dispersion of returns (return_std) penalizes — a strategy whose
+      results swing wildly between windows is not robust (up to -25 pts)
+
+    A consistent, modestly-positive, low-variance strategy scores high; a
+    curve-fit one (one huge window, several losing) scores low.
+    """
+    # Consistency backbone: 0..50
+    consistency_pts = max(0.0, min(consistency, 1.0)) * 50.0
+
+    # Average-return reward/penalty: clamp avg_return into ±30 pts.
+    # 0.10 (10% avg per window) saturates the reward.
+    return_pts = max(-30.0, min(avg_return / 0.10, 1.0) * 30.0)
+
+    # Stability penalty: the larger the std relative to a 0.10 reference, the
+    # bigger the penalty (capped at -25). Zero std → no penalty.
+    stability_penalty = -min(return_std / 0.10, 1.0) * 25.0
+
+    # Baseline 25, plus consistency, plus return reward/penalty, minus dispersion.
+    score = 25.0 + consistency_pts + return_pts + stability_penalty
+    return round(max(0.0, min(score, 100.0)), 1)
+
+
+def walk_forward(symbol: str, start_date: str, end_date: str,
+                 window_days: int = 90, step_days: int = 30,
+                 capital: float = 100_000) -> dict:
+    """
+    Walk-forward validation: run the backtest over rolling out-of-sample windows
+    and aggregate how consistent / robust the strategy's edge is.
+
+    The [start_date, end_date] range is sliced into rolling windows of
+    `window_days`, advancing `step_days` each step. Each window is replayed
+    through the existing BacktestEngine.run() (no scoring/indicator logic is
+    duplicated). Per-window metrics are collected and aggregated.
+
+    Args:
+        symbol:      ticker, e.g. 'AAPL'
+        start_date:  'YYYY-MM-DD' inclusive range start
+        end_date:    'YYYY-MM-DD' inclusive range end
+        window_days: width of each rolling window in calendar days
+        step_days:   how many calendar days to advance between windows
+        capital:     starting capital applied to each window independently
+
+    Returns a dict:
+        {
+          'symbol': str,
+          'windows': [
+            { 'start', 'end', 'total_return', 'win_rate', 'sharpe',
+              'max_drawdown', 'trades', 'dominant_regime', 'status' },
+            ...
+          ],
+          'summary': {
+            'consistency', 'avg_return', 'return_std', 'robustness_score',
+            'best_window', 'worst_window', 'total_windows'
+          },
+          'by_regime': { regime: { 'wins', 'trades', 'win_rate' }, ... }
+        }
+    """
+    symbol = symbol.upper()
+    engine = BacktestEngine(initial_capital=capital)
+
+    window_ranges = _gen_windows(start_date, end_date, window_days, step_days)
+    log.info("[WALKFWD] %s  %s → %s  | %d windows (%dd/%dd)",
+             symbol, start_date, end_date, len(window_ranges), window_days, step_days)
+
+    windows = []                       # per-window result dicts
+    regime_acc = defaultdict(lambda: {'wins': 0, 'trades': 0})
+
+    for (w_start, w_end) in window_ranges:
+        try:
+            result = engine.run(symbol, w_start, w_end, portfolio_size=capital)
+        except Exception as exc:
+            # Too few bars, fetch error, etc. — skip this window and continue.
+            log.warning("[WALKFWD] %s  window %s→%s skipped: %s",
+                        symbol, w_start, w_end, exc)
+            windows.append({
+                'start':           w_start,
+                'end':             w_end,
+                'total_return':    0.0,
+                'win_rate':        0.0,
+                'sharpe':          0.0,
+                'max_drawdown':    0.0,
+                'trades':          0,
+                'dominant_regime': 'none',
+                'status':          'skipped',
+            })
+            continue
+
+        m = result.metrics
+        n_trades = int(m.get('total_trades', 0) or 0)
+
+        # Accumulate per-regime win/trade counts across all windows.
+        for regime, stats in (result.by_regime or {}).items():
+            regime_acc[regime]['wins']   += int(stats.get('wins', 0) or 0)
+            regime_acc[regime]['trades'] += int(stats.get('trades', 0) or 0)
+
+        windows.append({
+            'start':           w_start,
+            'end':             w_end,
+            'total_return':    round(float(m.get('total_return', 0.0) or 0.0), 4),
+            'win_rate':        round(float(m.get('win_rate', 0.0) or 0.0), 3),
+            'sharpe':          round(float(m.get('sharpe', 0.0) or 0.0), 2),
+            'max_drawdown':    round(float(m.get('max_drawdown', 0.0) or 0.0), 4),
+            'trades':          n_trades,
+            'dominant_regime': _dominant_regime(result.by_regime),
+            # Windows that ran but produced no trades are 'flat', not failures.
+            'status':          'flat' if n_trades == 0 else 'ok',
+        })
+
+    # ── Aggregate across windows ────────────────────────────────────────────────
+    # Only windows that actually executed trades count toward consistency /
+    # return statistics; skipped (errored) and flat (no-trade) windows are
+    # neutral and excluded from the return distribution.
+    active = [w for w in windows if w['status'] == 'ok']
+    returns = [w['total_return'] for w in active]
+
+    if active:
+        profitable   = sum(1 for w in active if w['total_return'] > 0)
+        consistency  = round(profitable / len(active), 3)
+        avg_return   = round(sum(returns) / len(returns), 4)
+        return_std   = round(_stats.pstdev(returns), 4) if len(returns) > 1 else 0.0
+        best_window  = max(active, key=lambda w: w['total_return'])
+        worst_window = min(active, key=lambda w: w['total_return'])
+    else:
+        consistency  = 0.0
+        avg_return   = 0.0
+        return_std   = 0.0
+        best_window  = None
+        worst_window = None
+
+    robustness = _robustness_score(consistency, avg_return, return_std)
+
+    by_regime = {}
+    for regime, acc in regime_acc.items():
+        tr = acc['trades']
+        by_regime[regime] = {
+            'wins':     acc['wins'],
+            'trades':   tr,
+            'win_rate': round(acc['wins'] / tr, 3) if tr else 0.0,
+        }
+
+    summary = {
+        'consistency':      consistency,
+        'avg_return':       avg_return,
+        'return_std':       return_std,
+        'robustness_score': robustness,
+        'best_window':      best_window,
+        'worst_window':     worst_window,
+        'total_windows':    len(windows),
+    }
+
+    log.info("[WALKFWD] %s  done — %d windows, %d active, consistency=%.2f, robustness=%.1f",
+             symbol, len(windows), len(active), consistency, robustness)
+
+    return {
+        'symbol':    symbol,
+        'windows':   windows,
+        'summary':   summary,
+        'by_regime': by_regime,
+    }
+
+
+def run_walk_forward(symbol: str, start: str, end: str,
+                     window_days: int = 90, step_days: int = 30,
+                     capital: float = 100_000) -> dict:
+    """Convenience wrapper returning a JSON-serializable walk-forward dict.
+
+    Mirrors run_backtest's pattern. The returned structure contains only
+    JSON-native types (str/int/float/list/dict), so it can be passed straight
+    to json.dumps / a JSON HTTP response.
+    """
+    return walk_forward(symbol, start, end,
+                        window_days=window_days, step_days=step_days,
+                        capital=capital)

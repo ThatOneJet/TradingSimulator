@@ -637,3 +637,390 @@ def snapshot(symbol: str) -> dict:
         log.warning("[STRUCTURE] snapshot() called before init()")
         return dict(StructureEngine._EMPTY_SNAPSHOT)
     return _engine.snapshot(symbol)
+
+
+# ===========================================================================
+# Higher-Timeframe (Daily / Weekly) Structure
+#
+# Additive layer: seeds daily & weekly swing-based support/resistance from
+# yfinance daily history. The live StructureEngine above only sees 1m bars and
+# is blind to multi-month / multi-year levels (e.g. a 2-year-old resistance).
+# These HTF levels are the ones institutions actually trade from.
+#
+# yfinance is imported lazily inside methods; every public entry point is
+# wrapped in try/except and returns neutral defaults so a network/parse
+# failure never propagates into the live scorer.
+# ===========================================================================
+
+def _htf_zigzag_swings(highs: list, lows: list, closes: list) -> list:
+    """
+    Lightweight 3-bar zigzag swing detector for HTF bars (daily / weekly).
+
+    Mirrors SwingDetector's geometric pattern (b1 < b2 > b3 for a swing high,
+    b1 > b2 < b3 for a swing low) using a percentage-based threshold instead
+    of intraday ATR, since HTF bars have no per-bar ATR here.
+
+    Returns a list of {'type': 'high'|'low', 'price': float, 'idx': int}.
+    """
+    swings: list = []
+    try:
+        n = len(highs)
+        if n < 3:
+            return swings
+        # 0.4% of the median close is the minimum prominence for a swing.
+        ref = statistics.median([c for c in closes if c > 0]) if closes else 0.0
+        threshold = 0.004 * ref if ref > 0 else 0.0
+
+        for i in range(1, n - 1):
+            h1, h2, h3 = highs[i - 1], highs[i], highs[i + 1]
+            l1, l2, l3 = lows[i - 1], lows[i], lows[i + 1]
+
+            # Swing high
+            if h1 < h2 > h3 and (h2 - max(h1, h3)) >= threshold:
+                swings.append({'type': 'high', 'price': h2, 'idx': i})
+            # Swing low
+            elif l1 > l2 < l3 and (min(l1, l3) - l2) >= threshold:
+                swings.append({'type': 'low', 'price': l2, 'idx': i})
+
+        return swings
+    except Exception:
+        log.exception("[STRUCTURE] HTF zigzag error")
+        return swings
+
+
+def _htf_cluster(prices: list, pct: float = 0.01) -> list:
+    """
+    Cluster a list of price levels: any levels within `pct` (default 1%) of the
+    running cluster anchor are merged into one zone (represented by the median).
+
+    Returns a list of representative floats (one per cluster), sorted ascending.
+    """
+    try:
+        clean = sorted(p for p in prices if p and p > 0)
+        if not clean:
+            return []
+
+        clusters: list[list[float]] = [[clean[0]]]
+        for p in clean[1:]:
+            anchor = clusters[-1][0]
+            if anchor > 0 and (p - clusters[-1][-1]) <= pct * anchor:
+                clusters[-1].append(p)
+            else:
+                clusters.append([p])
+
+        return sorted(statistics.median(c) for c in clusters)
+    except Exception:
+        log.exception("[STRUCTURE] HTF cluster error")
+        return []
+
+
+class DailyStructure:
+    """
+    Computes daily and weekly swing-based support/resistance for a symbol from
+    yfinance daily history, with a 1-hour per-symbol cache.
+
+    Weekly bars are built by grouping daily bars into ISO weeks:
+        high  = max(daily highs in week)
+        low   = min(daily lows in week)
+        close = last daily close in week
+    """
+
+    _CACHE_TTL_SECONDS = 3600  # 1 hour
+    _LEVEL_PCT = 0.01          # "near a level" = within 1%
+    _MAX_LEVELS = 4            # nearest few levels per side to return
+
+    _EMPTY = {
+        'daily_resistance':   [],
+        'daily_support':      [],
+        'weekly_resistance':  [],
+        'weekly_support':     [],
+        'nearest_resistance': None,
+        'nearest_support':    None,
+        'at_weekly_level':    False,
+        'current_price':      None,
+    }
+
+    def __init__(self):
+        # symbol -> (computed_at_ts, result_dict)
+        self._cache: dict[str, tuple] = {}
+        self._lock = threading.Lock()
+
+    # -- weekly aggregation --------------------------------------------------
+
+    @staticmethod
+    def _resample_weekly(index, highs: list, lows: list, closes: list) -> tuple:
+        """
+        Group daily bars into ISO (year, week) buckets.
+        Returns (w_highs, w_lows, w_closes) ordered chronologically.
+        """
+        buckets: dict = {}
+        order: list = []
+        for ts, h, l, c in zip(index, highs, lows, closes):
+            try:
+                iso = ts.isocalendar()  # (year, week, weekday) on Timestamp/datetime
+                key = (iso[0], iso[1])
+            except Exception:
+                # Fall back to a per-7-day chunking key if isocalendar missing.
+                key = (getattr(ts, 'year', 0), getattr(ts, 'month', 0))
+            if key not in buckets:
+                buckets[key] = {'high': h, 'low': l, 'close': c}
+                order.append(key)
+            else:
+                b = buckets[key]
+                if h > b['high']:
+                    b['high'] = h
+                if l < b['low']:
+                    b['low'] = l
+                b['close'] = c  # last close in the week wins
+        w_highs  = [buckets[k]['high']  for k in order]
+        w_lows   = [buckets[k]['low']   for k in order]
+        w_closes = [buckets[k]['close'] for k in order]
+        return w_highs, w_lows, w_closes
+
+    # -- core ----------------------------------------------------------------
+
+    def compute(self, symbol: str) -> dict:
+        """
+        Return daily/weekly S/R for `symbol`, using the 1-hour cache when warm.
+        Always returns a dict shaped like `_EMPTY` (never raises).
+        """
+        try:
+            now = time.time()
+            with self._lock:
+                cached = self._cache.get(symbol)
+                if cached and (now - cached[0]) < self._CACHE_TTL_SECONDS:
+                    return cached[1]
+
+            result = self._compute_uncached(symbol)
+
+            with self._lock:
+                self._cache[symbol] = (now, result)
+            return result
+        except Exception:
+            log.exception("[STRUCTURE] DailyStructure.compute error for %s", symbol)
+            return dict(self._EMPTY)
+
+    def _compute_uncached(self, symbol: str) -> dict:
+        try:
+            import yfinance as yf
+
+            hist = yf.Ticker(symbol).history(period='1y')
+            if hist is None or hist.empty or len(hist) < 5:
+                return dict(self._EMPTY)
+
+            highs  = [float(x) for x in hist['High']]
+            lows   = [float(x) for x in hist['Low']]
+            closes = [float(x) for x in hist['Close']]
+            index  = list(hist.index)
+
+            current_price = closes[-1]
+            if not current_price or current_price <= 0:
+                return dict(self._EMPTY)
+
+            # --- Daily swings ---
+            d_swings = _htf_zigzag_swings(highs, lows, closes)
+            d_res_raw = [s['price'] for s in d_swings if s['type'] == 'high']
+            d_sup_raw = [s['price'] for s in d_swings if s['type'] == 'low']
+            daily_res_levels = _htf_cluster(d_res_raw, self._LEVEL_PCT)
+            daily_sup_levels = _htf_cluster(d_sup_raw, self._LEVEL_PCT)
+
+            # --- Weekly swings (strongest levels) ---
+            w_highs, w_lows, w_closes = self._resample_weekly(index, highs, lows, closes)
+            w_swings = _htf_zigzag_swings(w_highs, w_lows, w_closes)
+            w_res_raw = [s['price'] for s in w_swings if s['type'] == 'high']
+            w_sup_raw = [s['price'] for s in w_swings if s['type'] == 'low']
+            weekly_res_levels = _htf_cluster(w_res_raw, self._LEVEL_PCT)
+            weekly_sup_levels = _htf_cluster(w_sup_raw, self._LEVEL_PCT)
+
+            # Resistance = levels above price; support = levels below price.
+            daily_resistance = sorted(p for p in daily_res_levels if p > current_price)[: self._MAX_LEVELS]
+            daily_support    = sorted((p for p in daily_sup_levels if p < current_price), reverse=True)[: self._MAX_LEVELS]
+            weekly_resistance = sorted(p for p in weekly_res_levels if p > current_price)[: self._MAX_LEVELS]
+            weekly_support    = sorted((p for p in weekly_sup_levels if p < current_price), reverse=True)[: self._MAX_LEVELS]
+
+            # Nearest level (weekly weighted: prefer a weekly level if it exists).
+            nearest_resistance = (weekly_resistance[0] if weekly_resistance
+                                  else (daily_resistance[0] if daily_resistance else None))
+            nearest_support = (weekly_support[0] if weekly_support
+                               else (daily_support[0] if daily_support else None))
+
+            # at_weekly_level: within 1% of ANY weekly level (above or below price).
+            all_weekly = weekly_res_levels + weekly_sup_levels
+            at_weekly_level = any(
+                abs(lvl - current_price) <= self._LEVEL_PCT * current_price
+                for lvl in all_weekly
+            )
+
+            return {
+                'daily_resistance':   daily_resistance,
+                'daily_support':      daily_support,
+                'weekly_resistance':  weekly_resistance,
+                'weekly_support':     weekly_support,
+                'nearest_resistance': nearest_resistance,
+                'nearest_support':    nearest_support,
+                'at_weekly_level':    at_weekly_level,
+                'current_price':      current_price,
+                # Retained internally for break detection / weighting; harmless extras.
+                '_weekly_res_all':    weekly_res_levels,
+                '_weekly_sup_all':    weekly_sup_levels,
+                '_daily_res_all':     daily_res_levels,
+                '_daily_sup_all':     daily_sup_levels,
+            }
+        except Exception:
+            log.exception("[STRUCTURE] DailyStructure._compute_uncached error for %s", symbol)
+            return dict(self._EMPTY)
+
+    # -- signal --------------------------------------------------------------
+
+    def htf_signal(self, symbol: str, current_price: Optional[float] = None) -> dict:
+        """
+        Score price's relationship to HTF (daily/weekly) S/R levels.
+
+        Weekly levels are weighted 3x daily. See module-level htf_signal() for
+        the full contract.
+        """
+        neutral = {
+            'score':              0.0,
+            'description':        'no HTF level nearby',
+            'nearest_resistance': None,
+            'nearest_support':    None,
+            'at_weekly_level':    False,
+        }
+        try:
+            data = self.compute(symbol)
+
+            price = current_price
+            if price is None or price <= 0:
+                price = data.get('current_price')
+            if price is None or price <= 0:
+                return neutral
+
+            band = self._LEVEL_PCT * price  # 1% proximity band
+
+            weekly_res = data.get('weekly_resistance') or []
+            weekly_sup = data.get('weekly_support') or []
+            daily_res  = data.get('daily_resistance') or []
+            daily_sup  = data.get('daily_support') or []
+            weekly_res_all = data.get('_weekly_res_all') or []
+
+            nearest_res = data.get('nearest_resistance')
+            nearest_sup = data.get('nearest_support')
+            at_weekly   = bool(data.get('at_weekly_level'))
+
+            score = 0.0
+            desc = 'no HTF level nearby'
+
+            # 1) Broke above a weekly resistance: a level that is now just BELOW
+            #    price (within band) and was a resistance level → bullish breakout.
+            broke_weekly = any(
+                0 < (price - lvl) <= band for lvl in weekly_res_all
+            )
+
+            # 2) Approaching / at a weekly resistance from below (level above price).
+            at_weekly_res = any(0 <= (lvl - price) <= band for lvl in weekly_res)
+            # 3) Approaching / at a weekly support from above (level below price).
+            at_weekly_sup = any(0 <= (price - lvl) <= band for lvl in weekly_sup)
+            # 4) At a daily level (either side).
+            at_daily = (
+                any(abs(lvl - price) <= band for lvl in daily_res) or
+                any(abs(lvl - price) <= band for lvl in daily_sup)
+            )
+
+            if at_weekly_res:
+                score = -1.5
+                desc = 'at weekly resistance — strong ceiling'
+            elif at_weekly_sup:
+                score = 1.5
+                desc = 'at weekly support — strong floor'
+            elif broke_weekly:
+                score = 1.0
+                desc = 'broke weekly resistance — bullish'
+            elif at_daily:
+                # Sign by which side the nearest daily level sits on.
+                res_dist = min((abs(lvl - price) for lvl in daily_res), default=float('inf'))
+                sup_dist = min((abs(lvl - price) for lvl in daily_sup), default=float('inf'))
+                if res_dist <= sup_dist:
+                    score = -0.6
+                    desc = 'at daily resistance'
+                else:
+                    score = 0.6
+                    desc = 'at daily support'
+            else:
+                score = 0.0
+                desc = 'no HTF level nearby'
+
+            return {
+                'score':              round(score, 3),
+                'description':        desc,
+                'nearest_resistance': nearest_res,
+                'nearest_support':    nearest_sup,
+                'at_weekly_level':    at_weekly,
+            }
+        except Exception:
+            log.exception("[STRUCTURE] DailyStructure.htf_signal error for %s", symbol)
+            return neutral
+
+
+# ---------------------------------------------------------------------------
+# HTF module-level singleton + helpers
+# ---------------------------------------------------------------------------
+
+_daily_structure: Optional[DailyStructure] = None
+_daily_structure_lock = threading.Lock()
+
+
+def _get_daily_structure() -> DailyStructure:
+    """Lazily create the module-level DailyStructure singleton (thread-safe)."""
+    global _daily_structure
+    if _daily_structure is None:
+        with _daily_structure_lock:
+            if _daily_structure is None:
+                _daily_structure = DailyStructure()
+    return _daily_structure
+
+
+def htf_signal(symbol: str, current_price: Optional[float] = None) -> dict:
+    """
+    Daily/weekly support-resistance scoring signal.
+
+    Returns:
+        {
+          'score':              float,   # see scale below
+          'description':        str,
+          'nearest_resistance': float|None,
+          'nearest_support':    float|None,
+          'at_weekly_level':    bool,
+        }
+
+    Score scale (weekly levels weighted 3x daily):
+        -1.5  at/approaching weekly resistance from below — strong ceiling
+        +1.5  at/approaching weekly support from above — strong floor
+        +1.0  broke above a weekly resistance — bullish
+        -0.6  at a daily resistance
+        +0.6  at a daily support
+         0.0  no HTF level nearby
+
+    Never raises — returns a neutral (score 0.0) dict on any failure.
+    """
+    try:
+        return _get_daily_structure().htf_signal(symbol, current_price)
+    except Exception:
+        log.exception("[STRUCTURE] htf_signal error for %s", symbol)
+        return {
+            'score':              0.0,
+            'description':        'no HTF level nearby',
+            'nearest_resistance': None,
+            'nearest_support':    None,
+            'at_weekly_level':    False,
+        }
+
+
+def htf_score_contrib(symbol: str, current_price: Optional[float] = None) -> float:
+    """
+    Convenience wrapper returning only the numeric HTF score contribution.
+    Returns 0.0 on any failure.
+    """
+    try:
+        return float(htf_signal(symbol, current_price).get('score', 0.0))
+    except Exception:
+        return 0.0

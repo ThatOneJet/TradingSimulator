@@ -1086,6 +1086,23 @@ def run_backtest_endpoint():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/backtest/walkforward', methods=['POST'])
+def run_walkforward_endpoint():
+    """Walk-forward validation — tests strategy robustness across rolling windows."""
+    body    = request.json or {}
+    symbol  = body.get('symbol', 'AAPL').upper()
+    start   = body.get('start', '2023-01-01')
+    end     = body.get('end',   '2024-12-31')
+    window  = int(body.get('window_days', 90))
+    step    = int(body.get('step_days', 30))
+    capital = float(body.get('capital', 100000))
+    try:
+        from backtester import run_walk_forward
+        return jsonify(run_walk_forward(symbol, start, end, window, step, capital))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/options/signal/<symbol>')
 def options_signal(symbol):
     """Get options trade recommendation for a symbol."""
@@ -3225,6 +3242,34 @@ def _ai_score_detailed(data: dict) -> dict:
     except Exception:
         pass
 
+    # ── Extended signal engines (Tier A–C) — each adds a small weighted nudge ──
+    # All wrapped individually so any one failing never breaks scoring.
+    _ext_price = price or 0
+    for _eng_name, _fn in (
+        ('volume_profile', lambda: __import__('volume_profile').score_contrib(symbol)),
+        ('sector_rotation', lambda: __import__('sector_rotation').score_contrib(symbol)),
+        ('correlation',     lambda: __import__('correlation_engine').score_contrib(symbol)),
+        ('intermarket',     lambda: __import__('intermarket').score_contrib(symbol)),
+        ('cot',             lambda: __import__('cot_engine').score_contrib(symbol)),
+        ('htf_sr',          lambda: __import__('structure_engine').htf_score_contrib(symbol, _ext_price)),
+        ('daily_pattern',   lambda: __import__('pattern_engine').daily_pattern_contrib(symbol)),
+        ('breadth_div',     lambda: __import__('breadth_engine').divergence_contrib()),
+        ('event',           lambda: __import__('news_engine').event_contrib(symbol)),
+        ('earnings_drift',  lambda: __import__('news_engine').drift_contrib(symbol)),
+        ('seasonality',     lambda: __import__('seasonality').score_contrib(symbol)),
+        ('short_interest',  lambda: __import__('short_interest').score_contrib(symbol, data)),
+        ('options_pcr',     lambda: __import__('options_engine').pcr_contrib(symbol, _ext_price)),
+    ):
+        try:
+            _c = float(_fn() or 0.0)
+            if _c != 0:
+                score += _c
+                breakdown[_eng_name] = {'contrib': round(_c, 2)}
+        except Exception:
+            pass
+
+    score = round(score, 2)
+
     # ── Uncertainty score ─────────────────────────────────────────────────────
     bull_count = sum(1 for k, v in breakdown.items()
                      if isinstance(v, dict) and v.get('contribution', 0) > 0)
@@ -4256,6 +4301,21 @@ def _ai_run_portfolio(pid: int) -> dict:
                 available -= alloc
             except Exception as e:
                 summary['errors'].append(f'open {c["symbol"]}: {e}')
+
+        # ── Manage open options positions (exit at profit target / DTE / stop) ──
+        try:
+            import options_strategy as _os_mod
+            _mgr = _os_mod.get_manager()
+            if _mgr:
+                _opt_result = _mgr.manage_open_positions(pid)
+                for _closed in _opt_result.get('closed', []):
+                    summary['sold'].append({
+                        'symbol': _closed.get('symbol', ''), 'price': 0,
+                        'score': 0, 'reason': f"options_{_closed.get('reason','exit')}",
+                        'market_state': 'options',
+                    })
+        except Exception:
+            pass
 
     except Exception as e:
         summary['errors'].append(f'portfolio error: {e}')

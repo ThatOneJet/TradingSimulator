@@ -496,6 +496,259 @@ class OptionsStrategyManager:
                     'positions': 0, 'warnings': []}
 
     # ------------------------------------------------------------------
+    # Execution layer — open/manage simulated options positions
+    # ------------------------------------------------------------------
+
+    def _get_db(self):
+        """Open a sqlite3 connection with row access by column name."""
+        import sqlite3
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @staticmethod
+    def _position_side(strategy: str) -> str:
+        """Map a strategy name to 'long' (debit) or 'short' (credit)."""
+        s = (strategy or '').lower()
+        # Credit / premium-selling strategies are net short.
+        if s in ('iron_condor', 'short_strangle', 'short_straddle',
+                 'credit_spread', 'short_put', 'short_call'):
+            return 'short'
+        # long_call / long_put / bull_spread / bear_spread (debit) buying.
+        return 'long'
+
+    def open_position(self, pid: int, evaluation: dict) -> dict | None:
+        """Open a simulated options position from an evaluate() recommendation.
+
+        Inserts a row into sim_options_positions. Position sizing and risk are
+        already enforced upstream in evaluate(); this only executes the trade.
+
+        Returns a summary dict for the opened position, or None when the
+        evaluation does not recommend a trade or insertion fails.
+        """
+        try:
+            if not evaluation or not evaluation.get('recommend'):
+                return None
+
+            contract = evaluation.get('contract') or {}
+            symbol   = contract.get('symbol')
+            if not symbol:
+                log.debug('open_position: evaluation has no contract symbol')
+                return None
+
+            strategy   = evaluation.get('strategy', 'none')
+            side       = self._position_side(strategy)
+            contracts  = int(evaluation.get('size_contracts') or 1)
+            if contracts <= 0:
+                return None
+
+            underlying  = (contract.get('underlying_symbol')
+                           or contract.get('root_symbol')
+                           or evaluation.get('symbol')
+                           or '')
+            entry_price = float(contract.get('mid') or 0.0)
+            strike      = float(contract.get('strike_price')
+                                or contract.get('strike') or 0.0)
+            expiry      = contract.get('expiration_date') or contract.get('expiry') or ''
+            dte_entry   = contract.get('dte')
+            try:
+                dte_entry = int(dte_entry) if dte_entry is not None else None
+            except (TypeError, ValueError):
+                dte_entry = None
+
+            iv_entry = contract.get('iv')
+            delta    = contract.get('delta')
+            gamma    = contract.get('gamma')
+            theta    = contract.get('theta')
+            vega     = contract.get('vega')
+
+            with self._get_db() as conn:
+                cur = conn.execute(
+                    '''INSERT INTO sim_options_positions
+                       (portfolio_id, underlying, symbol, strategy, side,
+                        contracts, entry_price, current_price,
+                        delta, gamma, theta, vega, iv_at_entry,
+                        strike, expiry, dte_at_entry, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (pid, underlying, symbol, strategy, side,
+                     contracts, entry_price, entry_price,
+                     delta, gamma, theta, vega, iv_entry,
+                     strike, expiry, dte_entry, 'open'),
+                )
+                new_id = cur.lastrowid
+
+            log.info('options open_position: %s %s x%d @ %.2f (%s) id=%s',
+                     side, symbol, contracts, entry_price, strategy, new_id)
+            return {
+                'id':          new_id,
+                'portfolio_id': pid,
+                'underlying':  underlying,
+                'symbol':      symbol,
+                'strategy':    strategy,
+                'side':        side,
+                'contracts':   contracts,
+                'entry_price': round(entry_price, 4),
+                'strike':      strike,
+                'expiry':      expiry,
+                'dte_at_entry': dte_entry,
+                'status':      'open',
+            }
+        except Exception as exc:
+            log.error('open_position error: %s', exc)
+            return None
+
+    def manage_open_positions(self, pid: int) -> dict:
+        """Re-price and evaluate every open options position for a portfolio.
+
+        For each open position: refresh current_price from the live chain
+        (falling back to a Black-Scholes theoretical price), recompute days to
+        expiry, and apply ExitManager rules. Triggered exits are closed with a
+        realized P&L and reason. Meant to run each scan cycle.
+
+        Returns {'checked': int, 'closed': [{'symbol', 'reason', 'pl'}, ...]}.
+        """
+        result = {'checked': 0, 'closed': []}
+        try:
+            with self._get_db() as conn:
+                rows = conn.execute(
+                    '''SELECT * FROM sim_options_positions
+                       WHERE portfolio_id=? AND status=?''',
+                    (pid, 'open'),
+                ).fetchall()
+        except Exception as exc:
+            log.error('manage_open_positions DB read error: %s', exc)
+            return result
+
+        try:
+            import options_engine as _oe
+            engine = _oe.get_engine()
+        except Exception as exc:
+            log.debug('manage_open_positions: options engine unavailable: %s', exc)
+            engine = None
+
+        for row in rows:
+            try:
+                result['checked'] += 1
+                pos = dict(row)
+                symbol      = pos.get('symbol')
+                entry_price = pos.get('entry_price') or 0.0
+
+                current_price = self._current_price(engine, pos)
+                dte_remaining = self._dte_remaining(pos)
+
+                exit_pos = {
+                    'entry_price':   entry_price,
+                    'side':          pos.get('side', 'long'),
+                    'strategy':      pos.get('strategy', ''),
+                    'dte_remaining': dte_remaining,
+                    'current_delta': pos.get('delta', 0.5),
+                    'entry_iv':      pos.get('iv_at_entry'),
+                }
+                should_exit, reason = self.exit_manager.should_exit(
+                    exit_pos, current_price)
+
+                if should_exit:
+                    realized_pl = (current_price - entry_price) * \
+                        (pos.get('contracts') or 1) * 100
+                    if pos.get('side') == 'short':
+                        realized_pl = -realized_pl
+                    realized_pl = round(realized_pl, 2)
+                    self._close_position(
+                        pos['id'], current_price, reason, realized_pl)
+                    result['closed'].append(
+                        {'symbol': symbol, 'reason': reason, 'pl': realized_pl})
+                    log.info('options exit: %s — %s (P&L %.2f)',
+                             symbol, reason, realized_pl)
+                else:
+                    self._update_price(pos['id'], current_price)
+            except Exception as pos_exc:
+                log.warning('manage_open_positions position error: %s', pos_exc)
+
+        return result
+
+    # -- execution helpers --------------------------------------------------
+
+    def _current_price(self, engine, pos: dict) -> float:
+        """Best-available current mid price for an open contract."""
+        entry_price = pos.get('entry_price') or 0.0
+        symbol      = pos.get('symbol')
+        if engine is None or not symbol:
+            return entry_price
+        try:
+            quote = engine.chain.get_quote(symbol)
+            if quote and quote.get('mid', 0) > 0:
+                return float(quote['mid'])
+        except Exception as exc:
+            log.debug('get_quote failed for %s: %s', symbol, exc)
+
+        # Fall back to a Black-Scholes theoretical price.
+        try:
+            import options_engine as _oe
+            from datetime import date
+            strike = float(pos.get('strike') or 0)
+            expiry = pos.get('expiry')
+            if strike > 0 and expiry:
+                exp = date.fromisoformat(str(expiry)[:10])
+                T   = max(0.001, (exp - date.today()).days / 365.0)
+                opt_type   = 'put' if 'put' in (pos.get('strategy') or '').lower() \
+                    else 'call'
+                # Positions are opened near-the-money, so approximate the
+                # underlying spot with the strike — avoids extra market-data
+                # calls while keeping the theoretical fallback sane.
+                S  = strike
+                iv = pos.get('iv_at_entry') or 0.30
+                r  = getattr(engine.chain, 'RISK_FREE_RATE', 0.045) \
+                    if engine else 0.045
+                price = _oe.bs_price(S, strike, T, r, iv or 0.30, opt_type)
+                if price > 0:
+                    return round(price, 4)
+        except Exception as exc:
+            log.debug('bs_price fallback failed for %s: %s', symbol, exc)
+        return entry_price
+
+    def _dte_remaining(self, pos: dict) -> int:
+        """Days to expiry from today, falling back to the entry DTE."""
+        try:
+            from datetime import date
+            expiry = pos.get('expiry')
+            if expiry:
+                exp = date.fromisoformat(str(expiry)[:10])
+                return max(0, (exp - date.today()).days)
+        except Exception:
+            pass
+        dte = pos.get('dte_at_entry')
+        try:
+            return int(dte) if dte is not None else 999
+        except (TypeError, ValueError):
+            return 999
+
+    def _update_price(self, pos_id: int, current_price: float):
+        """Persist the latest mark for an open position."""
+        try:
+            with self._get_db() as conn:
+                conn.execute(
+                    'UPDATE sim_options_positions SET current_price=? WHERE id=?',
+                    (round(float(current_price), 4), pos_id),
+                )
+        except Exception as exc:
+            log.debug('_update_price error for id=%s: %s', pos_id, exc)
+
+    def _close_position(self, pos_id: int, current_price: float,
+                        reason: str, realized_pl: float):
+        """Mark a position closed with realized P&L and exit reason."""
+        try:
+            with self._get_db() as conn:
+                conn.execute(
+                    '''UPDATE sim_options_positions
+                       SET status='closed', current_price=?, exit_reason=?,
+                           realized_pl=?, closed_at=datetime('now')
+                       WHERE id=?''',
+                    (round(float(current_price), 4), reason, realized_pl, pos_id),
+                )
+        except Exception as exc:
+            log.error('_close_position error for id=%s: %s', pos_id, exc)
+
+    # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
