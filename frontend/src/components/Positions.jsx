@@ -11,9 +11,86 @@ function getCategory(sym) {
 }
 
 const CATEGORY_META = {
-  crypto:   { label: 'Crypto', dot: '#4ad9ff', badge: '24/7' },
-  forex:    { label: 'Forex',  dot: '#a78bfa', badge: '24/7' },
-  equities: { label: 'Equities', dot: '#f59e0b', badge: 'Market Hours' },
+  crypto:   { label: 'Crypto',   dot: '#4ad9ff', badge: '24/7' },
+  forex:    { label: 'Forex',    dot: '#a78bfa', badge: '24/7' },
+  equities: { label: 'Equities', dot: '#f59e0b', badge: 'Mkt Hours' },
+}
+
+function fmt(n, d = 2) {
+  return Number(n).toFixed(d)
+}
+
+function PositionCard({ p, isReal, totalValue, onClose }) {
+  const isShort = p.side === 'short'
+  const absQty  = Math.abs(p.qty)
+  const mktVal  = absQty * p.current_price
+  const pct     = totalValue > 0 ? (mktVal / totalValue * 100) : 0
+  const plPos   = p.unrealized_pl >= 0
+  const plColor = plPos ? 'var(--ok)' : 'var(--err)'
+
+  return (
+    <div style={{
+      padding: '7px 0',
+      borderBottom: '1px solid rgba(140,170,220,0.06)',
+    }}>
+      {/* Row 1: symbol + allocation bar + close */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 700, color: isShort ? '#ff6a6a' : 'var(--t-1)', flexShrink: 0 }}>
+          {p.symbol}
+        </span>
+        {isShort && (
+          <span style={{
+            fontSize: 7, fontWeight: 700, color: '#ff476f',
+            border: '1px solid rgba(255,71,111,0.4)', borderRadius: 3,
+            padding: '1px 3px', lineHeight: 1.4, letterSpacing: '0.04em', flexShrink: 0,
+          }}>SHORT</span>
+        )}
+
+        {/* Allocation bar */}
+        {totalValue > 0 && (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+            <div style={{ flex: 1, height: 3, background: 'rgba(140,170,220,0.1)', borderRadius: 2 }}>
+              <div style={{
+                width: `${Math.min(100, pct * 3)}%`, height: '100%',
+                background: isShort ? '#ff6a6a' : '#4ad9ff',
+                borderRadius: 2, opacity: 0.7,
+              }} />
+            </div>
+            <span style={{ fontSize: 8.5, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', flexShrink: 0 }}>
+              {pct.toFixed(1)}%
+            </span>
+          </div>
+        )}
+
+        {!isReal && (
+          <button
+            className="close-btn"
+            onClick={onClose}
+            title={isShort ? 'Cover short' : 'Close position'}
+            style={{ flexShrink: 0, color: isShort ? '#ff476f' : undefined }}
+          >
+            {isShort ? '↑' : '✕'}
+          </button>
+        )}
+      </div>
+
+      {/* Row 2: qty · avg → price · P&L */}
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 9.5, color: 'var(--t-4)', fontFamily: 'var(--font-mono)' }}>
+          {isShort ? '-' : ''}{absQty}
+        </span>
+        <span style={{ fontSize: 9.5, color: 'var(--t-4)', fontFamily: 'var(--font-mono)' }}>
+          ${fmt(p.avg_entry_price)} → ${fmt(p.current_price)}
+        </span>
+        <span style={{ fontSize: 10, fontWeight: 700, color: plColor, fontFamily: 'var(--font-mono)', marginLeft: 'auto' }}>
+          {plPos ? '+' : ''}{fmt(p.unrealized_pl)}
+          <span style={{ fontSize: 8.5, fontWeight: 400, color: 'var(--t-4)', marginLeft: 3 }}>
+            ({plPos ? '+' : ''}{fmt(p.unrealized_plpc * 100)}%)
+          </span>
+        </span>
+      </div>
+    </div>
+  )
 }
 
 export default function Positions({ positions, onRefresh, portfolioId, totalValue }) {
@@ -22,81 +99,16 @@ export default function Positions({ positions, onRefresh, portfolioId, totalValu
   async function closePosition(symbol, qty, side) {
     try {
       const orderSide = side === 'short' ? 'cover' : 'sell'
-      const absQty    = Math.abs(qty)
-      await api.post('/orders', { symbol, qty: absQty, side: orderSide, type: 'market', portfolio_id: portfolioId || 1 })
+      await api.post('/orders', { symbol, qty: Math.abs(qty), side: orderSide, type: 'market', portfolio_id: portfolioId || 1 })
       setTimeout(onRefresh, 800)
     } catch {}
   }
 
   const shorts = positions.filter(p => p.side === 'short')
 
-  // Group by category, preserving sort within each group
   const groups = { crypto: [], forex: [], equities: [] }
   for (const p of positions) groups[getCategory(p.symbol)].push(p)
-
   const orderedGroups = ['crypto', 'forex', 'equities'].filter(g => groups[g].length > 0)
-
-  function PositionRow({ p }) {
-    const isShort = p.side === 'short'
-    const absQty  = Math.abs(p.qty)
-    const mktVal  = absQty * p.current_price
-    const pct     = totalValue > 0 ? (mktVal / totalValue * 100) : 0
-    const barW    = Math.min(100, pct * 4)
-
-    return (
-      <tr key={p.symbol + (isShort ? '-short' : '')}>
-        <td className="mono bold" style={{ paddingBottom: 6 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-            {p.symbol}
-            {isShort && (
-              <span style={{
-                fontSize: 7, fontWeight: 700, color: '#ff476f',
-                border: '1px solid rgba(255,71,111,0.4)', borderRadius: 3,
-                padding: '1px 3px', lineHeight: 1.4, letterSpacing: '0.04em',
-              }}>
-                SHORT
-              </span>
-            )}
-          </div>
-          {totalValue > 0 && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
-              <div style={{ width: 28, height: 2, background: 'rgba(140,170,220,0.12)', borderRadius: 1 }}>
-                <div style={{
-                  width: `${barW}%`, height: '100%',
-                  background: isShort ? '#ff6a6a' : '#4ad9ff',
-                  borderRadius: 1, opacity: 0.75,
-                }} />
-              </div>
-              <span style={{ fontSize: 8.5, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', letterSpacing: '0.02em' }}>
-                {pct.toFixed(1)}%
-              </span>
-            </div>
-          )}
-        </td>
-        <td className="mono" style={{ color: isShort ? '#ff6a6a' : undefined }}>
-          {isShort ? '-' : ''}{absQty}
-        </td>
-        <td className="mono muted">${Number(p.avg_entry_price).toFixed(2)}</td>
-        <td className="mono">${Number(p.current_price).toFixed(2)}</td>
-        <td className="mono" style={{ color: p.unrealized_pl >= 0 ? 'var(--ok)' : 'var(--err)', whiteSpace: 'nowrap' }}>
-          {p.unrealized_pl >= 0 ? '+' : ''}{Number(p.unrealized_pl).toFixed(2)}
-          <span className="muted"> ({(p.unrealized_plpc * 100).toFixed(2)}%)</span>
-        </td>
-        {!isReal && (
-          <td>
-            <button
-              className="close-btn"
-              onClick={() => closePosition(p.symbol, p.qty, p.side)}
-              title={isShort ? 'Cover short' : 'Close position'}
-              style={isShort ? { color: '#ff476f' } : undefined}
-            >
-              {isShort ? '↑' : '✕'}
-            </button>
-          </td>
-        )}
-      </tr>
-    )
-  }
 
   return (
     <div className="widget" style={{ padding: '12px 14px' }}>
@@ -113,46 +125,45 @@ export default function Positions({ positions, onRefresh, portfolioId, totalValu
       {positions.length === 0
         ? <div className="empty-state">{isReal ? 'No holdings tracked' : 'No open positions'}</div>
         : (
-          <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 300, width: '100%' }}>
+          <div style={{ overflowY: 'auto', maxHeight: 320, width: '100%' }}>
             {orderedGroups.map(cat => {
               const meta = CATEGORY_META[cat]
+              const is247 = cat !== 'equities'
               return (
                 <div key={cat}>
-                  {/* Category separator */}
+                  {/* Category header */}
                   <div style={{
                     display: 'flex', alignItems: 'center', gap: 6,
-                    padding: '6px 0 4px',
+                    padding: '8px 0 4px',
                     borderBottom: '1px solid rgba(140,170,220,0.08)',
                     marginBottom: 2,
                   }}>
                     <div style={{ width: 6, height: 6, borderRadius: '50%', background: meta.dot, flexShrink: 0 }} />
-                    <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--t-3)', letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+                    <span style={{ fontSize: 9.5, fontWeight: 700, color: 'var(--t-3)', letterSpacing: '0.07em', textTransform: 'uppercase' }}>
                       {meta.label}
                     </span>
                     <span style={{
-                      fontSize: 8.5, color: is24_7(groups[cat][0]?.symbol) ? '#4ade80' : '#f59e0b',
-                      background: is24_7(groups[cat][0]?.symbol) ? 'rgba(74,222,128,0.1)' : 'rgba(245,158,11,0.1)',
-                      border: `1px solid ${is24_7(groups[cat][0]?.symbol) ? 'rgba(74,222,128,0.25)' : 'rgba(245,158,11,0.25)'}`,
-                      borderRadius: 3, padding: '1px 4px', lineHeight: 1.5,
+                      fontSize: 8, color: is247 ? '#4ade80' : '#f59e0b',
+                      background: is247 ? 'rgba(74,222,128,0.1)' : 'rgba(245,158,11,0.1)',
+                      border: `1px solid ${is247 ? 'rgba(74,222,128,0.2)' : 'rgba(245,158,11,0.2)'}`,
+                      borderRadius: 3, padding: '1px 4px',
                     }}>
                       {meta.badge}
                     </span>
-                    <span style={{ fontSize: 9, color: 'var(--t-4)', marginLeft: 'auto' }}>
-                      {groups[cat].length} position{groups[cat].length !== 1 ? 's' : ''}
+                    <span style={{ fontSize: 8.5, color: 'var(--t-4)', marginLeft: 'auto' }}>
+                      {groups[cat].length}
                     </span>
                   </div>
 
-                  <table className="pos-table" style={{ minWidth: isReal ? 280 : 340, width: '100%', marginBottom: 4 }}>
-                    <thead>
-                      <tr>
-                        <th>Symbol</th><th>Qty</th><th>Avg</th><th>Price</th><th>P&L</th>
-                        {!isReal && <th />}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {groups[cat].map(p => <PositionRow key={p.symbol + (p.side === 'short' ? '-short' : '')} p={p} />)}
-                    </tbody>
-                  </table>
+                  {groups[cat].map(p => (
+                    <PositionCard
+                      key={p.symbol + (p.side === 'short' ? '-s' : '')}
+                      p={p}
+                      isReal={isReal}
+                      totalValue={totalValue}
+                      onClose={() => closePosition(p.symbol, p.qty, p.side)}
+                    />
+                  ))}
                 </div>
               )
             })}
