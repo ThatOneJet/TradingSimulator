@@ -66,10 +66,15 @@ function ScanModal({ run, onClose }) {
   const [batchOpen, setBatchOpen] = useState(false)
   if (!run) return null
 
-  const bought   = run.bought_json   || []
-  const sold     = run.sold_json     || []
-  const batch    = run.batch_json    || []
-  const skipped  = run.skipped_json  || []
+  const allBought = run.bought_json  || []
+  const allSold   = run.sold_json    || []
+  const batch     = run.batch_json   || []
+  const skipped   = run.skipped_json || []
+  // Split by type field (new) or fall back to treating all as buy/sell
+  const bought   = allBought.filter(b => !b.type || b.type === 'buy')
+  const shorted  = allBought.filter(b => b.type === 'short')
+  const sold     = allSold.filter(s => !s.type || s.type === 'sell')
+  const covered  = allSold.filter(s => s.type === 'cover')
 
   return (
     <div
@@ -113,9 +118,11 @@ function ScanModal({ run, onClose }) {
             {run.mode === 'crypto_forex' && <Chip label="CRYPTO/FX" color="#4ad9ff" />}
             {run.skip_reason === 'max_positions' && <Chip label="MAX POS" color="#f5b342" />}
             {run.skip_reason === 'low_cash'      && <Chip label="LOW CASH" color="#f5b342" />}
-            {bought.length  > 0 && <Chip label={`${bought.length} bought`}    color="#3ddc97" />}
-            {sold.length    > 0 && <Chip label={`${sold.length} sold`}       color="#ff476f" />}
-            {skipped.length > 0 && <Chip label={`${skipped.length} skipped`} color="#f5b342" />}
+            {bought.length   > 0 && <Chip label={`${bought.length} bought`}    color="#3ddc97" />}
+            {shorted.length  > 0 && <Chip label={`${shorted.length} shorted`}  color="#ff6a6a" />}
+            {sold.length     > 0 && <Chip label={`${sold.length} sold`}        color="#ff476f" />}
+            {covered.length  > 0 && <Chip label={`${covered.length} covered`}  color="#4ad9ff" />}
+            {skipped.length  > 0 && <Chip label={`${skipped.length} skipped`}  color="#f5b342" />}
             {run.error_count > 0 && <Chip label={`${run.error_count} no data`} color="#ff476f" />}
           </div>
           <button
@@ -220,8 +227,60 @@ function ScanModal({ run, onClose }) {
             </section>
           )}
 
+          {/* Shorted */}
+          {shorted.length > 0 && (
+            <section style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 9, fontWeight: 700, color: '#ff6a6a', letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 5 }}>
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#ff6a6a', display: 'inline-block' }} />
+                Shorted
+              </div>
+              {shorted.map((b, i) => {
+                const stCfg = MARKET_STATE_CFG[b.market_state] ?? MARKET_STATE_CFG.neutral
+                return (
+                  <div key={i} style={{ background: 'rgba(255,106,106,0.04)', border: '1px solid rgba(255,106,106,0.12)', borderRadius: 7, padding: '10px 12px', marginBottom: 8 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 }}>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13, fontWeight: 800, color: '#ff6a6a' }}>{b.symbol}</span>
+                      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                        <span style={{ fontSize: 8, fontFamily: 'var(--font-mono)', padding: '1px 5px', border: `1px solid ${stCfg.color}44`, borderRadius: 3, color: stCfg.color }}>{stCfg.label}</span>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 700, color: '#ff6a6a' }}>{f(b.score, 1)}</span>
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--t-3)', fontFamily: 'var(--font-mono)', marginBottom: b.summary ? 6 : 0 }}>${f(b.price)} × {f(b.shares, 4)}</div>
+                    {b.summary && <div style={{ fontSize: 9.5, color: 'var(--t-3)', lineHeight: 1.55, borderTop: '1px solid rgba(255,106,106,0.08)', paddingTop: 6, marginTop: 2 }}>{b.summary}</div>}
+                  </div>
+                )
+              })}
+            </section>
+          )}
+
+          {/* Covered */}
+          {covered.length > 0 && (
+            <section style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 9, fontWeight: 700, color: '#4ad9ff', letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 5 }}>
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#4ad9ff', display: 'inline-block' }} />
+                Covered
+              </div>
+              {covered.map((s, i) => {
+                const stCfg = MARKET_STATE_CFG[s.market_state] ?? MARKET_STATE_CFG.neutral
+                const reasonLabel = { cover_signal: 'Cover Signal', stop_loss: 'Stop Loss', take_profit: 'Take Profit' }[s.reason] ?? s.reason ?? '—'
+                return (
+                  <div key={i} style={{ background: 'rgba(74,217,255,0.04)', border: '1px solid rgba(74,217,255,0.12)', borderRadius: 7, padding: '10px 12px', marginBottom: 8 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 }}>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13, fontWeight: 800, color: '#4ad9ff' }}>{s.symbol}</span>
+                      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                        <span style={{ fontSize: 8, fontFamily: 'var(--font-mono)', padding: '1px 5px', border: `1px solid ${stCfg.color}44`, borderRadius: 3, color: stCfg.color }}>{stCfg.label}</span>
+                        <span style={{ fontSize: 8, fontFamily: 'var(--font-mono)', padding: '1px 5px', border: '1px solid rgba(74,217,255,0.3)', borderRadius: 3, color: '#4ad9ff' }}>{reasonLabel}</span>
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--t-3)', fontFamily: 'var(--font-mono)' }}>${f(s.price)}</div>
+                  </div>
+                )
+              })}
+            </section>
+          )}
+
           {/* No action */}
-          {bought.length === 0 && sold.length === 0 && (
+          {bought.length === 0 && shorted.length === 0 && sold.length === 0 && covered.length === 0 && (
             <div style={{ textAlign: 'center', padding: '12px 0 16px', color: 'var(--t-4)', fontSize: 11 }}>
               No trades executed this scan.
             </div>

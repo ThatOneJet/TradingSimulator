@@ -3979,7 +3979,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                             pass
                         summary['covered'].append({'symbol': sym, 'price': round(fill, 2),
                                                    'score': score, 'reason': reason,
-                                                   'market_state': detail['market_state']})
+                                                   'market_state': detail['market_state'],
+                                                   'type': 'cover'})
                         _ai_log_entry(pid, sym, 'COVER', score, fill, short_qty,
                                       f"{reason} | short closed | {detail['summary'][:80]}")
                 else:
@@ -4032,7 +4033,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                             pass
                         summary['sold'].append({'symbol': sym, 'price': round(fill, 2),
                                                 'score': score, 'reason': reason,
-                                                'market_state': detail['market_state']})
+                                                'market_state': detail['market_state'],
+                                                'type': 'sell'})
                         _ai_log_entry(pid, sym, 'SELL', score, fill, row['shares'],
                                       f"{reason} | {detail['summary'][:80]}")
                     # ── Bearish intelligence: gradual trim ────────────────────────
@@ -4360,6 +4362,7 @@ def _ai_run_portfolio(pid: int) -> dict:
                         'shares': round(shares, 4), 'score': c['score'],
                         'market_state': c['detail']['market_state'],
                         'summary': c['detail']['summary'][:100],
+                        'type': 'buy',
                     })
                     _ai_log_entry(pid, c['symbol'], 'BUY', c['score'], fill, shares,
                                   f"score {c['score']:+.1f} | {c['detail']['summary'][:80]}")
@@ -4371,6 +4374,7 @@ def _ai_run_portfolio(pid: int) -> dict:
                         'shares': round(shares, 4), 'score': c['score'],
                         'market_state': c['detail']['market_state'],
                         'summary': c['detail']['summary'][:100],
+                        'type': 'short',
                     })
                     _ai_log_entry(pid, c['symbol'], 'SHORT', c['score'], fill, shares,
                                   f"score {c['score']:+.1f} | bearish short | {c['detail']['summary'][:80]}")
