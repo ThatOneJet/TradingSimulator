@@ -1513,7 +1513,9 @@ def get_bars(symbol):
     tf_str = request.args.get('timeframe', '1Min')
     limit  = int(request.args.get('limit', 300))
     symbol = symbol.upper()
-    if not KEYS_SET:
+    # Always use yfinance for crypto, forex, and futures — Alpaca stock API rejects them
+    is_non_equity = (symbol.endswith('-USD') or symbol.endswith('=X') or symbol.endswith('=F'))
+    if not KEYS_SET or is_non_equity:
         try:
             return jsonify(_bars_yfinance(symbol, tf_str, limit))
         except Exception as e:
@@ -2576,7 +2578,7 @@ _AI_UNIVERSE = [
     # ── Crypto (spot) ─────────────────────────────────────────────────────────
     'BTC-USD','ETH-USD','SOL-USD','BNB-USD','XRP-USD',
     'ADA-USD','AVAX-USD','DOGE-USD','DOT-USD','LINK-USD',
-    'MATIC-USD','ATOM-USD','NEAR-USD','APT-USD',
+    'ATOM-USD','NEAR-USD',
     'OP-USD','ARB-USD','SUI-USD','INJ-USD',
     'AAVE-USD','UNI-USD','FTM-USD','ALGO-USD','HBAR-USD',
 ]
@@ -3474,16 +3476,24 @@ def _seed_daily_candles(symbols: list) -> None:
             df = yf.download(sym, period='90d', interval='1d', progress=False, auto_adjust=True)
             if df.empty:
                 continue
+            # Flatten MultiIndex columns if present (newer yfinance versions)
+            if hasattr(df.columns, 'levels'):
+                df.columns = df.columns.get_level_values(0)
             with _candle_engine._lock:
                 hist = _candle_engine._history[sym]['1d']
                 for ts, row in df.iterrows():
                     bar_ts = ts.timestamp() if hasattr(ts, 'timestamp') else float(ts)
-                    o = float(row.get('Open', row.iloc[0]))
-                    h = float(row.get('High', row.iloc[0]))
-                    l = float(row.get('Low',  row.iloc[0]))
-                    cl = float(row.get('Close', row.iloc[0]))
-                    v = float(row.get('Volume', 0) or 0)
-                    hist.append(_OHLCV(open=o, high=h, low=l, close=cl, volume=v, ts=bar_ts))
+                    def _scalar(v):
+                        if hasattr(v, 'item'): return float(v.item())
+                        if hasattr(v, 'iloc'): return float(v.iloc[0])
+                        return float(v) if v is not None else 0.0
+                    o  = _scalar(row.get('Open',  0))
+                    h  = _scalar(row.get('High',  0))
+                    l  = _scalar(row.get('Low',   0))
+                    cl = _scalar(row.get('Close', 0))
+                    v  = _scalar(row.get('Volume', 0))
+                    if cl > 0:
+                        hist.append(_OHLCV(open=o, high=h, low=l, close=cl, volume=v, ts=bar_ts))
             print(f'[SEED] {sym}: {len(df)} daily bars loaded')
         except Exception as e:
             print(f'[SEED] {sym} failed: {e}')

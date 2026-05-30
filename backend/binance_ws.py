@@ -150,7 +150,12 @@ class BinanceWS:
         self._sm.on_bar(bar)
 
     def _on_error(self, ws, error) -> None:
-        log.error("[BINANCE] WebSocket error: %s", error)
+        err_str = str(error)
+        if '451' in err_str or 'restricted location' in err_str:
+            # Geo-blocked (US restriction) — silent, failover handles crypto
+            self._stop.set()
+        else:
+            log.error("[BINANCE] WebSocket error: %s", error)
 
     def _on_close(self, ws, code, msg) -> None:
         log.debug("[BINANCE] Connection closed (code=%s)", code)

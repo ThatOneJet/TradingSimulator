@@ -69,7 +69,12 @@ async def _do_subscribe(symbol: str, on_bar, on_quote) -> None:
 def start_stream(api_key: str, secret_key: str, stream_manager: StreamManager) -> None:
     global _stream, _stream_manager, _loop
     _stream_manager = stream_manager
-    _stream = StockDataStream(api_key, secret_key, feed='iex')
+    try:
+        from alpaca.data.enums import DataFeed
+        _feed = DataFeed.IEX
+    except (ImportError, AttributeError):
+        _feed = 'iex'
+    _stream = StockDataStream(api_key, secret_key, feed=_feed)
 
     on_bar   = _make_bar_handler(stream_manager)
     on_quote = _make_quote_handler(stream_manager)
