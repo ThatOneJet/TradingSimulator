@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react'
 import api from '../api.js'
 
 const isCrypto = sym => sym.endsWith('-USD')
@@ -20,7 +21,124 @@ function fmt(n, d = 2) {
   return Number(n).toFixed(d)
 }
 
-function PositionCard({ p, isReal, totalValue, onClose }) {
+const STAGE_COLORS = ['#ff476f', '#f59e0b', '#4ad9ff', '#a78bfa', '#4ade80']
+const STAGE_LABELS = ['At Risk', 'Breakeven', 'Min Locked', 'Half Locked', 'Trailing']
+
+function ProtectionGuide({ prot, bearish }) {
+  const [open, setOpen] = useState(false)
+  if (!prot) return null
+
+  const stage     = prot.protection?.stage ?? 0
+  const label     = prot.protection?.label ?? 'at_risk'
+  const stopPrice = prot.protection?.new_stop ?? prot.stop_price
+  const gainPct   = prot.protection?.gain_pct ?? 0
+  const desc      = prot.protection?.description ?? ''
+  const nextLvl   = prot.protection?.next_level
+  const bScore    = bearish?.score ?? 0
+  const bLevel    = bearish?.level ?? 'safe'
+  const bDesc     = bearish?.description ?? ''
+  const bColor    = bScore < 3 ? '#4ade80' : bScore < 5 ? '#f59e0b' : bScore < 7 ? '#fb923c' : '#ff476f'
+  const stageColor = STAGE_COLORS[stage] ?? '#ff476f'
+
+  return (
+    <div style={{ marginTop: 2, marginBottom: 4 }}>
+      {/* Collapsed toggle row */}
+      <button
+        onClick={() => setOpen(o => !o)}
+        style={{
+          width: '100%', background: 'none', border: 'none', cursor: 'pointer',
+          display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0',
+          textAlign: 'left',
+        }}
+      >
+        {/* Stage pip strip */}
+        <div style={{ display: 'flex', gap: 3, alignItems: 'center' }}>
+          {[0,1,2,3,4].map(i => (
+            <div key={i} style={{
+              width: i <= stage ? 10 : 6, height: i <= stage ? 6 : 4,
+              borderRadius: 2,
+              background: i <= stage ? STAGE_COLORS[i] : 'rgba(140,170,220,0.15)',
+              transition: 'all 0.2s',
+            }} />
+          ))}
+        </div>
+        <span style={{ fontSize: 9, color: stageColor, fontWeight: 700, letterSpacing: '0.05em' }}>
+          {STAGE_LABELS[stage]}
+        </span>
+        {bScore >= 4 && (
+          <span style={{ fontSize: 8, color: bColor, marginLeft: 4 }}>
+            ⚠ {bLevel}
+          </span>
+        )}
+        <span style={{ fontSize: 8, color: 'var(--t-4)', marginLeft: 'auto' }}>
+          {open ? '▲' : '▼'}
+        </span>
+      </button>
+
+      {open && (
+        <div style={{
+          background: 'rgba(0,0,0,0.25)', borderRadius: 6,
+          border: `1px solid ${stageColor}22`,
+          padding: '8px 10px', marginTop: 3,
+        }}>
+          {/* Stage description */}
+          <div style={{ fontSize: 9.5, color: 'var(--t-2)', lineHeight: 1.6, marginBottom: 6 }}>
+            {desc}
+          </div>
+
+          {/* Stop level */}
+          {stopPrice && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+              <span style={{ fontSize: 9, color: 'var(--t-4)' }}>Stop level</span>
+              <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', fontWeight: 700, color: stageColor }}>
+                ${Number(stopPrice).toFixed(2)}
+                {stage >= 1 && <span style={{ fontSize: 8, color: 'var(--t-4)', fontWeight: 400, marginLeft: 4 }}>
+                  {stage === 1 ? '(breakeven)' : stage === 2 ? '(+0.5% min)' : '(gain locked)'}
+                </span>}
+              </span>
+            </div>
+          )}
+
+          {/* Next protection level */}
+          {nextLvl && (
+            <div style={{
+              fontSize: 8.5, color: '#4ad9ff', background: 'rgba(74,217,255,0.07)',
+              borderRadius: 4, padding: '3px 7px', marginBottom: 6,
+            }}>
+              Next: {nextLvl}
+            </div>
+          )}
+
+          {/* Bearish risk bar */}
+          {bScore > 0 && (
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                <span style={{ fontSize: 8.5, color: 'var(--t-4)' }}>Bearish risk</span>
+                <span style={{ fontSize: 8.5, color: bColor, fontWeight: 700 }}>
+                  {bScore.toFixed(1)}/10 · {bLevel}
+                </span>
+              </div>
+              <div style={{ height: 4, background: 'rgba(140,170,220,0.1)', borderRadius: 2 }}>
+                <div style={{
+                  width: `${bScore * 10}%`, height: '100%',
+                  background: bColor, borderRadius: 2,
+                  transition: 'width 0.4s',
+                }} />
+              </div>
+              {bDesc && (
+                <div style={{ fontSize: 8.5, color: 'var(--t-4)', marginTop: 3, lineHeight: 1.4 }}>
+                  {bDesc}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function PositionCard({ p, isReal, totalValue, onClose, protData }) {
   const isShort = p.side === 'short'
   const absQty  = Math.abs(p.qty)
   const mktVal  = absQty * p.current_price
@@ -89,12 +207,29 @@ function PositionCard({ p, isReal, totalValue, onClose }) {
           </span>
         </span>
       </div>
+
+      {/* Protection guide — sim portfolios only */}
+      {!isReal && protData && (
+        <ProtectionGuide prot={protData} bearish={protData.bearish} />
+      )}
     </div>
   )
 }
 
 export default function Positions({ positions, onRefresh, portfolioId, totalValue }) {
   const isReal = portfolioId === 0
+  const [protection, setProtection] = useState({})
+
+  useEffect(() => {
+    if (!portfolioId || portfolioId === 0) return
+    api.get(`/portfolios/${portfolioId}/positions/protection`)
+      .then(r => {
+        const map = {}
+        ;(r.data || []).forEach(p => { if (p.symbol) map[p.symbol] = p })
+        setProtection(map)
+      })
+      .catch(() => {})
+  }, [portfolioId, positions.length])
 
   async function closePosition(symbol, qty, side) {
     try {
@@ -162,6 +297,7 @@ export default function Positions({ positions, onRefresh, portfolioId, totalValu
                       isReal={isReal}
                       totalValue={totalValue}
                       onClose={() => closePosition(p.symbol, p.qty, p.side)}
+                      protData={protection[p.symbol]}
                     />
                   ))}
                 </div>

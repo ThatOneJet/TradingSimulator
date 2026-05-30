@@ -1188,6 +1188,50 @@ def portfolio_performance_endpoint(pid):
     })
 
 
+@app.route('/api/portfolios/<int:pid>/positions/protection')
+def positions_protection(pid):
+    """Protection status for each open position — stage, stop, bearish risk."""
+    try:
+        with _get_db() as conn:
+            rows = conn.execute(
+                'SELECT symbol, shares, avg_cost, stop_price FROM sim_positions WHERE portfolio_id=? AND shares!=0',
+                (pid,)
+            ).fetchall()
+
+        result = []
+        for row in rows:
+            sym   = row['symbol']
+            try:
+                data  = _compute_indicators_fast(sym)
+                price = data.get('last_price') or _get_current_price(sym)
+                atr   = data.get('atr') or (price * 0.02 if price else 0)
+
+                prot  = _protection_stage(row['avg_cost'], price, row['stop_price'], atr)
+
+                bearish_info = {}
+                try:
+                    import bearish_engine as _be
+                    bearish_info = _be.score(sym, data, row['avg_cost'], price)
+                except Exception:
+                    pass
+
+                result.append({
+                    'symbol':        sym,
+                    'shares':        row['shares'],
+                    'avg_cost':      row['avg_cost'],
+                    'current_price': price,
+                    'stop_price':    row['stop_price'],
+                    'protection':    prot,
+                    'bearish':       bearish_info,
+                })
+            except Exception as e:
+                result.append({'symbol': sym, 'error': str(e)})
+
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/analysis/<symbol>/structure')
 def symbol_structure_endpoint(symbol):
     """Market structure snapshot: swing bias, S/R levels, FVGs, session levels."""
@@ -2641,6 +2685,80 @@ def _regime_stop_multiplier(market_state: str) -> tuple[float, float]:
     return 1.5, 1.5        # default: symmetric stop and target
 
 
+def _protection_stage(avg_cost: float, current_price: float,
+                      stop_price: float | None, atr: float) -> dict:
+    """
+    Compute current profit-protection stage and recommended new stop level.
+
+    Stages:
+      0 at_risk:    < 0.5% gain — normal ATR stop, can lose money
+      1 breakeven:  >= 0.5% gain — stop moved to entry, can't lose
+      2 min_locked: >= 1.5% gain — stop at entry+0.5%, locking small gain
+      3 half_locked: >= 3% gain  — stop at entry + 50% of current gain
+      4 trailing:   >= 5% gain   — ATR trail above half-locked level
+
+    Stop NEVER moves down — only ratchets upward.
+    """
+    if avg_cost <= 0 or current_price <= 0:
+        return {'stage': 0, 'label': 'at_risk', 'new_stop': None,
+                'gain_pct': 0, 'description': 'No data'}
+
+    gain_pct  = (current_price - avg_cost) / avg_cost
+    atr_stop  = current_price - 1.5 * atr   # normal ATR trail level
+
+    if gain_pct >= 0.05:
+        # Stage 4: full ATR trailing, but never below half-locked level
+        half_locked = avg_cost + (current_price - avg_cost) * 0.5
+        new_stop = max(half_locked, atr_stop)
+        label    = 'trailing'
+        desc     = f'Trailing stop — locked in {gain_pct/2*100:.1f}% minimum gain'
+        next_lvl = None
+    elif gain_pct >= 0.03:
+        # Stage 3: lock 50% of current gain
+        new_stop = avg_cost + (current_price - avg_cost) * 0.5
+        label    = 'half_locked'
+        desc     = f'Half gain locked — stop at +{(new_stop/avg_cost-1)*100:.1f}% from entry'
+        next_lvl = f'+5% to full ATR trail'
+    elif gain_pct >= 0.015:
+        # Stage 2: lock minimum +0.5% gain
+        new_stop = avg_cost * 1.005
+        label    = 'min_locked'
+        desc     = f'Minimum gain locked (+0.5%) — stop above entry'
+        next_lvl = f'+3% to lock half the gain'
+    elif gain_pct >= 0.005:
+        # Stage 1: breakeven — stop at entry
+        new_stop = avg_cost
+        label    = 'breakeven'
+        desc     = 'Breakeven protected — cannot lose money on this trade'
+        next_lvl = f'+1.5% to lock minimum gain'
+    else:
+        # Stage 0: at risk — normal ATR stop below entry
+        new_stop = avg_cost - 1.5 * atr
+        label    = 'at_risk'
+        desc     = f'At risk — stop ${new_stop:.2f} ({gain_pct*100:+.1f}% from entry)'
+        next_lvl = f'+0.5% to move stop to breakeven'
+
+    # Never let stop go below entry once we've reached breakeven
+    if stop_price and stop_price >= avg_cost and new_stop < avg_cost:
+        new_stop = avg_cost
+
+    # Stops only ratchet upward — never move down
+    if stop_price:
+        new_stop = max(new_stop, stop_price)
+
+    stage_num = {'at_risk': 0, 'breakeven': 1, 'min_locked': 2,
+                 'half_locked': 3, 'trailing': 4}[label]
+
+    return {
+        'stage':     stage_num,
+        'label':     label,
+        'new_stop':  round(new_stop, 4) if new_stop else None,
+        'gain_pct':  round(gain_pct * 100, 2),
+        'description': desc,
+        'next_level': next_lvl if 'next_lvl' in dir() else None,
+    }
+
+
 def _adaptive_weights(market_state: str) -> dict:
     """Return per-indicator weight multipliers based on market state."""
     base = {'rsi': 1.0, 'macd': 1.0, 'stoch': 1.0, 'bb': 1.0, 'volume': 1.0,
@@ -3362,16 +3480,19 @@ def _ai_run_portfolio(pid: int) -> dict:
                         _ai_log_entry(pid, sym, 'COVER', score, fill, short_qty,
                                       f"{reason} | short closed | {detail['summary'][:80]}")
                 else:
-                    # ── Long position: sell on signal or stop ──────────────────────
+                    # ── Long position: profit-protection engine ────────────────────
                     stop_m, tgt_m = _regime_stop_multiplier(detail['market_state'])
-                    tgt    = row['avg_cost'] + tgt_m * atr
-                    new_stop     = price - stop_m * atr
-                    current_stop = row['stop_price'] if row['stop_price'] else (row['avg_cost'] - stop_m * atr)
-                    trailing     = max(current_stop, new_stop)
+                    prot = _protection_stage(row['avg_cost'], price,
+                                             row['stop_price'], atr)
+                    trailing = prot['new_stop'] or (row['avg_cost'] - stop_m * atr)
+                    tgt      = row['avg_cost'] + tgt_m * atr
+
+                    # Update stop if protection engine recommends higher level
+                    current_stop = row['stop_price'] or (row['avg_cost'] - stop_m * atr)
                     if trailing > current_stop:
                         with _get_db() as conn:
                             conn.execute('UPDATE sim_positions SET stop_price=? WHERE id=?',
-                                         (trailing, row['id']))
+                                         (round(trailing, 4), row['id']))
                     profit_pct = (price - row['avg_cost']) / row['avg_cost'] if row['avg_cost'] > 0 else 0
                     hit_profit_floor = profit_pct >= PROFIT_FLOOR
                     if tradeable and (score <= SELL_THRESH or price <= trailing or price >= tgt or hit_profit_floor):
@@ -3411,6 +3532,27 @@ def _ai_run_portfolio(pid: int) -> dict:
                                                 'market_state': detail['market_state']})
                         _ai_log_entry(pid, sym, 'SELL', score, fill, row['shares'],
                                       f"{reason} | {detail['summary'][:80]}")
+                    # ── Bearish intelligence: gradual trim ────────────────────────
+                    elif tradeable and not (score <= SELL_THRESH or price <= trailing or price >= tgt or hit_profit_floor):
+                        try:
+                            import bearish_engine as _be
+                            b_result = _be.score(sym, data, row['avg_cost'], price)
+                            trim_frac = _be.get_engine().trim_fraction(b_result['score'])
+                            if trim_frac > 0:
+                                trim_shares = round(row['shares'] * trim_frac, 4)
+                                if trim_shares >= 0.001:
+                                    fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0))
+                                    _sim_sell(sym, trim_shares, fill, pid)
+                                    summary['sold'].append({
+                                        'symbol': sym, 'price': round(fill, 2),
+                                        'score': score, 'reason': f'bearish_trim_{b_result["level"]}',
+                                        'market_state': detail['market_state'],
+                                        'trim_pct': int(trim_frac * 100),
+                                    })
+                                    _ai_log_entry(pid, sym, 'SELL', score, fill, trim_shares,
+                                                  f'bearish trim {int(trim_frac*100)}% | {b_result["description"][:60]}')
+                        except Exception:
+                            pass
             except Exception as e:
                 summary['errors'].append(f'exit {sym}: {e}')
 
