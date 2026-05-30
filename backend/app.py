@@ -3647,8 +3647,6 @@ def _ai_run_portfolio(pid: int) -> dict:
                     'qualifies_short': qualifies_short,
                     'confidence': confidence,
                 })
-                print(f'[AI]   {sym:12s} score={score:+.1f}  state={detail["market_state"]:16s}  '
-                      f'rsi={data.get("rsi",50):.0f}  macd={data.get("macd_cross","")}  trend={data.get("trend","")}')
                 if qualifies_long:
                     candidates.append({'symbol': sym, 'score': score, 'price': price,
                                        'atr': data.get('atr'), 'atr_pct': float(data.get('atr_pct', 2.0) or 2.0),
@@ -3667,7 +3665,6 @@ def _ai_run_portfolio(pid: int) -> dict:
                                        'anomaly_mult': data.get('_anomaly_mult', 1.0)})
             except Exception as e:
                 summary['errors'].append(f'scan {sym}: {e}')
-                print(f'[AI]   {sym:12s} ERROR: {e}')
                 batch_data.append({'symbol': sym, 'score': 0, 'price': 0,
                                    'market_state': 'neutral', 'rsi': 50,
                                    'trend': '—', 'qualifies': False,
