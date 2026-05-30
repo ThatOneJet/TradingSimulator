@@ -949,10 +949,26 @@ def portfolio_trades(pid):
     limit = int(request.args.get('limit', 200))
     try:
         with _get_db() as conn:
+            # Join sim_trades with ai_log to get reasoning for each trade
+            # Match on symbol + approximate time (within 10 seconds) + action mapping
             rows = conn.execute(
-                '''SELECT id, symbol, side, qty, price, realized_pl, created_at
-                   FROM sim_trades WHERE portfolio_id=?
-                   ORDER BY id DESC LIMIT ?''',
+                '''SELECT t.id, t.symbol, t.side, t.qty, t.price, t.realized_pl,
+                          t.created_at,
+                          l.reason, l.score as ai_score, l.market_state, l.strategy
+                   FROM sim_trades t
+                   LEFT JOIN ai_log l ON (
+                       l.portfolio_id = t.portfolio_id
+                       AND l.symbol = t.symbol
+                       AND ABS(strftime('%s', l.created_at) - strftime('%s', t.created_at)) <= 15
+                       AND (
+                           (t.side = 'buy'   AND l.action = 'BUY')   OR
+                           (t.side = 'sell'  AND l.action = 'SELL')  OR
+                           (t.side = 'short' AND l.action = 'SHORT') OR
+                           (t.side = 'cover' AND l.action = 'COVER')
+                       )
+                   )
+                   WHERE t.portfolio_id=?
+                   ORDER BY t.id DESC LIMIT ?''',
                 (pid, limit)
             ).fetchall()
 
@@ -962,9 +978,11 @@ def portfolio_trades(pid):
             if d.get('created_at') and not d['created_at'].endswith('Z'):
                 d['created_at'] += 'Z'
             is_close = d['side'] in ('sell', 'cover')
-            # Show P&L only on closing trades; opening trades are always 0
-            d['pl'] = round(d['realized_pl'], 4) if is_close else None
+            d['pl']      = round(d['realized_pl'], 4) if is_close else None
             d['is_open'] = not is_close
+            # Clean up reason text
+            if d.get('reason'):
+                d['reason'] = d['reason'].encode('utf-8', errors='replace').decode('utf-8')
             trades.append(d)
 
         # Summary stats

@@ -298,6 +298,78 @@ function ScanModal({ run, onClose }) {
   )
 }
 
+function TradeRow({ t, isClose, pl, plColor, sideColor, hasReason }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div style={{ borderBottom: '1px solid rgba(140,170,220,0.05)' }}>
+      {/* Main row */}
+      <div
+        onClick={() => hasReason && setOpen(o => !o)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          padding: '6px 0',
+          cursor: hasReason ? 'pointer' : 'default',
+        }}
+        onMouseEnter={e => { if (hasReason) e.currentTarget.style.background = 'rgba(140,170,220,0.04)' }}
+        onMouseLeave={e => { e.currentTarget.style.background = 'transparent' }}
+      >
+        <span style={{ fontSize: 8, fontWeight: 700, color: sideColor, fontFamily: 'var(--font-mono)', width: 36, flexShrink: 0, textTransform: 'uppercase' }}>
+          {t.side}
+        </span>
+        <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--t-1)', fontFamily: 'var(--font-mono)', width: 80, flexShrink: 0 }}>
+          {t.symbol}
+        </span>
+        <span style={{ fontSize: 9, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {Number(t.qty).toFixed(4)} @ ${Number(t.price).toFixed(4)}
+        </span>
+        <span style={{ fontSize: 10, fontWeight: 700, fontFamily: 'var(--font-mono)', color: isClose ? plColor : 'var(--t-4)', flexShrink: 0, width: 70, textAlign: 'right' }}>
+          {isClose ? `${pl >= 0 ? '+' : ''}$${pl?.toFixed(2)}` : '—'}
+        </span>
+        <span style={{ fontSize: 8, color: 'var(--t-4)', flexShrink: 0, width: 40, textAlign: 'right' }}>
+          {fmtTime(t.created_at)}
+        </span>
+        {hasReason && (
+          <span style={{ fontSize: 8, color: 'var(--t-4)', flexShrink: 0 }}>{open ? '▲' : '▼'}</span>
+        )}
+      </div>
+
+      {/* Expanded reasoning */}
+      {open && hasReason && (
+        <div style={{
+          margin: '0 0 8px 44px',
+          padding: '8px 10px',
+          background: 'rgba(0,0,0,0.2)',
+          borderRadius: 6,
+          border: `1px solid ${sideColor}22`,
+        }}>
+          {/* Score + regime + strategy */}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
+            {t.ai_score != null && (
+              <span style={{ fontSize: 8.5, fontFamily: 'var(--font-mono)', color: t.ai_score >= 0 ? 'var(--ok)' : 'var(--err)', fontWeight: 700 }}>
+                score {t.ai_score >= 0 ? '+' : ''}{Number(t.ai_score).toFixed(2)}
+              </span>
+            )}
+            {t.market_state && (
+              <span style={{ fontSize: 8, color: '#f5b342', background: 'rgba(245,179,66,0.1)', border: '1px solid rgba(245,179,66,0.25)', borderRadius: 3, padding: '1px 5px', fontFamily: 'var(--font-mono)' }}>
+                {t.market_state.replace(/_/g, ' ')}
+              </span>
+            )}
+            {t.strategy && (
+              <span style={{ fontSize: 8, color: '#4ad9ff', background: 'rgba(74,217,255,0.08)', border: '1px solid rgba(74,217,255,0.2)', borderRadius: 3, padding: '1px 5px', fontFamily: 'var(--font-mono)' }}>
+                {t.strategy}
+              </span>
+            )}
+          </div>
+          {/* Reasoning text */}
+          <div style={{ fontSize: 9.5, color: 'var(--t-2)', lineHeight: 1.65 }}>
+            {t.reason}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function Chip({ label, color }) {
   return (
     <span style={{
@@ -451,39 +523,18 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
                   </div>
                 )}
 
-                {/* Trade rows */}
+                {/* Trade rows — click to expand reasoning */}
                 {(tradeHist.trades || []).map((t, i) => {
-                  const isClose = !t.is_open
-                  const pl = t.pl
-                  const plColor = pl > 0 ? 'var(--ok)' : pl < 0 ? 'var(--err)' : 'var(--t-4)'
+                  const isClose   = !t.is_open
+                  const pl        = t.pl
+                  const plColor   = pl > 0 ? 'var(--ok)' : pl < 0 ? 'var(--err)' : 'var(--t-4)'
                   const sideColor = t.side === 'buy' ? '#3ddc97' : t.side === 'sell' ? '#ff476f'
-                               : t.side === 'short' ? '#ff6a6a' : '#4ad9ff' // cover
+                                  : t.side === 'short' ? '#ff6a6a' : '#4ad9ff'
+                  const hasReason = !!t.reason
                   return (
-                    <div key={t.id || i} style={{
-                      display: 'flex', alignItems: 'center', gap: 8,
-                      padding: '5px 0', borderBottom: '1px solid rgba(140,170,220,0.05)',
-                    }}>
-                      {/* Side badge */}
-                      <span style={{ fontSize: 8, fontWeight: 700, color: sideColor, fontFamily: 'var(--font-mono)', width: 36, flexShrink: 0, textTransform: 'uppercase' }}>
-                        {t.side}
-                      </span>
-                      {/* Symbol */}
-                      <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--t-1)', fontFamily: 'var(--font-mono)', width: 80, flexShrink: 0 }}>
-                        {t.symbol}
-                      </span>
-                      {/* Qty @ price */}
-                      <span style={{ fontSize: 9, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {Number(t.qty).toFixed(4)} @ ${Number(t.price).toFixed(4)}
-                      </span>
-                      {/* P&L */}
-                      <span style={{ fontSize: 10, fontWeight: 700, fontFamily: 'var(--font-mono)', color: isClose ? plColor : 'var(--t-4)', flexShrink: 0, width: 70, textAlign: 'right' }}>
-                        {isClose ? `${pl >= 0 ? '+' : ''}$${pl?.toFixed(2)}` : '—'}
-                      </span>
-                      {/* Time */}
-                      <span style={{ fontSize: 8, color: 'var(--t-4)', flexShrink: 0 }}>
-                        {fmtTime(t.created_at)}
-                      </span>
-                    </div>
+                    <TradeRow key={t.id || i}
+                      t={t} isClose={isClose} pl={pl} plColor={plColor}
+                      sideColor={sideColor} hasReason={hasReason} />
                   )
                 })}
               </>
