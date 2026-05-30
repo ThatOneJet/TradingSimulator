@@ -4556,7 +4556,6 @@ if __name__ == '__main__':
     threading.Thread(target=_load_ticker_db, daemon=True).start()
 
     # ── Real-time streaming infrastructure ──────────────────────────────────────
-    global _stream_manager, _candle_engine, _structure_engine, _portfolio_analytics, _perf_engine
     from event_bus import event_bus
     from stream_manager import StreamManager, CRYPTO_SYMBOLS
     from candle_engine import CandleEngine
