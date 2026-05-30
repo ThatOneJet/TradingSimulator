@@ -71,10 +71,12 @@ function ScanModal({ run, onClose }) {
   const batch     = run.batch_json   || []
   const skipped   = run.skipped_json || []
   // Split by type field (new) or fall back to treating all as buy/sell
-  const bought   = allBought.filter(b => !b.type || b.type === 'buy')
-  const shorted  = allBought.filter(b => b.type === 'short')
-  const sold     = allSold.filter(s => !s.type || s.type === 'sell')
-  const covered  = allSold.filter(s => s.type === 'cover')
+  // For new records: use explicit type field
+  // For old records without type: use score direction (negative score in bought_json = was a short)
+  const bought   = allBought.filter(b => b.type === 'buy'   || (!b.type && (b.score ?? 0) >= 0))
+  const shorted  = allBought.filter(b => b.type === 'short' || (!b.type && (b.score ?? 0) < 0))
+  const sold     = allSold.filter(s => s.type === 'sell'   || (!s.type && !(s.reason || '').toLowerCase().includes('cover')))
+  const covered  = allSold.filter(s => s.type === 'cover'  || (!s.type && (s.reason || '').toLowerCase().includes('cover')))
 
   return (
     <div
@@ -156,7 +158,7 @@ function ScanModal({ run, onClose }) {
                           border: `1px solid ${stCfg.color}44`, borderRadius: 3, color: stCfg.color,
                         }}>{stCfg.label}</span>
                         <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 700, color: '#3ddc97' }}>
-                          +{f(b.score, 1)}
+                          {(b.score ?? 0) >= 0 ? '+' : ''}{f(b.score, 1)}
                         </span>
                       </div>
                     </div>
