@@ -258,6 +258,8 @@ _price_cache: dict[str, tuple[float, float]] = {}
 _PRICE_TTL = 30
 _quote_cache: dict[str, tuple[dict, float]] = {}
 _QUOTE_TTL  = 60
+_earnings_cache: dict[str, tuple[int | None, float]] = {}  # {symbol: (days_to_earnings, ts)}
+EARNINGS_CACHE_TTL = 3600  # 1 hour
 _subscribed_symbols: set = set()
 _stream_manager    = None  # set in __main__ after StreamManager is instantiated
 _candle_engine     = None  # set in __main__ after CandleEngine is instantiated
@@ -881,6 +883,64 @@ def portfolio_analytics_endpoint(pid):
     prices = {p['symbol']: p['current_price'] for p in positions}
     result = _portfolio_analytics.compute(positions, prices)
     return jsonify(result)
+
+
+@app.route('/api/portfolios/<int:pid>/breakers')
+def portfolio_breakers(pid):
+    """Circuit breaker status for a portfolio."""
+    try:
+        import circuit_breakers as _cb_mod
+        cb = _cb_mod.get()
+        if cb is None:
+            return jsonify({'status': 'not_initialized'})
+        state = _sim_state(pid)
+        equity = state.get('last_equity') or state.get('cash') or 100000
+        state = _cb_mod.check(pid, equity)
+        return jsonify({
+            'state':            state,
+            'consec_losses':    cb._consec_losses.get(pid, 0),
+            'paused_until':     cb._pause_until.get(pid),
+            'disabled_combos':  list(cb._disabled_combos),
+            'hwm':              cb._hwm.get(pid),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/breadth')
+def market_breadth():
+    """Current market breadth snapshot."""
+    try:
+        import breadth_engine as _be
+        return jsonify(_be.latest())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sentiment/<symbol>')
+def symbol_news(symbol):
+    """News sentiment and event calendar for a symbol."""
+    try:
+        import news_engine as _ne
+        return jsonify(_ne.get_engine().get_signal(symbol.upper()))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/backtest', methods=['POST'])
+def run_backtest_endpoint():
+    """Run historical backtest for a symbol."""
+    body    = request.json or {}
+    symbol  = body.get('symbol', 'AAPL').upper()
+    start   = body.get('start', '2024-01-01')
+    end     = body.get('end',   '2024-12-31')
+    capital = float(body.get('capital', 100000))
+    try:
+        from backtester import run_backtest
+        result = run_backtest(symbol, start, end, capital)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/portfolios/<int:pid>/performance')
@@ -2371,6 +2431,18 @@ def _adaptive_weights(market_state: str) -> dict:
         return {**base, 'volume': 1.5, 'macd': 1.2, 'rsi': 0.8, 'trend': 0.7}
     if market_state == 'news_driven':
         return {**base, 'volume': 2.0, 'macd': 0.4, 'rsi': 0.3, 'stoch': 0.3, 'bb': 0.4}
+    # Blend in ML-learned weights if available (Tier 5)
+    try:
+        import model_trainer as _mt_mod
+        trainer = _mt_mod.get_trainer()
+        if trainer:
+            learned = trainer.get_weights(market_state)
+            # Blend: 70% rule-based + 30% ML-learned
+            for k in base:
+                if k in learned:
+                    base[k] = round(base[k] * 0.7 + learned[k] * 0.3, 3)
+    except Exception:
+        pass
     return base
 
 
@@ -2504,6 +2576,32 @@ def _ai_score_detailed(data: dict) -> dict:
     score = round(score, 2)
     breakdown['mtf'] = {'h1': mtf['h1'], 'm5': mtf['m5'], 'm1': mtf['m1'],
                         'bias': mtf['bias'], 'alignment': mtf['alignment']}
+
+    # ── Market breadth signal ─────────────────────────────────────────────────
+    try:
+        import breadth_engine as _be
+        breadth_contrib = _be.score_contrib()
+        if breadth_contrib != 0:
+            score += breadth_contrib * 0.5   # breadth is market-wide, weight 50%
+            breakdown['breadth'] = {'contrib': round(breadth_contrib * 0.5, 2),
+                                    'signal': _be.latest().get('signal', 'neutral')}
+    except Exception:
+        pass
+
+    # ── News sentiment signal ─────────────────────────────────────────────────
+    if symbol:
+        try:
+            import news_engine as _news
+            ns = _news.get_engine().get_signal(symbol)
+            news_sig = ns.get('signal', 0.0)
+            if news_sig != 0:
+                score += news_sig
+                breakdown['news'] = {'signal': round(news_sig, 2),
+                                     'sentiment': ns.get('sentiment_score', 0.5),
+                                     'earnings_risk': ns.get('earnings_risk', 'none'),
+                                     'economic_event': ns.get('economic_event')}
+        except Exception:
+            pass
 
     # ── Uncertainty score ─────────────────────────────────────────────────────
     bull_count = sum(1 for k, v in breakdown.items()
@@ -2841,6 +2939,36 @@ def _market_is_open() -> bool:
     return open_t <= now < close_t
 
 
+def _days_to_earnings(sym: str) -> int | None:
+    """Return days until next earnings, or None if unknown. Negative = days since last."""
+    if sym.endswith('-USD') or sym.endswith('=X') or sym.endswith('=F'):
+        return None  # no earnings for crypto/forex/futures
+    now_ts = _time.time()
+    if sym in _earnings_cache:
+        days, ts = _earnings_cache[sym]
+        if now_ts - ts < EARNINGS_CACHE_TTL:
+            return days
+    try:
+        import yfinance as yf
+        import datetime
+        dates = yf.Ticker(sym).earnings_dates
+        if dates is None or dates.empty:
+            _earnings_cache[sym] = (None, now_ts)
+            return None
+        now = datetime.datetime.now(datetime.timezone.utc)
+        future = [d for d in dates.index if d.to_pydatetime() > now]
+        if not future:
+            _earnings_cache[sym] = (None, now_ts)
+            return None
+        next_e = min(future)
+        delta = (next_e.to_pydatetime() - now).days
+        _earnings_cache[sym] = (delta, now_ts)
+        return delta
+    except Exception:
+        _earnings_cache[sym] = (None, now_ts)
+        return None
+
+
 def _session_size_factor(sym: str) -> float:
     """Return a position size multiplier (0.3–1.0) based on current session quality.
 
@@ -2849,13 +2977,22 @@ def _session_size_factor(sym: str) -> float:
     - Equity/Futures: full size during RTH, reduced pre/post market
     - Crypto: slight reduction during low-liquidity weekend overnight
     - All: reduced during known high-risk event windows (FOMC day approx, etc.)
+    Also reduces size around earnings events for equities.
     """
+    asset_class = _get_asset_class(sym)
+
+    # Earnings proximity check — overrides session timing for equities
+    if asset_class == 'equity':
+        dte = _days_to_earnings(sym)
+        if dte is not None:
+            if dte <= 1:  return 0.25   # earnings today/tomorrow — minimal size
+            if dte <= 2:  return 0.50
+            if dte <= 5:  return 0.75   # earnings week — reduced
+
     import datetime, zoneinfo
     now = datetime.datetime.now(zoneinfo.ZoneInfo('America/New_York'))
     hour = now.hour + now.minute / 60.0
     weekday = now.weekday()  # 0=Mon, 6=Sun
-
-    asset_class = _get_asset_class(sym)
 
     if asset_class == 'forex':
         # London open: 3AM ET, NY open: 8AM ET, overlap ends: 12PM ET, London close: 12PM ET
@@ -2952,6 +3089,16 @@ def _ai_run_portfolio(pid: int) -> dict:
                                   else 'take_profit')
                         fill = _apply_slippage(price, 'buy', atr, data.get('volume_ratio', 1.0))
                         _sim_cover(sym, short_qty, fill, pid)
+                        try:
+                            import circuit_breakers as _cb_mod
+                            _cb_mod.record_result(
+                                pid,
+                                profitable=(price <= entry_price),
+                                strategy=detail.get('strategy', ''),
+                                regime=detail.get('market_state', '')
+                            )
+                        except Exception:
+                            pass
                         summary['covered'].append({'symbol': sym, 'price': round(fill, 2),
                                                    'score': score, 'reason': reason,
                                                    'market_state': detail['market_state']})
@@ -2974,6 +3121,16 @@ def _ai_run_portfolio(pid: int) -> dict:
                                   else 'take_profit')
                         fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0))
                         _sim_sell(sym, row['shares'], fill, pid)
+                        try:
+                            import circuit_breakers as _cb_mod
+                            _cb_mod.record_result(
+                                pid,
+                                profitable=(price >= row['avg_cost']),
+                                strategy=detail.get('strategy', ''),
+                                regime=detail.get('market_state', '')
+                            )
+                        except Exception:
+                            pass
                         summary['sold'].append({'symbol': sym, 'price': round(fill, 2),
                                                 'score': score, 'reason': reason,
                                                 'market_state': detail['market_state']})
@@ -3036,6 +3193,16 @@ def _ai_run_portfolio(pid: int) -> dict:
                                        'trend': '—', 'qualifies': False,
                                        'qualifies_short': False, 'error': 'no_price'})
                     continue
+                # Anomaly detection — updates rolling history and flags outliers
+                try:
+                    import anomaly_detection as _ad
+                    anomaly = _ad.check_and_update(sym, data)
+                    data['_anomaly']      = anomaly['anomaly']
+                    data['_anomaly_mult'] = anomaly['size_mult']
+                    if anomaly['anomaly']:
+                        data['_anomaly_desc'] = anomaly['description']
+                except Exception:
+                    pass
                 detail = _ai_score_detailed(data)
                 score  = detail['score']
                 # Apply market-specific strategy adjustments
@@ -3070,13 +3237,17 @@ def _ai_run_portfolio(pid: int) -> dict:
                                        'atr': data.get('atr'), 'atr_pct': float(data.get('atr_pct', 2.0) or 2.0),
                                        'detail': detail,
                                        'volume_ratio': data.get('volume_ratio', 1.0),
-                                       'side': 'long', 'confidence': confidence})
+                                       'side': 'long', 'confidence': confidence,
+                                       'anomaly': data.get('_anomaly', False),
+                                       'anomaly_mult': data.get('_anomaly_mult', 1.0)})
                 elif qualifies_short:
                     candidates.append({'symbol': sym, 'score': score, 'price': price,
                                        'atr': data.get('atr'), 'atr_pct': float(data.get('atr_pct', 2.0) or 2.0),
                                        'detail': detail,
                                        'volume_ratio': data.get('volume_ratio', 1.0),
-                                       'side': 'short', 'confidence': confidence})
+                                       'side': 'short', 'confidence': confidence,
+                                       'anomaly': data.get('_anomaly', False),
+                                       'anomaly_mult': data.get('_anomaly_mult', 1.0)})
             except Exception as e:
                 summary['errors'].append(f'scan {sym}: {e}')
                 batch_data.append({'symbol': sym, 'score': 0, 'price': 0,
@@ -3173,6 +3344,28 @@ def _ai_run_portfolio(pid: int) -> dict:
             if conf < 35:
                 summary['errors'].append(f"skip {c['symbol']}: low confidence ({conf})")
                 continue
+
+            # ── Circuit breaker check ─────────────────────────────────────────
+            try:
+                import circuit_breakers as _cb_mod
+                breaker = _cb_mod.check(
+                    pid, equity,
+                    strategy=c.get('detail', {}).get('strategy', ''),
+                    regime=c.get('detail', {}).get('market_state', '')
+                )
+                if not breaker['allowed']:
+                    summary['errors'].append(
+                        f"skip {c['symbol']}: circuit breaker — {breaker['reason']}"
+                    )
+                    continue
+                position_value *= breaker['size_mult']
+            except Exception:
+                pass
+
+            # ── Anomaly size reduction ────────────────────────────────────────
+            anomaly_mult = c.get('anomaly_mult', 1.0)
+            if anomaly_mult < 1.0:
+                position_value *= anomaly_mult
 
             # ── Futures: convert to contracts with multiplier ─────────────────
             if asset_class == 'futures':
@@ -3748,6 +3941,22 @@ def get_analysis(symbol):
         data = _compute_indicators_fast(symbol.upper())
         data['symbol'] = symbol.upper()
         detail = _ai_score_detailed(data)
+
+        # Apply strategy engine
+        strategy_info = {}
+        try:
+            import strategy_engine as _se
+            se = _se.get_engine()
+            strat = se.score(symbol.upper(), data, detail['score'], detail.get('uncertainty', 0.3))
+            detail['score'] = strat['score']
+            strategy_info = {
+                'strategy':   strat['strategy'],
+                'confidence': strat['confidence'],
+                'rationale':  strat['rationale'],
+            }
+        except Exception:
+            pass
+
         return jsonify({
             'symbol':       symbol.upper(),
             'price':        data.get('last_price'),
@@ -3758,6 +3967,7 @@ def get_analysis(symbol):
             'summary':      detail['summary'],
             'what_changed': detail['what_changed'],
             'weights_used': detail['weights_used'],
+            'strategy':     strategy_info,
             'indicators': {
                 'rsi':          data.get('rsi'),
                 'macd_cross':   data.get('macd_cross'),
@@ -4076,6 +4286,35 @@ if __name__ == '__main__':
     _seed_symbols = list(set(CRYPTO_SYMBOLS) | {'SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'TSLA', 'META', 'GOOGL', 'AMZN', 'JPM'})
     threading.Thread(target=_seed_daily_candles, args=(_seed_symbols,), daemon=True).start()
     print(f'[TradeSimulator] Seeding daily candles for {len(_seed_symbols)} symbols in background...')
+
+    # ── Tier 3-5 module initialization ────────────────────────────────────────
+    try:
+        import breadth_engine as _breadth
+        _breadth.init(event_bus=event_bus)
+        print('[TradeSimulator] BreadthEngine started (31-stock basket, 5m poll).')
+    except Exception as e:
+        print(f'[TradeSimulator] BreadthEngine failed: {e}')
+
+    try:
+        import model_trainer as _mt
+        _mt.start_nightly_training(db_path=DB_PATH, pid=1)
+        print('[TradeSimulator] ModelTrainer nightly scheduler started.')
+    except Exception as e:
+        print(f'[TradeSimulator] ModelTrainer failed: {e}')
+
+    try:
+        import circuit_breakers as _cb
+        _cb.init(DB_PATH)
+        print('[TradeSimulator] CircuitBreakers initialized.')
+    except Exception as e:
+        print(f'[TradeSimulator] CircuitBreakers failed: {e}')
+
+    try:
+        import news_engine as _ne
+        _ne.get_engine()   # pre-warm singleton
+        print('[TradeSimulator] NewsEngine ready (Finnhub sentiment).')
+    except Exception as e:
+        print(f'[TradeSimulator] NewsEngine failed: {e}')
 
     # ── Structure Engine — market structure per symbol ─────────────────────────
     try:
