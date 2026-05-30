@@ -569,9 +569,13 @@ def _sim_positions_with_prices(portfolio_id: int = 1) -> list[dict]:
         avg      = row['avg_cost']
         is_short = qty < 0
         abs_qty  = abs(qty)
-        mv       = price * abs_qty
-        # Long P&L: (price - avg) * qty.  Short P&L: (avg - price) * abs_qty
-        upl      = (price - avg) * qty if not is_short else (avg - price) * abs_qty
+        # market_value: positive for longs, NEGATIVE for shorts.
+        # For equity = cash + sum(market_value):
+        #   cash already includes short proceeds received, so subtracting the
+        #   short market value gives the correct net equity (avoids double-counting).
+        mv       = price * abs_qty if not is_short else -(price * abs_qty)
+        # Long P&L: (price - avg) * abs_qty.  Short P&L: (avg - price) * abs_qty
+        upl      = (price - avg) * abs_qty if not is_short else (avg - price) * abs_qty
         out.append({
             'symbol':          row['symbol'],
             'qty':             qty,
