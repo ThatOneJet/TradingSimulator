@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from alpaca.data.live import StockDataStream
 from stream_manager import Bar, StreamManager, Tick, normalize_alpaca
 
@@ -37,8 +38,9 @@ def _make_quote_handler(sm: StreamManager):
         mid = (bid + ask) / 2 if bid and ask else bid or ask
         if not mid:
             return
+        normalized_symbol = normalize_alpaca(quote.symbol)
         tick = Tick(
-            symbol=normalize_alpaca(quote.symbol),
+            symbol=normalized_symbol,
             price=mid,
             size=float(quote.bid_size or 0),
             timestamp=quote.timestamp.timestamp(),
@@ -47,6 +49,21 @@ def _make_quote_handler(sm: StreamManager):
             ask=ask or None,
         )
         sm.on_tick(tick)
+
+        # Also publish a quote:{symbol} event so OrderFlowEngine receives data.
+        try:
+            bus = getattr(sm, '_bus', None)
+            if bus is not None:
+                bus.publish(f'quote:{normalized_symbol}', {
+                    'symbol':    normalized_symbol,
+                    'bid':       float(quote.bid_price or 0),
+                    'ask':       float(quote.ask_price or 0),
+                    'bid_size':  float(quote.bid_size or 0),
+                    'ask_size':  float(quote.ask_size or 0),
+                    'timestamp': time.time(),
+                })
+        except Exception as e:
+            log.debug('[ALPACA] order_flow quote publish failed: %s', e)
     return on_quote
 
 

@@ -1835,7 +1835,7 @@ def market_heatmap():
         import yfinance as yf
         bulk = yf.download(equity_syms, period='2d', interval='1d',
                            auto_adjust=True, progress=False, threads=True,
-                           group_by='ticker', timeout=25)
+                           group_by='ticker', timeout=12)
         for sym in equity_syms:
             try:
                 df = bulk[sym] if len(equity_syms) > 1 else bulk
@@ -1858,29 +1858,35 @@ def market_heatmap():
     except Exception:
         pass
 
-    for sym in crypto_syms:
-        try:
-            p = _get_current_price(sym)
-            if p: result['crypto'].append({'symbol': sym, 'chg_pct': 0,
-                                           'price': round(p, 4), 'weight': 10})
-        except Exception:
-            pass
-
-    for sym in forex_syms:
-        try:
-            p = _get_current_price(sym)
-            if p: result['forex'].append({'symbol': sym.replace('=X',''),
-                                          'chg_pct': 0, 'price': round(p, 5), 'weight': 5})
-        except Exception:
-            pass
-
-    for sym in futures_syms:
-        try:
-            p = _get_current_price(sym)
-            if p: result['futures'].append({'symbol': sym, 'chg_pct': 0,
-                                            'price': round(p, 2), 'weight': 8})
-        except Exception:
-            pass
+    # Crypto + Forex + Futures: bulk download for real change %
+    other_syms = crypto_syms + forex_syms + futures_syms
+    try:
+        import yfinance as yf
+        obulk = yf.download(other_syms, period='2d', interval='1d',
+                            auto_adjust=True, progress=False, threads=True,
+                            group_by='ticker', timeout=12)
+        for sym in other_syms:
+            try:
+                df = obulk[sym] if len(other_syms) > 1 else obulk
+                if df is None or df.empty or len(df) < 1:
+                    continue
+                if hasattr(df.columns, 'levels'):
+                    df.columns = df.columns.get_level_values(0)
+                closes = [float(x) for x in df['Close'].dropna()]
+                if not closes:
+                    continue
+                price = closes[-1]
+                chg = ((closes[-1] - closes[-2]) / closes[-2] * 100) if len(closes) >= 2 and closes[-2] else 0.0
+                if sym.endswith('-USD'):
+                    result['crypto'].append({'symbol': sym, 'chg_pct': round(chg,2), 'price': round(price,4), 'weight': 10})
+                elif sym.endswith('=X'):
+                    result['forex'].append({'symbol': sym.replace('=X',''), 'chg_pct': round(chg,3), 'price': round(price,5), 'weight': 5})
+                elif sym.endswith('=F'):
+                    result['futures'].append({'symbol': sym, 'chg_pct': round(chg,2), 'price': round(price,2), 'weight': 8})
+            except Exception:
+                continue
+    except Exception:
+        pass
 
     _HEATMAP_CACHE = (result, now)
     return jsonify(result)
@@ -2568,12 +2574,11 @@ _AI_UNIVERSE = [
     'AUDUSD=X','USDCAD=X','NZDUSD=X',
     'EURGBP=X','EURJPY=X','GBPJPY=X',
 
-    # ── Crypto (spot) ─────────────────────────────────────────────────────────
+    # ── Crypto (spot) — only tickers with reliable yfinance history ───────────
     'BTC-USD','ETH-USD','SOL-USD','BNB-USD','XRP-USD',
     'ADA-USD','AVAX-USD','DOGE-USD','DOT-USD','LINK-USD',
-    'ATOM-USD','NEAR-USD',
-    'OP-USD','ARB-USD','SUI-USD','INJ-USD',
-    'AAVE-USD','UNI-USD','FTM-USD','ALGO-USD','HBAR-USD',
+    'ATOM-USD','NEAR-USD','OP-USD','ARB-USD','INJ-USD',
+    'AAVE-USD','ALGO-USD','HBAR-USD',
 ]
 _AI_UNIVERSE = list(dict.fromkeys(_AI_UNIVERSE))  # deduplicate, preserve order
 
@@ -2598,11 +2603,18 @@ def _compute_indicators_fast(symbol: str) -> dict:
     Never returns a price_only dict if real historical data is obtainable.
     Handles all symbol types: equity, crypto (-USD), forex (=X), futures (=F).
     """
-    # ── 1. CandleEngine live data (streaming symbols) ──────────────────────────
+    # ── 1. CandleEngine live data (only if mature — enough bars for real indicators) ──
+    # A just-connected stream (e.g. Coinbase) has few closed 1m bars, so RSI/MACD
+    # return their neutral defaults (RSI=50). Require 30+ closed bars before trusting
+    # live data; otherwise fall through to yfinance daily history.
     if _candle_engine:
         ce = _candle_engine.latest(symbol, '1m')
         if ce and ce.get('last_price', 0) > 0:
-            return ce
+            try:
+                if len(_candle_engine.get_recent_closes(symbol, '1m', 30)) >= 30:
+                    return ce
+            except Exception:
+                pass
 
     # ── 2. Warm cache (full indicator dict, not a bulk prefetch stub) ──────────
     now = _time.time()
@@ -3038,6 +3050,11 @@ def _ai_score_detailed(data: dict) -> dict:
 
     market_state = _classify_market_state(data)
     weights = _adaptive_weights(market_state)
+
+    # Intraday boost: live 1m CandleEngine readings weight momentum/volume more
+    if data.get('_source') == 'candle_engine':
+        weights = {**weights, 'volume': weights['volume'] * 1.2,
+                   'macd': weights['macd'] * 1.2}
 
     # Trend gate: RSI/BB buy signals at 40% weight in confirmed downtrend
     trend_penalty = 0.4 if slope < -0.05 else 1.0
@@ -3691,6 +3708,64 @@ def _build_history_context(pid: int) -> dict:
         return default
 
 
+def _check_single_position_exit(pid: int, symbol: str, data: dict) -> None:
+    """Event-triggered exit check for a single held position (called on bar close)."""
+    try:
+        with _get_db() as conn:
+            row = conn.execute(
+                'SELECT id, symbol, shares, avg_cost, stop_price FROM sim_positions WHERE portfolio_id=? AND symbol=? AND shares!=0',
+                (pid, symbol)
+            ).fetchone()
+        if not row:
+            return
+        ATR_STOP_M = 1.5
+        SELL_THRESH = -1.8
+        COVER_THRESH = 1.0
+        PROFIT_FLOOR = 0.015
+        market_open = _market_is_open()
+        tradeable = market_open or _is_fractional_asset(symbol)
+        if not tradeable:
+            return
+        data['symbol'] = symbol
+        detail = _ai_score_detailed(data)
+        score  = detail['score']
+        price  = data.get('last_price') or _get_current_price(symbol)
+        if not price or price <= 0:
+            return
+        atr = data.get('atr') or (price * 0.02)
+        is_short = row['shares'] < 0
+        if is_short:
+            entry = row['avg_cost']
+            stop_m, tgt_m = _regime_stop_multiplier(detail['market_state'])
+            new_stop = price + stop_m * atr
+            cur_stop = row['stop_price'] if row['stop_price'] else entry + stop_m * atr
+            trail = min(cur_stop, new_stop)
+            tgt   = entry - tgt_m * atr
+            if score >= COVER_THRESH or price >= trail or price <= tgt:
+                reason = ('cover_signal' if score >= COVER_THRESH else 'stop_loss' if price >= trail else 'take_profit')
+                fill = _apply_slippage(price, 'buy', atr, data.get('volume_ratio', 1.0))
+                _sim_cover(symbol, abs(row['shares']), fill, pid)
+                _ai_log_entry(pid, symbol, 'COVER', score, fill, abs(row['shares']), f'{reason} (event) | {detail["summary"][:60]}')
+        else:
+            prot = _protection_stage(row['avg_cost'], price, row['stop_price'], atr)
+            trail = prot['new_stop'] or (row['avg_cost'] - ATR_STOP_M * atr)
+            cur_stop = row['stop_price'] or (row['avg_cost'] - ATR_STOP_M * atr)
+            if trail > cur_stop:
+                with _get_db() as conn:
+                    conn.execute('UPDATE sim_positions SET stop_price=? WHERE id=?', (round(trail,4), row['id']))
+            _, tgt_m = _regime_stop_multiplier(detail['market_state'])
+            tgt = row['avg_cost'] + tgt_m * atr
+            profit_pct = (price - row['avg_cost']) / row['avg_cost'] if row['avg_cost'] > 0 else 0
+            hit_floor = profit_pct >= PROFIT_FLOOR
+            if score <= SELL_THRESH or price <= trail or price >= tgt or hit_floor:
+                reason = ('sell_signal' if score <= SELL_THRESH else 'stop_loss' if price <= trail else 'profit_floor' if hit_floor else 'take_profit')
+                fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0))
+                _sim_sell(symbol, row['shares'], fill, pid)
+                _ai_log_entry(pid, symbol, 'SELL', score, fill, row['shares'], f'{reason} (event) | {detail["summary"][:60]}')
+    except Exception:
+        pass
+
+
 def _ai_run_portfolio(pid: int) -> dict:
     """One AI scan cycle: check existing positions, then scan a batch for buys."""
     MAX_POS      = 12   # raised from 8 — allow more concurrent positions
@@ -4208,7 +4283,7 @@ def _ai_run_portfolio(pid: int) -> dict:
 
 
 # ── AI background worker ───────────────────────────────────────────────────────
-_AI_INTERVAL = 90   # seconds between scans
+_AI_INTERVAL = 30   # seconds between scans
 
 def _ai_worker():
     """Daemon thread: scan all AI portfolios every _AI_INTERVAL seconds."""
@@ -5141,8 +5216,22 @@ if __name__ == '__main__':
             return
         try:
             data   = _compute_indicators_fast(symbol)
-            detail = _ai_score_detailed(data)
             _proj_cache[symbol] = (data, _time.time())
+        except Exception:
+            return
+        # Event-triggered exit check: if this symbol is held by any AI portfolio,
+        # check it for exit immediately (sub-2s reaction vs 30s timer)
+        try:
+            with _get_db() as conn:
+                holders = conn.execute(
+                    '''SELECT DISTINCT sp.portfolio_id
+                       FROM sim_positions sp
+                       JOIN portfolios p ON p.id = sp.portfolio_id
+                       WHERE sp.symbol=? AND sp.shares!=0 AND p.ai_controlled=1''',
+                    (symbol,)
+                ).fetchall()
+            for h in holders:
+                _check_single_position_exit(h['portfolio_id'], symbol, data)
         except Exception:
             pass
 
