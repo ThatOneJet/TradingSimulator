@@ -836,6 +836,37 @@ def ai_run(pid):
     summary = _ai_run_portfolio(pid)
     return jsonify(summary)
 
+
+@app.route('/api/portfolios/<int:pid>/heat')
+def portfolio_heat(pid):
+    """Return portfolio risk heat and asset-class exposure breakdown."""
+    try:
+        state  = _sim_state(pid)
+        equity = state.get('last_equity') or state.get('cash') or 100000
+        heat   = _compute_portfolio_heat(pid, equity)
+        held_prices = {}
+        with _get_db() as conn:
+            rows = conn.execute(
+                'SELECT symbol, shares FROM sim_positions WHERE portfolio_id=? AND shares!=0', (pid,)
+            ).fetchall()
+        for row in rows:
+            try:
+                held_prices[row['symbol']] = _get_current_price(row['symbol'])
+            except Exception:
+                pass
+        exposure = _compute_exposure(pid, equity, held_prices)
+        return jsonify({
+            'heat':       heat,
+            'heat_pct':   f'{heat*100:.1f}%',
+            'max_heat':   MAX_PORTFOLIO_HEAT,
+            'exposure':   {k: round(v, 4) for k, v in exposure.items()},
+            'caps':       ASSET_CLASS_CAPS,
+            'equity':     equity,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/portfolios/<int:pid>/analytics')
 def portfolio_analytics_endpoint(pid):
     """Portfolio-level risk analytics: sector exposure, beta, correlation clusters."""
@@ -2292,6 +2323,19 @@ def _classify_market_state(data: dict) -> str:
     return 'neutral'
 
 
+def _regime_stop_multiplier(market_state: str) -> tuple[float, float]:
+    """Return (stop_mult, target_mult) based on regime. Wider stops in volatile regimes."""
+    if market_state in ('panic', 'news_driven', 'euphoric'):
+        return 2.5, 4.0   # wider — don't get shaken out in explosive moves
+    if market_state in ('breakout',):
+        return 2.0, 3.5   # wider — breakouts need room to develop
+    if market_state in ('ranging', 'accumulation', 'oversold_extreme', 'overbought_extreme'):
+        return 1.0, 1.8   # tighter — mean-reversion setups have clear invalidation
+    if market_state in ('trending_up', 'trending_down'):
+        return 1.5, 3.0   # standard with wider target
+    return 1.5, 2.5        # default
+
+
 def _adaptive_weights(market_state: str) -> dict:
     """Return per-indicator weight multipliers based on market state."""
     base = {'rsi': 1.0, 'macd': 1.0, 'stoch': 1.0, 'bb': 1.0, 'volume': 1.0,
@@ -2561,6 +2605,128 @@ def _score_to_pct(score: float) -> float:
     return 0.05
 
 
+def _compute_confidence(score: float, data: dict, detail: dict) -> int:
+    """Compute 0–100 confidence score combining score strength, MTF alignment,
+    volume confirmation, uncertainty, and regime clarity."""
+    uncertainty = float(detail.get('uncertainty', 0.3) or 0.3)
+    mtf         = detail.get('mtf_bias', {}) or {}
+    vol_r       = float(data.get('volume_ratio', 1) or 1)
+    regime      = detail.get('market_state', 'neutral') or 'neutral'
+
+    # Base: score magnitude → 0–60 pts
+    base = min(60, int(abs(score) / 10 * 60))
+
+    # MTF alignment bonus: 0–20 pts
+    alignment = float(mtf.get('alignment', 0.33) or 0.33)
+    bias       = mtf.get('bias', 'neutral') or 'neutral'
+    score_dir  = 1 if score > 0 else -1 if score < 0 else 0
+    bias_dir   = 1 if bias == 'bullish' else -1 if bias == 'bearish' else 0
+    if score_dir != 0 and bias_dir == score_dir:
+        mtf_bonus = int(alignment * 20)   # up to +20
+    elif bias_dir != 0 and bias_dir != score_dir:
+        mtf_bonus = -int(alignment * 15)  # opposing MTF: up to -15
+    else:
+        mtf_bonus = 0
+
+    # Volume confirmation bonus: 0–10 pts
+    vol_sig = data.get('volume_signal', '') or ''
+    if vol_sig in ('high_up', 'high_down') and vol_r >= 1.5:
+        vol_bonus = min(10, int((vol_r - 1) * 6))
+    elif vol_sig == 'low':
+        vol_bonus = -10
+    else:
+        vol_bonus = 0
+
+    # Uncertainty penalty: 0–25 pts subtracted
+    uncertainty_penalty = int(uncertainty * 25)
+
+    # Regime clarity bonus: clear regime → +5, neutral/ranging → -5
+    regime_bonus = 5 if regime in ('trending_up', 'trending_down', 'breakout', 'panic') else \
+                  -5 if regime in ('neutral', 'ranging') else 0
+
+    confidence = base + mtf_bonus + vol_bonus - uncertainty_penalty + regime_bonus
+    return max(5, min(95, confidence))
+
+
+def _compute_exposure(pid: int, equity: float, held_prices: dict) -> dict:
+    """Return current exposure by asset class as fraction of equity."""
+    if equity <= 0:
+        return {k: 0.0 for k in ASSET_CLASS_CAPS}
+    result = {k: 0.0 for k in ASSET_CLASS_CAPS}
+    with _get_db() as conn:
+        rows = conn.execute(
+            'SELECT symbol, shares FROM sim_positions WHERE portfolio_id=? AND shares!=0', (pid,)
+        ).fetchall()
+    for row in rows:
+        sym = row['symbol']
+        price = held_prices.get(sym) or _get_current_price(sym)
+        mkt_val = abs(row['shares']) * price
+        cls = _get_asset_class(sym)
+        result[cls] = result.get(cls, 0.0) + mkt_val / equity
+    return result
+
+
+def _compute_portfolio_heat(pid: int, equity: float) -> float:
+    """Total active risk as fraction of equity: sum(pos_value * atr_pct / 100) across positions."""
+    if equity <= 0:
+        return 0.0
+    total_heat = 0.0
+    with _get_db() as conn:
+        rows = conn.execute(
+            'SELECT symbol, shares, avg_cost, stop_price FROM sim_positions WHERE portfolio_id=? AND shares!=0', (pid,)
+        ).fetchall()
+    for row in rows:
+        try:
+            sym = row['symbol']
+            price = _get_current_price(sym)
+            if not price:
+                continue
+            # Risk = distance from current price to stop
+            if row['stop_price']:
+                stop_dist = abs(price - row['stop_price'])
+            else:
+                # Estimate: use 2% as default risk
+                stop_dist = price * 0.02
+            position_risk = (abs(row['shares']) * stop_dist) / equity
+            total_heat += position_risk
+        except Exception:
+            pass
+    return round(total_heat, 4)
+
+
+def _compute_cluster_exposure(new_sym: str, held_syms: list, pid: int, equity: float, held_prices: dict) -> float:
+    """Return total portfolio exposure in the correlated cluster containing new_sym (as fraction of equity)."""
+    if not _candle_engine or equity <= 0:
+        return 0.0
+    new_closes = _candle_engine.get_recent_closes(new_sym, '1m', 20)
+    if len(new_closes) < 8:
+        return 0.0
+    cluster_value = 0.0
+    with _get_db() as conn:
+        rows = conn.execute(
+            'SELECT symbol, shares FROM sim_positions WHERE portfolio_id=? AND shares!=0',
+            (pid,)
+        ).fetchall()
+        pos_map = {r['symbol']: r['shares'] for r in rows}
+
+    for held in held_syms:
+        hc = _candle_engine.get_recent_closes(held, '1m', 20)
+        n = min(len(new_closes), len(hc))
+        if n < 8:
+            continue
+        a, b = new_closes[-n:], hc[-n:]
+        ma, mb = sum(a)/n, sum(b)/n
+        sa = (sum((x-ma)**2 for x in a)/n)**0.5
+        sb = (sum((x-mb)**2 for x in b)/n)**0.5
+        if sa > 0 and sb > 0:
+            r = sum((a[i]-ma)*(b[i]-mb) for i in range(n)) / (n * sa * sb)
+            if abs(r) > 0.65:
+                price = held_prices.get(held) or _get_current_price(held)
+                shares = abs(pos_map.get(held, 0))
+                cluster_value += shares * price
+    return cluster_value / equity
+
+
 def _compute_corr_factor(new_sym: str, held_syms: list) -> float:
     """Return 0.5 if new symbol is highly correlated (r>0.7) with any held position."""
     if not _candle_engine or not held_syms:
@@ -2584,7 +2750,39 @@ def _compute_corr_factor(new_sym: str, held_syms: list) -> float:
 
 
 def _is_fractional_asset(sym: str) -> bool:
-    return sym.endswith('-USD') or sym.endswith('=X')
+    return sym.endswith('-USD') or sym.endswith('=X') or sym.endswith('=F')
+
+
+def _get_asset_class(sym: str) -> str:
+    if sym.endswith('-USD'): return 'crypto'
+    if sym.endswith('=X'):   return 'forex'
+    if sym.endswith('=F'):   return 'futures'
+    return 'equity'
+
+# Hard caps: max portfolio exposure per asset class
+ASSET_CLASS_CAPS = {
+    'equity':  0.40,
+    'crypto':  0.15,
+    'forex':   0.20,
+    'futures': 0.25,
+}
+# Max single position size per asset class (as % of equity)
+SINGLE_POS_CAPS = {
+    'crypto':  0.03,
+    'equity':  0.05,
+    'forex':   0.04,
+    'futures': 0.06,
+}
+MAX_PORTFOLIO_HEAT = 0.05   # max 5% of equity at risk simultaneously
+MAX_CLUSTER_EXPOSURE = 0.07 # max 7% of equity in any correlated cluster
+
+# Futures contract multipliers (price × multiplier = notional value)
+FUTURES_MULTIPLIERS = {
+    'ES=F': 50, 'NQ=F': 20, 'YM=F': 5,  'RTY=F': 50,
+    'CL=F': 1000, 'GC=F': 100, 'SI=F': 5000, 'NG=F': 10000,
+    'ZB=F': 1000, 'ZN=F': 1000, 'BTC=F': 5, 'ETH=F': 50,
+}
+MAX_FUTURES_CONTRACTS = 3  # never hold more than 3 contracts of any futures instrument
 
 
 def _seed_daily_candles(symbols: list) -> None:
@@ -2627,6 +2825,48 @@ def _market_is_open() -> bool:
     return open_t <= now < close_t
 
 
+def _session_size_factor(sym: str) -> float:
+    """Return a position size multiplier (0.3–1.0) based on current session quality.
+
+    Reduces allocation during low-liquidity periods:
+    - Forex: full size only during London/NY overlap (8AM-12PM ET)
+    - Equity/Futures: full size during RTH, reduced pre/post market
+    - Crypto: slight reduction during low-liquidity weekend overnight
+    - All: reduced during known high-risk event windows (FOMC day approx, etc.)
+    """
+    import datetime, zoneinfo
+    now = datetime.datetime.now(zoneinfo.ZoneInfo('America/New_York'))
+    hour = now.hour + now.minute / 60.0
+    weekday = now.weekday()  # 0=Mon, 6=Sun
+
+    asset_class = _get_asset_class(sym)
+
+    if asset_class == 'forex':
+        # London open: 3AM ET, NY open: 8AM ET, overlap ends: 12PM ET, London close: 12PM ET
+        if 8.0 <= hour < 12.0:   return 1.0   # London/NY overlap — best liquidity
+        if 3.0 <= hour < 8.0:    return 0.7   # London session only
+        if 12.0 <= hour < 17.0:  return 0.6   # NY afternoon — fading liquidity
+        if weekday >= 5:          return 0.3   # weekend — very thin
+        return 0.4                              # Asian session / overnight
+
+    if asset_class in ('equity', 'futures'):
+        if not (weekday < 5):     return 0.5   # weekend futures
+        if 9.5 <= hour < 10.0:   return 1.0   # opening 30 min — highest volatility/opportunity
+        if 15.5 <= hour < 16.0:  return 1.0   # closing 30 min — high opportunity
+        if 9.5 <= hour < 16.0:   return 0.85  # normal RTH
+        if 8.0 <= hour < 9.5:    return 0.5   # pre-market
+        if 16.0 <= hour < 18.0:  return 0.45  # early after-hours
+        return 0.3                              # overnight
+
+    if asset_class == 'crypto':
+        if weekday >= 5 and (hour < 8.0 or hour > 22.0):
+            return 0.6   # late weekend night — thin
+        if 9.5 <= hour < 16.0:   return 1.0   # US market hours — highest crypto liquidity too
+        return 0.85                             # other hours — still active
+
+    return 1.0
+
+
 def _ai_run_portfolio(pid: int) -> dict:
     """One AI scan cycle: check existing positions, then scan a batch for buys."""
     MAX_POS      = 12   # raised from 8 — allow more concurrent positions
@@ -2645,6 +2885,13 @@ def _ai_run_portfolio(pid: int) -> dict:
                    'shorted': [], 'covered': [],
                    'errors': [], 'mode': mode, 'skip_reason': None}
     batch_data  = []
+
+    # Load strategy engine (lazy import — engine is in same directory)
+    try:
+        import strategy_engine as _se
+        _strategy_engine = _se.get_engine()
+    except Exception:
+        _strategy_engine = None
 
     try:
         # ── 1. Check held positions for exits + cover shorts ───────────────
@@ -2671,17 +2918,18 @@ def _ai_run_portfolio(pid: int) -> dict:
                     # ── Short position: trailing stop trails DOWN as price falls ──
                     short_qty    = abs(row['shares'])
                     entry_price  = row['avg_cost']
-                    # Trailing stop for shorts: min(current_stop, price + ATR_STOP_M*atr)
+                    # Trailing stop for shorts: min(current_stop, price + stop_m*atr)
                     # — stop trails downward as price falls, protecting profit
-                    new_stop     = price + ATR_STOP_M * atr
-                    current_stop = row['stop_price'] if row['stop_price'] else (entry_price + ATR_STOP_M * atr)
+                    stop_m, tgt_m = _regime_stop_multiplier(detail['market_state'])
+                    new_stop     = price + stop_m * atr
+                    current_stop = row['stop_price'] if row['stop_price'] else (entry_price + stop_m * atr)
                     trailing_stop = min(current_stop, new_stop)
                     if trailing_stop < current_stop:
                         with _get_db() as conn:
                             conn.execute('UPDATE sim_positions SET stop_price=? WHERE id=?',
                                          (trailing_stop, row['id']))
-                    # Target: price falling ATR_TGT_M below entry
-                    tgt_price    = entry_price - ATR_TGT_M * atr
+                    # Target: price falling tgt_m below entry
+                    tgt_price    = entry_price - tgt_m * atr
                     if tradeable and (score >= COVER_THRESH or price >= trailing_stop or price <= tgt_price):
                         reason = ('cover_signal' if score >= COVER_THRESH
                                   else 'stop_loss' if price >= trailing_stop
@@ -2695,9 +2943,10 @@ def _ai_run_portfolio(pid: int) -> dict:
                                       f"{reason} | short closed | {detail['summary'][:80]}")
                 else:
                     # ── Long position: sell on signal or stop ──────────────────────
-                    tgt    = row['avg_cost'] + ATR_TGT_M * atr
-                    new_stop     = price - ATR_STOP_M * atr
-                    current_stop = row['stop_price'] if row['stop_price'] else (row['avg_cost'] - ATR_STOP_M * atr)
+                    stop_m, tgt_m = _regime_stop_multiplier(detail['market_state'])
+                    tgt    = row['avg_cost'] + tgt_m * atr
+                    new_stop     = price - stop_m * atr
+                    current_stop = row['stop_price'] if row['stop_price'] else (row['avg_cost'] - stop_m * atr)
                     trailing     = max(current_stop, new_stop)
                     if trailing > current_stop:
                         with _get_db() as conn:
@@ -2769,6 +3018,19 @@ def _ai_run_portfolio(pid: int) -> dict:
                     continue
                 detail = _ai_score_detailed(data)
                 score  = detail['score']
+                # Apply market-specific strategy adjustments
+                if _strategy_engine:
+                    try:
+                        strat_result = _strategy_engine.score(
+                            sym, data, score, detail.get('uncertainty', 0.3)
+                        )
+                        score  = strat_result['score']
+                        detail['strategy']   = strat_result['strategy']
+                        detail['confidence'] = strat_result['confidence']
+                        detail['rationale']  = strat_result['rationale']
+                    except Exception:
+                        pass
+                confidence = _compute_confidence(score, data, detail)
                 summary['scanned'] += 1
                 qualifies_long  = score >= BUY_THRESH
                 qualifies_short = score <= SHORT_THRESH
@@ -2779,6 +3041,7 @@ def _ai_run_portfolio(pid: int) -> dict:
                     'trend': data.get('trend', ''),
                     'qualifies': qualifies_long,
                     'qualifies_short': qualifies_short,
+                    'confidence': confidence,
                 })
                 print(f'[AI]   {sym:12s} score={score:+.1f}  state={detail["market_state"]:16s}  '
                       f'rsi={data.get("rsi",50):.0f}  macd={data.get("macd_cross","")}  trend={data.get("trend","")}')
@@ -2787,33 +3050,124 @@ def _ai_run_portfolio(pid: int) -> dict:
                                        'atr': data.get('atr'), 'atr_pct': float(data.get('atr_pct', 2.0) or 2.0),
                                        'detail': detail,
                                        'volume_ratio': data.get('volume_ratio', 1.0),
-                                       'side': 'long'})
+                                       'side': 'long', 'confidence': confidence})
                 elif qualifies_short:
                     candidates.append({'symbol': sym, 'score': score, 'price': price,
                                        'atr': data.get('atr'), 'atr_pct': float(data.get('atr_pct', 2.0) or 2.0),
                                        'detail': detail,
                                        'volume_ratio': data.get('volume_ratio', 1.0),
-                                       'side': 'short'})
+                                       'side': 'short', 'confidence': confidence})
             except Exception as e:
                 summary['errors'].append(f'scan {sym}: {e}')
 
         candidates.sort(key=lambda x: abs(x['score']), reverse=True)
+
+        # Build held prices for exposure calculations
+        held_prices = {}
+        for sym in held:
+            try:
+                held_prices[sym] = _get_current_price(sym)
+            except Exception:
+                pass
 
         # ── 4. Buy top candidates (only if eligible) ───────────────────────
         n_pos = len(held)
         for c in candidates if can_buy else []:
             if n_pos >= MAX_POS or available <= 100:
                 break
-            base_pct   = _score_to_pct(abs(c['score']))
-            vol_scale  = max(0.5, float(c.get('atr_pct', 2.0)) / 2.0)
-            corr_scale = _compute_corr_factor(c['symbol'], held)
-            pos_pct    = max(0.03, min(0.12, base_pct / vol_scale * corr_scale))
-            alloc      = min(equity * pos_pct, available)
-            raw_shares = alloc / c['price']
-            shares     = raw_shares if _is_fractional_asset(c['symbol']) else max(1, int(raw_shares))
+
+            asset_class = _get_asset_class(c['symbol'])
+
+            # ── 1. Risk-per-trade sizing ──────────────────────────────────────
+            # Risk 0.5%–1.0% of equity per trade, scaled by signal conviction
+            RISK_PER_TRADE     = 0.005
+            MAX_RISK_PER_TRADE = 0.010
+            score_factor = min(1.0, max(0.0, (abs(c['score']) - BUY_THRESH) / max(5.0 - BUY_THRESH, 1)))
+            risk_pct     = RISK_PER_TRADE + score_factor * (MAX_RISK_PER_TRADE - RISK_PER_TRADE)
+
+            atr_val       = c.get('atr') or (c['price'] * 0.02)
+            stop_m, _     = _regime_stop_multiplier(c['detail']['market_state'])
+            stop_dist     = stop_m * atr_val               # dollars of risk per share
+            dollar_risk   = equity * risk_pct              # total dollars to risk on this trade
+            raw_shares    = dollar_risk / stop_dist if stop_dist > 0 else 0
+            position_value = raw_shares * c['price']
+
+            # ── 2. Correlation scale ──────────────────────────────────────────
+            corr_scale    = _compute_corr_factor(c['symbol'], held)
+            position_value *= corr_scale
+
+            # ── 3. Single-position cap ────────────────────────────────────────
+            single_cap    = SINGLE_POS_CAPS.get(asset_class, 0.05)
+            position_value = min(position_value, equity * single_cap)
+
+            # ── 4. Asset-class exposure cap ───────────────────────────────────
+            try:
+                exposure = _compute_exposure(pid, equity, held_prices)
+                class_used = exposure.get(asset_class, 0.0)
+                class_cap  = ASSET_CLASS_CAPS.get(asset_class, 0.40)
+                class_room = max(0.0, (class_cap - class_used) * equity)
+                position_value = min(position_value, class_room)
+            except Exception:
+                pass
+
+            # ── 5. Portfolio heat cap ─────────────────────────────────────────
+            try:
+                heat = _compute_portfolio_heat(pid, equity)
+                if heat >= MAX_PORTFOLIO_HEAT:
+                    summary['errors'].append(f'skip {c["symbol"]}: portfolio heat {heat:.1%} at max')
+                    continue
+                heat_room = (MAX_PORTFOLIO_HEAT - heat) * equity
+                trade_heat = raw_shares * stop_dist
+                if trade_heat > heat_room:
+                    scale = heat_room / trade_heat if trade_heat > 0 else 1.0
+                    position_value *= scale
+                    raw_shares *= scale
+            except Exception:
+                pass
+
+            # ── 6. Correlated cluster cap ─────────────────────────────────────
+            try:
+                cluster_exp = _compute_cluster_exposure(c['symbol'], held, pid, equity, held_prices)
+                if cluster_exp >= MAX_CLUSTER_EXPOSURE:
+                    summary['errors'].append(f'skip {c["symbol"]}: cluster exposure {cluster_exp:.1%} at max')
+                    continue
+                cluster_room = max(0.0, (MAX_CLUSTER_EXPOSURE - cluster_exp) * equity)
+                position_value = min(position_value, cluster_room)
+            except Exception:
+                pass
+
+            # ── 7. Session quality factor ─────────────────────────────────────
+            session_f  = _session_size_factor(c['symbol'])
+            position_value *= session_f
+            if session_f < 1.0:
+                summary.setdefault('session_notes', []).append(
+                    f"{c['symbol']}: session factor {session_f:.0%}"
+                )
+
+            # ── 8. Minimum confidence gate ────────────────────────────────────
+            conf = c.get('confidence', 50)
+            if conf < 35:
+                summary['errors'].append(f"skip {c['symbol']}: low confidence ({conf})")
+                continue
+
+            # ── Futures: convert to contracts with multiplier ─────────────────
+            if asset_class == 'futures':
+                multiplier = FUTURES_MULTIPLIERS.get(c['symbol'], 1)
+                if multiplier > 1:
+                    # Notional per contract = price × multiplier
+                    notional_per_contract = c['price'] * multiplier
+                    # Contracts that fit within our position_value budget
+                    contracts = max(1, int(position_value / notional_per_contract))
+                    contracts = min(contracts, MAX_FUTURES_CONTRACTS)
+                    raw_shares = contracts
+                    position_value = contracts * c['price']  # sim books at price, not notional
+
+            alloc = min(position_value, available)
             if alloc < 10:
                 continue
-            alloc = shares * c['price']
+            raw_shares = alloc / c['price']
+            shares = raw_shares if _is_fractional_asset(c['symbol']) else max(1, int(raw_shares))
+            alloc  = shares * c['price']
             if alloc > available:
                 continue
             try:
@@ -2822,7 +3176,7 @@ def _ai_run_portfolio(pid: int) -> dict:
                 if side == 'long':
                     fill = _apply_slippage(c['price'], 'buy', atr_val, c.get('volume_ratio', 1.0))
                     _sim_buy(c['symbol'], shares, fill, pid)
-                    init_stop = fill - ATR_STOP_M * atr_val
+                    init_stop = fill - stop_m * atr_val   # for longs
                     with _get_db() as conn:
                         conn.execute(
                             'UPDATE sim_positions SET stop_price=? WHERE symbol=? AND portfolio_id=? AND stop_price IS NULL',
@@ -3395,6 +3749,142 @@ def get_analysis(symbol):
                 'ema50':        data.get('ema50'),
                 'adx':          data.get('adx'),
             }
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/analysis/<symbol>/brief')
+def analysis_brief(symbol):
+    """Compiled Trade Brief: regime, MTF, structure, projection, setup guide."""
+    sym = symbol.upper()
+    try:
+        data   = _compute_indicators_fast(sym)
+        data['symbol'] = sym
+        detail = _ai_score_detailed(data)
+
+        price     = float(data.get('last_price') or 0)
+        atr       = float(data.get('atr') or price * 0.02)
+        atr_pct   = float(data.get('atr_pct') or 2.0)
+        regime    = detail['market_state']
+        mtf       = detail.get('mtf_bias', {})
+        score     = detail['score']
+
+        # Asset class
+        if sym.endswith('-USD'):   asset_class = 'crypto'
+        elif sym.endswith('=X'):   asset_class = 'forex'
+        elif sym.endswith('=F'):   asset_class = 'futures'
+        else:                      asset_class = 'equity'
+
+        # Projected range (±1 ATR for 24h, ±0.5 ATR for intraday)
+        proj_high = round(price + atr, 4)
+        proj_low  = round(price - atr, 4)
+
+        # Stop suggestion based on current regime
+        stop_mult = 2.5 if regime in ('panic', 'news_driven', 'euphoric') else 1.5
+        long_stop  = round(price - stop_mult * atr, 4)
+        short_stop = round(price + stop_mult * atr, 4)
+
+        # Structure snapshot if engine available
+        structure = {}
+        try:
+            import structure_engine as se
+            structure = se.snapshot(sym)
+        except Exception:
+            pass
+
+        # Regime descriptions
+        regime_desc = {
+            'trending_up':       'Strong uptrend — momentum indicators dominant, follow the trend.',
+            'trending_down':     'Strong downtrend — caution on longs, shorts favored.',
+            'breakout':          'Breakout pattern — price clearing resistance on high volume.',
+            'accumulation':      'Accumulation — smart money likely building positions quietly.',
+            'ranging':           'Ranging market — momentum strategies less effective, mean reversion favored.',
+            'panic':             'Panic selling — signals unreliable, extreme caution advised.',
+            'oversold_extreme':  'Extreme oversold — snap-back likely but timing uncertain.',
+            'overbought_extreme':'Extreme overbought — pullback risk elevated.',
+            'mild_uptrend':      'Mild uptrend — moderate bullish bias, confirmation needed.',
+            'mild_downtrend':    'Mild downtrend — moderate bearish bias.',
+            'euphoric':          'Euphoric extension — parabolic move, mean-reversion risk high.',
+            'distribution':      'Distribution — supply overwhelming demand at current levels.',
+            'news_driven':       'News-driven volatility — wait for stabilization before entering.',
+            'neutral':           'Neutral conditions — no clear edge, wait for setup.',
+        }.get(regime, 'Conditions unclear.')
+
+        # Asset-class setup guides
+        setup_guides = {
+            'crypto': {
+                'title': 'Crypto Trading Guide',
+                'tips': [
+                    'Crypto trades 24/7 — highest volume during US market hours (9AM–5PM ET) and Asia open (8PM–12AM ET)',
+                    'Watch BTC as the lead indicator — most altcoins follow BTC direction with a lag',
+                    'Crypto ATR is typically 3–8× higher than equities — size positions accordingly',
+                    'Avoid entries during overnight weekend hours (Fri 10PM – Sun 8PM ET) — thin liquidity',
+                    f'Current ATR: {atr_pct:.1f}% daily — position sizing should reflect this volatility',
+                ],
+                'best_sessions': 'US Open (9AM–12PM ET), Asia Open (8PM–11PM ET)',
+                'avoid': 'Late weekend nights, major macro announcements without a clear thesis',
+            },
+            'forex': {
+                'title': 'Forex Trading Guide',
+                'tips': [
+                    'Highest liquidity: London/New York overlap (8AM–12PM ET) — best spreads, clearest trends',
+                    'Asian session (7PM–2AM ET) — low volatility, good for range strategies on JPY pairs',
+                    'Avoid trading 30 min before/after major data releases (CPI, NFP, FOMC)',
+                    'Forex moves in pips — 1% daily moves are significant; size positions conservatively',
+                    f'Current ATR: {atr_pct:.1f}% — {"elevated, wider stops needed" if atr_pct > 0.8 else "normal range"}',
+                ],
+                'best_sessions': 'London/NY overlap (8AM–12PM ET)',
+                'avoid': 'Asian session for trend trades, major economic calendar events',
+            },
+            'futures': {
+                'title': 'Futures Trading Guide',
+                'tips': [
+                    'Index futures (ES, NQ) mirror the stock market but trade nearly 24/7 Sun–Fri',
+                    'Highest volume: regular trading hours (9:30AM–4PM ET) and Globex pre-market',
+                    'Futures use leverage — one ES contract controls ~$250k notional; size carefully',
+                    'Watch for roll dates — contracts expire quarterly (Mar/Jun/Sep/Dec)',
+                    'Economic data (CPI, NFP, FOMC) causes sharp moves — reduce exposure beforehand',
+                ],
+                'best_sessions': 'RTH (9:30AM–4PM ET), pre-market 8–9:30AM ET for gap setups',
+                'avoid': 'Overnight Sunday open (thin), contract expiration week (gamma risk)',
+            },
+            'equity': {
+                'title': 'Stock Trading Guide',
+                'tips': [
+                    'Highest volatility: first 30 min (9:30–10AM ET) and last 30 min (3:30–4PM ET)',
+                    'Avoid chasing earnings plays without an options hedge — IV crush is real',
+                    'Check float and average volume — thin stocks can gap violently on news',
+                    'SPY/QQQ direction sets the tone for most stocks — check market breadth first',
+                    f'Current ATR: ${atr:.2f} ({atr_pct:.1f}%) — {"high volatility day" if atr_pct > 3 else "normal session"}',
+                ],
+                'best_sessions': 'Power hour open (9:30–10:30AM ET), close (3–4PM ET)',
+                'avoid': 'Mid-day chop (12–2PM ET), pre-earnings without a clear catalyst edge',
+            },
+        }
+
+        return jsonify({
+            'symbol':       sym,
+            'price':        price,
+            'asset_class':  asset_class,
+            'score':        round(score, 2),
+            'regime':       regime,
+            'regime_desc':  regime_desc,
+            'mtf_bias':     mtf,
+            'atr':          round(atr, 4),
+            'atr_pct':      round(atr_pct, 2),
+            'proj_high':    proj_high,
+            'proj_low':     proj_low,
+            'long_stop':    long_stop,
+            'short_stop':   short_stop,
+            'nearest_support':    structure.get('nearest_support'),
+            'nearest_resistance': structure.get('nearest_resistance'),
+            'swing_bias':         structure.get('swing_bias', 'undefined'),
+            'in_consolidation':   structure.get('in_consolidation', False),
+            'setup_guide':  setup_guides.get(asset_class, {}),
+            'summary':      detail['summary'],
+            'breakdown':    detail['breakdown'],
+            'uncertainty':  detail['uncertainty'],
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500

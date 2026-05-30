@@ -685,7 +685,116 @@ function TradeGuide({ data, price }) {
 
 // ── Analysis Tab ───────────────────────────────────────────────────────────────
 
-function AnalysisTab({ data, price, symbol }) {
+const ASSET_COLORS = {
+  crypto:  { text: '#4ad9ff', bg: 'rgba(74,217,255,0.12)' },
+  forex:   { text: '#a78bfa', bg: 'rgba(167,139,250,0.12)' },
+  futures: { text: '#fb923c', bg: 'rgba(251,146,60,0.12)'  },
+  equity:  { text: '#f59e0b', bg: 'rgba(245,158,11,0.12)'  },
+}
+
+function ContextBar({ brief, price }) {
+  const [guideOpen, setGuideOpen] = useState(false)
+  if (!brief) return null
+  const ac    = brief.asset_class || 'equity'
+  const acCol = ASSET_COLORS[ac] || ASSET_COLORS.equity
+  const is247 = ac === 'crypto' || ac === 'forex'
+  const atr   = brief.atr || 0
+  const guide = brief.setup_guide || {}
+
+  return (
+    <div style={{ margin: '0 0 6px', padding: '10px 12px', background: 'rgba(0,0,0,0.25)', borderRadius: 6, border: '1px solid rgba(140,170,220,0.07)' }}>
+      {/* Row 1: asset class + session badge + stop levels */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.09em', textTransform: 'uppercase', color: acCol.text, background: acCol.bg, padding: '2px 7px', borderRadius: 4 }}>
+          {ac}
+        </span>
+        <span style={{ fontSize: 9, color: is247 ? '#4ade80' : '#f59e0b', background: is247 ? 'rgba(74,222,128,0.1)' : 'rgba(245,158,11,0.1)', border: `1px solid ${is247 ? 'rgba(74,222,128,0.2)' : 'rgba(245,158,11,0.2)'}`, borderRadius: 3, padding: '1px 5px' }}>
+          {is247 ? '24/7' : 'Market Hours'}
+        </span>
+        {atr > 0 && price > 0 && (
+          <span style={{ fontSize: 9, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', marginLeft: 'auto' }}>
+            ATR {brief.atr_pct?.toFixed(1)}%
+          </span>
+        )}
+      </div>
+
+      {/* Row 2: projected range + stops */}
+      {brief.proj_high && brief.proj_low && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 4, marginBottom: 8 }}>
+          {[
+            { label: '↑ Proj High', val: `$${Number(brief.proj_high).toFixed(2)}`, color: 'var(--ok)' },
+            { label: '↓ Proj Low',  val: `$${Number(brief.proj_low).toFixed(2)}`,  color: 'var(--err)' },
+            { label: 'Long Stop',   val: `$${Number(brief.long_stop).toFixed(2)}`,  color: '#ff6a6a' },
+            { label: 'Short Stop',  val: `$${Number(brief.short_stop).toFixed(2)}`, color: '#4ade80' },
+          ].map(({ label, val, color }) => (
+            <div key={label} style={{ background: 'rgba(140,170,220,0.04)', borderRadius: 4, padding: '5px 7px', textAlign: 'center' }}>
+              <div style={{ fontSize: 8, color: 'var(--t-4)', marginBottom: 2, letterSpacing: '0.04em' }}>{label}</div>
+              <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', fontWeight: 700, color }}>{val}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Row 3: S/R from structure engine if available */}
+      {(brief.nearest_support || brief.nearest_resistance) && (
+        <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+          {brief.nearest_support && (
+            <div style={{ flex: 1, fontSize: 9, color: 'var(--t-3)' }}>
+              <span style={{ color: 'var(--ok)', fontWeight: 700 }}>S </span>
+              <span style={{ fontFamily: 'var(--font-mono)' }}>${Number(brief.nearest_support).toFixed(2)}</span>
+            </div>
+          )}
+          {brief.nearest_resistance && (
+            <div style={{ flex: 1, fontSize: 9, color: 'var(--t-3)' }}>
+              <span style={{ color: 'var(--err)', fontWeight: 700 }}>R </span>
+              <span style={{ fontFamily: 'var(--font-mono)' }}>${Number(brief.nearest_resistance).toFixed(2)}</span>
+            </div>
+          )}
+          {brief.swing_bias && brief.swing_bias !== 'undefined' && (
+            <span style={{ fontSize: 9, color: brief.swing_bias === 'bullish' ? 'var(--ok)' : 'var(--err)', fontWeight: 600 }}>
+              {brief.swing_bias} structure
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Row 4: session guide toggle */}
+      {guide.title && (
+        <>
+          <button
+            onClick={() => setGuideOpen(o => !o)}
+            style={{ width: '100%', background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '3px 0', color: 'var(--t-3)', fontSize: 9, letterSpacing: '0.06em', textTransform: 'uppercase' }}
+          >
+            <span>{guide.title}</span>
+            <span style={{ fontSize: 10 }}>{guideOpen ? '▲' : '▼'}</span>
+          </button>
+          {guideOpen && (
+            <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid rgba(140,170,220,0.07)' }}>
+              {(guide.tips || []).map((tip, i) => (
+                <div key={i} style={{ display: 'flex', gap: 6, fontSize: 9.5, color: 'var(--t-3)', lineHeight: 1.55, marginBottom: 4 }}>
+                  <span style={{ color: acCol.text, flexShrink: 0 }}>›</span>
+                  <span>{tip}</span>
+                </div>
+              ))}
+              {guide.best_sessions && (
+                <div style={{ fontSize: 9, color: 'var(--ok)', marginTop: 4 }}>
+                  <span style={{ color: 'var(--t-4)' }}>Best: </span>{guide.best_sessions}
+                </div>
+              )}
+              {guide.avoid && (
+                <div style={{ fontSize: 9, color: 'var(--err)', marginTop: 2 }}>
+                  <span style={{ color: 'var(--t-4)' }}>Avoid: </span>{guide.avoid}
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+function AnalysisTab({ data, price, symbol, brief }) {
   if (!data) return <div className="ap-placeholder">Loading indicators…</div>
 
   const macdDiff   = (data.macd_value ?? 0) - (data.macd_signal_value ?? 0)
@@ -881,6 +990,7 @@ function AnalysisTab({ data, price, symbol }) {
 
   return (
     <div className="ap-content">
+      <ContextBar brief={brief} price={price} />
       <TabbedIndicatorCard momentumPages={momentumPages} contextPages={contextPages} />
       <div style={{ borderTop: '1px solid rgba(140,170,220,0.07)', marginTop: 2 }}>
         <AIThesisPanel data={data} price={price} symbol={symbol} />
@@ -1236,6 +1346,7 @@ export default function AnalysisPanel({ symbol, quote, delta }) {
   const [aiDetail,  setAiDetail] = useState(null)
   const [aiLoading, setAiLoading]= useState(false)
   const [aiError,   setAiError]  = useState(null)
+  const [brief,     setBrief]    = useState(null)
   const lastUpdRef = useRef(null)
   const refreshRef = useRef(null)
 
@@ -1272,6 +1383,16 @@ export default function AnalysisPanel({ symbol, quote, delta }) {
     doFetch()
     const id = setInterval(doFetch, 90_000)
     return () => { cancelled = true; clearInterval(id) }
+  }, [symbol])
+
+  // Brief fetch — asset class, stop levels, session guide, S/R from structure engine
+  useEffect(() => {
+    if (!symbol) return
+    let cancelled = false
+    api.get(`/analysis/${symbol}/brief`).then(r => {
+      if (!cancelled) setBrief(r.data)
+    }).catch(() => {})
+    return () => { cancelled = true }
   }, [symbol])
 
   useEffect(() => {
@@ -1378,7 +1499,7 @@ export default function AnalysisPanel({ symbol, quote, delta }) {
 
       <LiveQuoteBar quote={quote} extQuote={extQuote} secsAgo={secsAgo} />
 
-      {tab === 'analysis' && <AnalysisTab data={data} price={price} symbol={symbol} />}
+      {tab === 'analysis' && <AnalysisTab data={data} price={price} symbol={symbol} brief={brief} />}
       {tab === 'ai'       && <AIDecisionTab data={data} price={price} />}
       {tab === 'intel'    && <AIIntelTab detail={aiDetail} aiLoading={aiLoading} aiError={aiError} />}
 
