@@ -2629,16 +2629,16 @@ def _classify_market_state(data: dict) -> str:
 
 
 def _regime_stop_multiplier(market_state: str) -> tuple[float, float]:
-    """Return (stop_mult, target_mult) based on regime. Wider stops in volatile regimes."""
+    """Return (stop_mult, target_mult) based on regime."""
     if market_state in ('panic', 'news_driven', 'euphoric'):
-        return 2.5, 4.0   # wider — don't get shaken out in explosive moves
+        return 2.0, 2.0   # volatile — still take profit quickly
     if market_state in ('breakout',):
-        return 2.0, 3.5   # wider — breakouts need room to develop
+        return 1.5, 2.0   # breakouts: let it run a bit but don't overstay
     if market_state in ('ranging', 'accumulation', 'oversold_extreme', 'overbought_extreme'):
-        return 1.0, 1.8   # tighter — mean-reversion setups have clear invalidation
+        return 1.0, 1.2   # mean-reversion: tight target, take it fast
     if market_state in ('trending_up', 'trending_down'):
-        return 1.5, 3.0   # standard with wider target
-    return 1.5, 2.5        # default
+        return 1.5, 1.8   # trends: slightly wider target
+    return 1.5, 1.5        # default: symmetric stop and target
 
 
 def _adaptive_weights(market_state: str) -> dict:
@@ -3283,10 +3283,11 @@ def _ai_run_portfolio(pid: int) -> dict:
     ATR_STOP_M   = 1.5
     ATR_TGT_M    = 2.5
     BATCH_SIZE   = 30   # raised from 25 — scan more symbols per cycle
-    BUY_THRESH   = 2.5     # raised from 2.0 — require stronger conviction
-    SELL_THRESH  = -2.5    # raised from -2.0 — don't exit winners too early
+    BUY_THRESH   = 2.5     # require strong conviction to enter
+    SELL_THRESH  = -1.8    # exit sooner when signals turn bearish
     SHORT_THRESH = -3.0    # strong bearish signal required to open a short
     COVER_THRESH = 1.0     # close short when signal turns neutral/bullish
+    PROFIT_FLOOR = 0.015   # always sell if up >1.5% regardless of ATR target
 
     market_open = _market_is_open()
     mode        = 'full' if market_open else 'crypto_forex'
@@ -3371,9 +3372,12 @@ def _ai_run_portfolio(pid: int) -> dict:
                         with _get_db() as conn:
                             conn.execute('UPDATE sim_positions SET stop_price=? WHERE id=?',
                                          (trailing, row['id']))
-                    if tradeable and (score <= SELL_THRESH or price <= trailing or price >= tgt):
-                        reason = ('sell_signal' if score <= SELL_THRESH
-                                  else 'stop_loss' if price <= trailing
+                    profit_pct = (price - row['avg_cost']) / row['avg_cost'] if row['avg_cost'] > 0 else 0
+                    hit_profit_floor = profit_pct >= PROFIT_FLOOR
+                    if tradeable and (score <= SELL_THRESH or price <= trailing or price >= tgt or hit_profit_floor):
+                        reason = ('sell_signal'   if score <= SELL_THRESH
+                                  else 'stop_loss'    if price <= trailing
+                                  else 'profit_floor' if hit_profit_floor
                                   else 'take_profit')
                         fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0))
                         _sim_sell(sym, row['shares'], fill, pid)
