@@ -1534,13 +1534,11 @@ def get_bars(symbol):
     tf_str = request.args.get('timeframe', '1Min')
     limit  = int(request.args.get('limit', 300))
     symbol = symbol.upper()
-    # Always use yfinance for crypto, forex, and futures — Alpaca stock API rejects them
-    is_non_equity = (symbol.endswith('-USD') or symbol.endswith('=X') or symbol.endswith('=F'))
-    if not KEYS_SET or is_non_equity:
-        try:
-            return jsonify(_bars_yfinance(symbol, tf_str, limit))
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
+    # Use yfinance for all symbols — Alpaca IEX feed has data gaps and enum issues
+    try:
+        return jsonify(_bars_yfinance(symbol, tf_str, limit))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
     tf_map = {
         '1Min':  TimeFrame(1,  TimeFrameUnit.Minute),
         '5Min':  TimeFrame(5,  TimeFrameUnit.Minute),
