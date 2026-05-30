@@ -12,6 +12,33 @@ DIST_DIR     = os.path.join(FRONTEND_DIR, 'dist')
 FLASK_PORT   = 8765
 
 
+# ── Kill any existing process on the Flask port ──────────────────────────────
+
+def kill_port(port):
+    """Kill any process currently holding port (Windows only)."""
+    try:
+        out = subprocess.check_output(
+            f'netstat -ano | findstr :{port}', shell=True, encoding='utf-8', stderr=subprocess.DEVNULL
+        )
+        pids = set()
+        for line in out.splitlines():
+            if 'LISTENING' in line:
+                parts = line.strip().split()
+                if parts:
+                    pids.add(parts[-1])
+        for pid in pids:
+            try:
+                subprocess.run(f'taskkill /F /T /PID {pid}', shell=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print(f'[TradeSimulator] Killed old backend process (PID {pid}).')
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+kill_port(FLASK_PORT)
+
+
 # ── Build frontend if dist/ is missing ───────────────────────────────────────
 
 def build_frontend():
