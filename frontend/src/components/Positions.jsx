@@ -24,7 +24,7 @@ function fmt(n, d = 2) {
 const STAGE_COLORS = ['#ff476f', '#f59e0b', '#4ad9ff', '#a78bfa', '#4ade80']
 const STAGE_LABELS = ['At Risk', 'Breakeven', 'Min Locked', 'Half Locked', 'Trailing']
 
-function ProtectionGuide({ prot, bearish }) {
+function ProtectionGuide({ prot, bearish, isShort }) {
   const [open, setOpen] = useState(false)
   if (!prot) return null
 
@@ -40,6 +40,12 @@ function ProtectionGuide({ prot, bearish }) {
   const bColor    = bScore < 3 ? '#4ade80' : bScore < 5 ? '#f59e0b' : bScore < 7 ? '#fb923c' : '#ff476f'
   const stageColor = STAGE_COLORS[stage] ?? '#ff476f'
 
+  // For shorts: bearish signal is GOOD (position working in our favour), don't warn
+  // Only show bearish warning on long positions
+  const showBearishWarn = bScore >= 4 && !isShort
+
+  // Don't render anything at stage 0 (At Risk) when collapsed — just show a subtle
+  // "monitoring" line so it's not overwhelming. Only expand on click.
   return (
     <div style={{ marginTop: 2, marginBottom: 4 }}>
       {/* Collapsed toggle row */}
@@ -62,10 +68,10 @@ function ProtectionGuide({ prot, bearish }) {
             }} />
           ))}
         </div>
-        <span style={{ fontSize: 9, color: stageColor, fontWeight: 700, letterSpacing: '0.05em' }}>
-          {STAGE_LABELS[stage]}
+        <span style={{ fontSize: 9, color: stage === 0 ? 'var(--t-4)' : stageColor, fontWeight: stage === 0 ? 400 : 700, letterSpacing: '0.05em' }}>
+          {stage === 0 ? 'monitoring' : STAGE_LABELS[stage]}
         </span>
-        {bScore >= 4 && (
+        {showBearishWarn && (
           <span style={{ fontSize: 8, color: bColor, marginLeft: 4 }}>
             ⚠ {bLevel}
           </span>
@@ -201,16 +207,16 @@ function PositionCard({ p, isReal, totalValue, onClose, protData }) {
           ${fmt(p.avg_entry_price)} → ${fmt(p.current_price)}
         </span>
         <span style={{ fontSize: 10, fontWeight: 700, color: plColor, fontFamily: 'var(--font-mono)', marginLeft: 'auto' }}>
-          {plPos ? '+' : ''}{fmt(p.unrealized_pl)}
+          {plPos ? '+' : ''}{Number(p.unrealized_pl).toFixed(2)}
           <span style={{ fontSize: 8.5, fontWeight: 400, color: 'var(--t-4)', marginLeft: 3 }}>
-            ({plPos ? '+' : ''}{fmt(p.unrealized_plpc * 100)}%)
+            ({plPos ? '+' : ''}{(Number(p.unrealized_plpc) * 100).toFixed(2)}%)
           </span>
         </span>
       </div>
 
       {/* Protection guide — sim portfolios only */}
       {!isReal && protData && (
-        <ProtectionGuide prot={protData} bearish={protData.bearish} />
+        <ProtectionGuide prot={protData} bearish={protData.bearish} isShort={isShort} />
       )}
     </div>
   )
