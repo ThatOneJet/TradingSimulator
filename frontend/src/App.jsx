@@ -124,6 +124,12 @@ export default function App() {
       ? ((Number(delta.bid) + Number(delta.ask || delta.bid)) / 2).toFixed(2)
       : null
   const priceDelayed = !quote && delta?.delayed
+  // Market is closed if it's a weekend or outside 9:30-16:00 ET
+  const _nowET = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }))
+  const _isWeekend = _nowET.getDay() === 0 || _nowET.getDay() === 6
+  const _hour = _nowET.getHours() + _nowET.getMinutes() / 60
+  const marketClosed = _isWeekend || _hour < 9.5 || _hour >= 16
+  const priceLabel = priceDelayed ? (marketClosed ? 'closed' : 'delayed') : null
 
   // ── User initials helper ──────────────────────────────────────────────────
   function userInitials(name) {
@@ -265,8 +271,8 @@ export default function App() {
                   {quote?.spread != null && (
                     <span className="chart-spread"> spread ${Number(quote.spread).toFixed(2)}</span>
                   )}
-                  {priceDelayed && (
-                    <span style={{ fontSize: 9, color: 'var(--warn)', marginLeft: 5, opacity: 0.7 }}>delayed</span>
+                  {priceLabel && (
+                    <span style={{ fontSize: 9, color: priceLabel === 'closed' ? 'var(--t-4)' : 'var(--warn)', marginLeft: 5, opacity: 0.7 }}>{priceLabel}</span>
                   )}
                 </span>
               )}
