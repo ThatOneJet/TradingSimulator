@@ -200,7 +200,7 @@ class StreamManager:
                 elif sym in self._active_source:
                     del self._active_source[sym]
 
-            log.warning("[STREAM] failover %s: %s → %s", sym, source, new_source or 'none')
+            log.debug("[STREAM] failover %s: %s → %s", sym, source, new_source or 'none')
             self._bus.publish('stream:failover', {
                 'symbol': sym, 'from': source, 'to': new_source,
             })

@@ -52,7 +52,7 @@ def _on_error(ws, error):
 
 
 def _on_close(ws, *args):
-    log.warning("[FINNHUB] Closed — reconnecting in 5s")
+    log.debug("[FINNHUB] Closed — reconnecting in 5s")
 
 
 def subscribe(symbol: str, sio=None) -> None:

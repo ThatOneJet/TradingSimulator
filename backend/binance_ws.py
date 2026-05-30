@@ -86,7 +86,7 @@ class BinanceWS:
             if self._stop.is_set():
                 break
 
-            log.warning("[BINANCE] Disconnected, reconnecting in %.0fs", backoff)
+            log.debug("[BINANCE] Disconnected, reconnecting in %.0fs", backoff)
             # notify StreamManager so failover activates
             for sym in self._symbols:
                 self._sm.mark_source_dead('binance', sym)
@@ -153,4 +153,4 @@ class BinanceWS:
         log.error("[BINANCE] WebSocket error: %s", error)
 
     def _on_close(self, ws, code, msg) -> None:
-        log.warning("[BINANCE] Connection closed (code=%s)", code)
+        log.debug("[BINANCE] Connection closed (code=%s)", code)

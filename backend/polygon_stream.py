@@ -103,7 +103,7 @@ class _PolygonCluster:
 
             if self._stop.is_set():
                 break
-            log.warning("[POLYGON/%s] Disconnected, retry in %.0fs", self._cluster, backoff)
+            log.debug("[POLYGON/%s] Disconnected, retry in %.0fs", self._cluster, backoff)
             time.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
 
@@ -234,7 +234,7 @@ class _PolygonCluster:
         log.error("[POLYGON/%s] Error: %s", self._cluster, error)
 
     def _on_close(self, ws, code, msg) -> None:
-        log.warning("[POLYGON/%s] Closed (code=%s)", self._cluster, code)
+        log.debug("[POLYGON/%s] Closed (code=%s)", self._cluster, code)
         self._authenticated = False
 
 
