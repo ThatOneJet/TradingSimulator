@@ -68,23 +68,42 @@ async def _do_subscribe(symbol: str, on_bar, on_quote) -> None:
 
 def start_stream(api_key: str, secret_key: str, stream_manager: StreamManager) -> None:
     global _stream, _stream_manager, _loop
-    _stream_manager = stream_manager
     try:
-        from alpaca.data.enums import DataFeed
-        _feed = DataFeed.IEX
-    except (ImportError, AttributeError):
-        _feed = 'iex'
-    _stream = StockDataStream(api_key, secret_key, feed=_feed)
+        _stream_manager = stream_manager
 
-    on_bar   = _make_bar_handler(stream_manager)
-    on_quote = _make_quote_handler(stream_manager)
+        # Handle both old SDK (string) and new SDK (enum) for feed parameter
+        feed_arg = 'iex'
+        try:
+            from alpaca.data.enums import DataFeed
+            feed_arg = DataFeed.IEX
+        except (ImportError, AttributeError):
+            pass
 
-    for sym in ['AAPL', 'TSLA', 'NVDA', 'SPY']:
-        _subscribed.add(sym)
-        _stream.subscribe_bars(on_bar, sym)
-        _stream.subscribe_quotes(on_quote, sym)
+        try:
+            _stream = StockDataStream(api_key, secret_key, feed=feed_arg)
+        except TypeError:
+            # Some SDK versions don't accept feed at all
+            try:
+                _stream = StockDataStream(api_key, secret_key)
+            except Exception as e:
+                log.error("[ALPACA] Failed to create StockDataStream: %s", e)
+                return
+        except Exception as e:
+            log.error("[ALPACA] Failed to create StockDataStream: %s", e)
+            return
 
-    _loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_loop)
-    log.debug("[ALPACA] Stream starting (iex feed)")
-    _stream.run()
+        on_bar   = _make_bar_handler(stream_manager)
+        on_quote = _make_quote_handler(stream_manager)
+
+        for sym in ['AAPL', 'TSLA', 'NVDA', 'SPY']:
+            _subscribed.add(sym)
+            _stream.subscribe_bars(on_bar, sym)
+            _stream.subscribe_quotes(on_quote, sym)
+
+        _loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop)
+        log.debug("[ALPACA] Stream starting (iex feed)")
+        _stream.run()
+    except Exception as e:
+        log.error("[ALPACA] Stream startup failed: %s", e)
+        return

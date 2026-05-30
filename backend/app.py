@@ -318,7 +318,28 @@ def _fetch_price_live(symbol: str) -> float:
     # Always use yfinance for simulation prices — no Alpaca dependency
     return _quote_yfinance(symbol)['bid']
 
+def _get_crypto_price(symbol: str) -> float | None:
+    """Get current crypto price from Coinbase REST API (no key, US-accessible)."""
+    try:
+        import urllib.request, json as _json
+        # Convert BTC-USD → BTC-USD (Coinbase uses same format)
+        cb_sym = symbol  # e.g. BTC-USD
+        url = f'https://api.coinbase.com/v2/prices/{cb_sym}/spot'
+        req = urllib.request.Request(url, headers={'CB-VERSION': '2016-02-18'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = _json.loads(r.read())
+            return float(data['data']['amount'])
+    except Exception:
+        return None
+
+
 def _get_current_price(symbol: str) -> float:
+    # For crypto: try Coinbase REST first (reliable, no key, US-accessible)
+    if symbol.endswith('-USD'):
+        cb_price = _get_crypto_price(symbol)
+        if cb_price and cb_price > 0:
+            return cb_price
+
     now = _time.time()
     if symbol in _price_cache:
         price, ts = _price_cache[symbol]
@@ -2600,110 +2621,156 @@ def _ema(vals, period):
 
 
 def _compute_indicators_fast(symbol: str) -> dict:
-    """Lightweight indicator fetch for AI scanning — skips Monte Carlo projection.
-    Returns the same keys as _compute_indicators but projection fields are omitted.
-    Checks CandleEngine first (live streaming bars), falls back to yfinance."""
-    # CandleEngine live data takes priority (sub-second freshness for streaming symbols)
-    if _candle_engine:
-        ce_data = _candle_engine.latest(symbol, '1m')
-        if ce_data:
-            return ce_data
+    """Fetch indicators for a symbol. Priority: CandleEngine → cache → yfinance.
 
-    # Use full cache if warm (skip entries that only hold bulk prefetch data)
+    Never returns a price_only dict if real historical data is obtainable.
+    Handles all symbol types: equity, crypto (-USD), forex (=X), futures (=F).
+    """
+    # ── 1. CandleEngine live data (streaming symbols) ──────────────────────────
+    if _candle_engine:
+        ce = _candle_engine.latest(symbol, '1m')
+        if ce and ce.get('last_price', 0) > 0:
+            return ce
+
+    # ── 2. Warm cache (full indicator dict, not a bulk prefetch stub) ──────────
     now = _time.time()
     if symbol in _proj_cache:
         payload, ts = _proj_cache[symbol]
-        if now - ts < _PROJ_TTL and '_yf_bulk' not in payload:
+        if now - ts < _PROJ_TTL and isinstance(payload, dict) and 'rsi' in payload:
             return payload
 
+    # ── 3. yfinance historical data ────────────────────────────────────────────
     import yfinance as yf
-    # Check for pre-fetched bulk DataFrame from scan batch prefetch
     hist = None
+
+    # Check for pre-fetched bulk DataFrame (from scan batch prefetch)
     if symbol in _proj_cache:
         payload, ts = _proj_cache[symbol]
-        if now - ts < _PROJ_TTL and '_yf_bulk' in payload:
+        if now - ts < _PROJ_TTL and isinstance(payload, dict) and '_yf_bulk' in payload:
             hist = payload['_yf_bulk']
-            del _proj_cache[symbol]  # consume bulk entry; indicators computed below
+            del _proj_cache[symbol]  # consume the stub
+
     if hist is None:
         try:
             hist = yf.Ticker(symbol).history(period='60d')
         except Exception:
-            hist = None
+            pass
+
+    # ── 4. Validate and flatten DataFrame ──────────────────────────────────────
+    if hist is not None and not hist.empty:
+        # Flatten MultiIndex columns if present (newer yfinance for bulk downloads)
+        if hasattr(hist.columns, 'levels') and len(hist.columns.levels) > 1:
+            hist.columns = hist.columns.get_level_values(0)
+        # Drop rows with NaN close
+        hist = hist.dropna(subset=['Close'])
+
     if hist is None or hist.empty or len(hist) < 20:
-        # Last resort: return minimal dict with just current price so scan can proceed
+        # Last resort: fetch current price only
         try:
             price = _get_current_price(symbol)
             if price and price > 0:
-                return {'last_price': price, 'rsi': 50.0, 'macd_cross': 'neutral',
-                        'macd_value': 0.0, 'macd_signal_value': 0.0,
-                        'stoch_k_val': 50.0, 'stoch_d_val': 50.0,
-                        'bb_position': 'unknown', 'vwap_signal': '', 'volume_signal': 'normal',
-                        'volume_ratio': 1.0, 'trend': 'sideways', 'slope': 0.0, 'slope_pct': 0.0,
-                        'atr': price * 0.02, 'atr_pct': 2.0, 'ema50': price, 'adx': 0.0,
-                        'regime': 'neutral', '_source': 'price_only'}
+                # Try to get a meaningful price series from yfinance with shorter period
+                try:
+                    h2 = yf.Ticker(symbol).history(period='30d')
+                    if h2 is not None and not h2.empty and len(h2) >= 5:
+                        if hasattr(h2.columns, 'levels'):
+                            h2.columns = h2.columns.get_level_values(0)
+                        h2 = h2.dropna(subset=['Close'])
+                        if len(h2) >= 5:
+                            hist = h2
+                except Exception:
+                    pass
         except Exception:
             pass
+
+    if hist is None or hist.empty or len(hist) < 5:
         raise ValueError(f'Insufficient data for {symbol}')
 
-    closes  = list(hist['Close'].dropna())
-    highs   = list(hist['High'].dropna())
-    lows    = list(hist['Low'].dropna())
-    volumes = list(hist['Volume'].dropna())
+    # ── 5. Extract OHLCV arrays ────────────────────────────────────────────────
+    def _to_float_list(series):
+        """Convert a pandas Series to a list of floats, handling any type."""
+        try:
+            return [float(x) for x in series if x is not None and str(x) != 'nan']
+        except Exception:
+            return []
+
+    closes  = _to_float_list(hist['Close'])
+    highs   = _to_float_list(hist['High'])
+    lows    = _to_float_list(hist['Low'])
+    volumes = _to_float_list(hist.get('Volume', hist['Close'] * 0))
+
     n = min(len(closes), len(highs), len(lows), len(volumes))
-    closes = closes[-n:]; highs = highs[-n:]; lows = lows[-n:]; volumes = volumes[-n:]
+    if n < 5:
+        raise ValueError(f'Insufficient valid rows for {symbol}: {n}')
 
-    last_c = closes[-1]
+    closes  = closes[-n:]; highs = highs[-n:]; lows = lows[-n:]; volumes = volumes[-n:]
+    last_c  = closes[-1]
 
-    # RSI (14)
-    gains  = [max(closes[i]-closes[i-1], 0) for i in range(1, n)]
-    losses = [max(closes[i-1]-closes[i], 0) for i in range(1, n)]
-    avg_g  = sum(gains[-14:]) / 14; avg_l = sum(losses[-14:]) / 14
-    rsi    = round(100 - (100 / (1 + avg_g / avg_l)) if avg_l else 100.0, 2)
+    # ── 6. RSI (14) ────────────────────────────────────────────────────────────
+    gains  = [max(closes[i] - closes[i-1], 0) for i in range(1, n)]
+    losses = [max(closes[i-1] - closes[i], 0) for i in range(1, n)]
+    if len(gains) >= 14:
+        avg_g = sum(gains[-14:]) / 14
+        avg_l = sum(losses[-14:]) / 14
+        rsi   = round(100 - (100 / (1 + avg_g / avg_l)) if avg_l else 100.0, 2)
+    else:
+        rsi   = 50.0
 
-    # MACD (12, 26, 9)
-    ema12 = _ema(closes, 12); ema26 = _ema(closes, 26)
-    macd_vals = [ema12[i] - ema26[i] for i in range(25, n)]
-    sig_vals  = _ema(macd_vals, 9)
-    last_m = macd_vals[-1]; last_s = sig_vals[-1]
-    prev_m = macd_vals[-2] if len(macd_vals) > 1 else last_m
-    prev_s = sig_vals[-2]  if len(sig_vals)  > 1 else last_s
-    curr_h = last_m - last_s; prev_h = prev_m - prev_s
-    if   curr_h > 0 and prev_h <= 0: macd_cross = 'bullish_cross'
-    elif curr_h < 0 and prev_h >= 0: macd_cross = 'bearish_cross'
-    elif curr_h > 0:                 macd_cross = 'bullish'
-    else:                            macd_cross = 'bearish'
+    # ── 7. MACD (12, 26, 9) ────────────────────────────────────────────────────
+    def _ema_calc(vals, period):
+        if not vals: return []
+        k = 2 / (period + 1); out = [vals[0]]
+        for v in vals[1:]: out.append(v * k + out[-1] * (1 - k))
+        return out
 
-    # Stochastic (14)
-    stoch_k_arr = []
-    for i in range(13, n):
-        ph = max(highs[i-13:i+1]); pl = min(lows[i-13:i+1])
-        stoch_k_arr.append(((closes[i]-pl)/(ph-pl)*100) if ph > pl else 50.0)
-    last_k = stoch_k_arr[-1] if stoch_k_arr else 50.0
+    macd_cross = 'neutral'; macd_val = 0.0; macd_sig_val = 0.0
+    if n >= 27:
+        ema12 = _ema_calc(closes, 12); ema26 = _ema_calc(closes, 26)
+        macd_vals = [ema12[i] - ema26[i] for i in range(25, n)]
+        sig_vals  = _ema_calc(macd_vals, 9)
+        if macd_vals and sig_vals:
+            lm = macd_vals[-1]; ls = sig_vals[-1]
+            pm = macd_vals[-2] if len(macd_vals) > 1 else lm
+            ps = sig_vals[-2]  if len(sig_vals)  > 1 else ls
+            ch = lm - ls; ph = pm - ps
+            if   ch > 0 and ph <= 0: macd_cross = 'bullish_cross'
+            elif ch < 0 and ph >= 0: macd_cross = 'bearish_cross'
+            elif ch > 0:             macd_cross = 'bullish'
+            else:                    macd_cross = 'bearish'
+            macd_val = round(lm, 6); macd_sig_val = round(ls, 6)
 
-    # Bollinger Bands (20, 2σ)
+    # ── 8. Stochastic (14) ────────────────────────────────────────────────────
+    stoch_k = 50.0
+    if n >= 14:
+        arr = []
+        for i in range(13, n):
+            ph = max(highs[i-13:i+1]); pl = min(lows[i-13:i+1])
+            arr.append((closes[i]-pl)/(ph-pl)*100 if ph > pl else 50.0)
+        stoch_k = arr[-1] if arr else 50.0
+
+    # ── 9. Bollinger Bands (20, 2σ) ───────────────────────────────────────────
     bb_pos = 'unknown'
     if n >= 20:
-        w = closes[-20:]; mean = sum(w)/20
-        std = (sum((c-mean)**2 for c in w)/20)**0.5
-        bb_u = mean + 2*std; bb_l = mean - 2*std
-        bw = bb_u - bb_l
+        w = closes[-20:]; mean = sum(w) / 20
+        std = (sum((c - mean) ** 2 for c in w) / 20) ** 0.5
+        bbu = mean + 2*std; bbl = mean - 2*std; bw = bbu - bbl
         if   bw < last_c * 0.03:     bb_pos = 'squeeze'
-        elif last_c >= bb_u * 0.995: bb_pos = 'overbought'
-        elif last_c <= bb_l * 1.005: bb_pos = 'oversold'
+        elif last_c >= bbu * 0.995:  bb_pos = 'overbought'
+        elif last_c <= bbl * 1.005:  bb_pos = 'oversold'
         elif last_c > mean:          bb_pos = 'upper_half'
         else:                        bb_pos = 'lower_half'
 
-    # VWAP (20-day rolling)
+    # ── 10. VWAP (20-bar rolling) ─────────────────────────────────────────────
     vwap_signal = ''
     if n >= 20:
         tp  = [(highs[i]+lows[i]+closes[i])/3 for i in range(n-20, n)]
         vol = volumes[n-20:n]
         tv  = sum(vol)
         if tv > 0:
-            vwap_val = sum(p*v for p,v in zip(tp, vol)) / tv
+            vwap_val = sum(p*v for p,v in zip(tp,vol)) / tv
             vwap_signal = 'above' if last_c > vwap_val else 'below'
 
-    # Volume
+    # ── 11. Volume signal ─────────────────────────────────────────────────────
     last_vol = volumes[-1] if volumes else 0
     avg_vol  = sum(volumes[-20:]) / min(20, len(volumes)) if volumes else 0
     vol_ratio = round(last_vol / avg_vol, 2) if avg_vol > 0 else 1.0
@@ -2712,59 +2779,60 @@ def _compute_indicators_fast(symbol: str) -> dict:
     elif vol_ratio <= 0.5: vol_signal = 'low'
     else:                  vol_signal = 'normal'
 
-    # Trend (linear regression slope, 20-day)
-    last20 = closes[-20:]; x_mean = 9.5; y_mean = sum(last20)/20
-    num = sum((i-x_mean)*(last20[i]-y_mean) for i in range(20))
-    denom = sum((i-x_mean)**2 for i in range(20))
+    # ── 12. Trend (20-bar linear regression) ─────────────────────────────────
+    last20 = closes[-20:] if n >= 20 else closes
+    sz = len(last20); xm = (sz-1)/2; ym = sum(last20)/sz
+    num   = sum((i-xm)*(last20[i]-ym) for i in range(sz))
+    denom = sum((i-xm)**2 for i in range(sz))
     slope = num/denom if denom else 0
     trend = 'up' if slope > 0.05 else 'down' if slope < -0.05 else 'sideways'
 
-    # ATR (14)
+    # ── 13. ATR (14) ──────────────────────────────────────────────────────────
     tr_vals = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
                for i in range(1, n)]
-    atr = round(sum(tr_vals[-14:])/14, 4) if len(tr_vals) >= 14 else last_c * 0.02
+    atr = round(sum(tr_vals[-14:])/14, 6) if len(tr_vals) >= 14 else last_c * 0.02
 
-    # EMA50 — used for falling-knife prevention
-    ema50_arr = _ema(closes, min(50, n))
-    ema50 = ema50_arr[-1]
+    # ── 14. EMA50 ─────────────────────────────────────────────────────────────
+    ema50_arr = _ema_calc(closes, min(50, n))
+    ema50 = ema50_arr[-1] if ema50_arr else last_c
 
-    # Slope as % per bar — more comparable across price levels
     slope_pct = round((slope / last_c) * 100, 4) if last_c else 0.0
 
-    # ADX approximation (directional strength)
+    # ── 15. ADX approximation ─────────────────────────────────────────────────
     adx_val = 0.0
     if n >= 15:
-        plus_dm  = [max(highs[i]-highs[i-1], 0) if (highs[i]-highs[i-1]) > (lows[i-1]-lows[i]) else 0 for i in range(1,n)]
-        minus_dm = [max(lows[i-1]-lows[i], 0) if (lows[i-1]-lows[i]) > (highs[i]-highs[i-1]) else 0 for i in range(1,n)]
-        atr14s   = tr_vals[-14:]
-        atr14    = sum(atr14s) / 14 if atr14s else 1
-        pdm14    = sum(plus_dm[-14:]) / 14; mdm14 = sum(minus_dm[-14:]) / 14
-        pdi = 100 * pdm14 / atr14 if atr14 else 0
-        mdi = 100 * mdm14 / atr14 if atr14 else 0
-        dx  = abs(pdi - mdi) / (pdi + mdi) * 100 if (pdi + mdi) else 0
+        plus_dm  = [max(highs[i]-highs[i-1],0) if (highs[i]-highs[i-1])>(lows[i-1]-lows[i]) else 0 for i in range(1,n)]
+        minus_dm = [max(lows[i-1]-lows[i],0) if (lows[i-1]-lows[i])>(highs[i]-highs[i-1]) else 0 for i in range(1,n)]
+        atr14 = sum(tr_vals[-14:])/14 if len(tr_vals)>=14 else 1
+        pdm14 = sum(plus_dm[-14:])/14; mdm14 = sum(minus_dm[-14:])/14
+        pdi = 100*pdm14/atr14 if atr14 else 0; mdi = 100*mdm14/atr14 if atr14 else 0
+        dx  = abs(pdi-mdi)/(pdi+mdi)*100 if (pdi+mdi) else 0
         adx_val = round(dx, 1)
 
-    return {
-        'last_price':    last_c,
-        'rsi':           rsi,
-        'macd_cross':    macd_cross,
-        'macd_value':    round(last_m, 4),
-        'macd_signal_value': round(last_s, 4),
-        'stoch_k_val':   round(last_k, 2),
-        'stoch_d_val':   round(last_k, 2),
-        'bb_position':   bb_pos,
-        'vwap_signal':   vwap_signal,
-        'volume_signal': vol_signal,
-        'volume_ratio':  vol_ratio,
-        'trend':         trend,
-        'slope':         round(slope, 6),
-        'slope_pct':     slope_pct,
-        'atr':           atr,
-        'atr_pct':       round(atr / last_c * 100, 2) if last_c else 2.0,
-        'ema50':         round(ema50, 4),
-        'adx':           adx_val,
-        'regime':        'neutral',
+    result = {
+        'last_price':        last_c,
+        'rsi':               rsi,
+        'macd_cross':        macd_cross,
+        'macd_value':        macd_val,
+        'macd_signal_value': macd_sig_val,
+        'stoch_k_val':       round(stoch_k, 2),
+        'stoch_d_val':       round(stoch_k, 2),
+        'bb_position':       bb_pos,
+        'vwap_signal':       vwap_signal,
+        'volume_signal':     vol_signal,
+        'volume_ratio':      vol_ratio,
+        'trend':             trend,
+        'slope':             round(slope, 6),
+        'slope_pct':         slope_pct,
+        'atr':               atr,
+        'atr_pct':           round(atr / last_c * 100, 2) if last_c else 2.0,
+        'ema50':             round(ema50, 4),
+        'adx':               adx_val,
+        'regime':            'neutral',
     }
+
+    _proj_cache[symbol] = (result, now)
+    return result
 
 
 def _compute_mtf_bias(symbol: str) -> dict:
@@ -3468,32 +3536,51 @@ def _seed_daily_candles(symbols: list) -> None:
         from candle_engine import _OHLCV
     except ImportError:
         return
+
+    # Download all symbols at once
+    try:
+        bulk = yf.download(symbols, period='90d', interval='1d',
+                           auto_adjust=True, progress=False, threads=True,
+                           group_by='ticker')
+    except Exception as e:
+        print(f'[SEED] Bulk download failed: {e}')
+        return
+
     for sym in symbols:
         try:
-            df = yf.download(sym, period='90d', interval='1d', progress=False, auto_adjust=True)
-            if df.empty:
+            # Extract per-symbol DataFrame
+            if len(symbols) == 1:
+                df = bulk
+            elif sym in bulk.columns.get_level_values(0):
+                df = bulk[sym]
+            else:
                 continue
-            # Flatten MultiIndex columns if present (newer yfinance versions)
+
+            # Flatten if needed
             if hasattr(df.columns, 'levels'):
                 df.columns = df.columns.get_level_values(0)
+
+            df = df.dropna(subset=['Close'])
+            if df.empty or len(df) < 5:
+                continue
+
             with _candle_engine._lock:
                 hist = _candle_engine._history[sym]['1d']
                 for ts, row in df.iterrows():
-                    bar_ts = ts.timestamp() if hasattr(ts, 'timestamp') else float(ts)
-                    def _scalar(v):
-                        if hasattr(v, 'item'): return float(v.item())
-                        if hasattr(v, 'iloc'): return float(v.iloc[0])
-                        return float(v) if v is not None else 0.0
-                    o  = _scalar(row.get('Open',  0))
-                    h  = _scalar(row.get('High',  0))
-                    l  = _scalar(row.get('Low',   0))
-                    cl = _scalar(row.get('Close', 0))
-                    v  = _scalar(row.get('Volume', 0))
-                    if cl > 0:
-                        hist.append(_OHLCV(open=o, high=h, low=l, close=cl, volume=v, ts=bar_ts))
-            print(f'[SEED] {sym}: {len(df)} daily bars loaded')
+                    try:
+                        bar_ts = ts.timestamp()
+                        o  = float(row['Open'])  if hasattr(row['Open'],  '__float__') else float(row['Open'].iloc[0])
+                        h  = float(row['High'])  if hasattr(row['High'],  '__float__') else float(row['High'].iloc[0])
+                        l  = float(row['Low'])   if hasattr(row['Low'],   '__float__') else float(row['Low'].iloc[0])
+                        cl = float(row['Close']) if hasattr(row['Close'], '__float__') else float(row['Close'].iloc[0])
+                        v  = float(row['Volume'] or 0)
+                        if cl > 0:
+                            hist.append(_OHLCV(open=o, high=h, low=l, close=cl, volume=v, ts=bar_ts))
+                    except Exception:
+                        continue
+            print(f'[SEED] {sym}: {len(df)} bars')
         except Exception as e:
-            print(f'[SEED] {sym} failed: {e}')
+            print(f'[SEED] {sym}: {e}')
 
 
 def _market_is_open() -> bool:
@@ -3838,27 +3925,6 @@ def _ai_run_portfolio(pid: int) -> dict:
         cursor   = _ai_scan_cursor.get(pid, 0)
         batch    = [universe[(cursor + i) % len(universe)] for i in range(min(BATCH_SIZE, len(universe)))]
         _ai_scan_cursor[pid] = (cursor + BATCH_SIZE) % max(len(universe), 1)
-
-        # ── Bulk yfinance prefetch for equity/futures symbols ─────────────────
-        # One HTTP call for the whole batch instead of N sequential calls
-        try:
-            import yfinance as yf
-            _eq_batch = [s for s in batch
-                         if not _is_fractional_asset(s)
-                         and not (_candle_engine and _candle_engine.latest(s, '1m'))]
-            if len(_eq_batch) >= 2:
-                _bulk = yf.download(_eq_batch, period='60d', interval='1d',
-                                    auto_adjust=True, progress=False,
-                                    threads=True, group_by='ticker', timeout=20)
-                for _sym in _eq_batch:
-                    try:
-                        _df = _bulk[_sym] if len(_eq_batch) > 1 else _bulk
-                        if _df is not None and not _df.empty and len(_df) >= 20:
-                            _proj_cache[_sym] = ({'_yf_bulk': _df}, _time.time())
-                    except Exception:
-                        pass
-        except Exception:
-            pass
 
         candidates = []
         batch_data = []
@@ -5110,16 +5176,16 @@ if __name__ == '__main__':
 
     event_bus.subscribe('bar:*:1m', _on_bar_for_ai)
 
-    # Binance — primary crypto source (no API key needed)
+    # Coinbase — primary crypto source (no API key needed, US-accessible)
     try:
-        from binance_ws import BinanceWS
+        from coinbase_ws import CoinbaseWS
         crypto_syms = list(CRYPTO_SYMBOLS)
-        _binance = BinanceWS(crypto_syms, _stream_manager)
-        _stream_manager.register_provider('binance', 'crypto')
-        _binance.start()
-        print(f'[TradeSimulator] Binance crypto stream starting ({len(crypto_syms)} symbols).')
+        _coinbase = CoinbaseWS(crypto_syms, _stream_manager)
+        _stream_manager.register_provider('coinbase', 'crypto')
+        _coinbase.start()
+        print(f'[TradeSimulator] Coinbase crypto stream starting ({len(crypto_syms)} symbols).')
     except Exception as e:
-        print(f'[TradeSimulator] Binance stream failed: {e}')
+        print(f'[TradeSimulator] Coinbase stream failed: {e}')
 
     # Polygon — forex primary + crypto failover
     if POLYGON_KEYS_SET:
@@ -5130,9 +5196,9 @@ if __name__ == '__main__':
             threading.Thread(
                 target=poly_start, args=(POLYGON_KEY, _stream_manager), daemon=True
             ).start()
-            # When Binance dies, activate Polygon crypto failover
+            # When Coinbase dies, activate Polygon crypto failover
             def _on_failover(symbol, old_src, new_src):
-                if old_src == 'binance' and new_src == 'polygon':
+                if old_src in ('binance', 'coinbase') and new_src == 'polygon':
                     activate_crypto_failover([symbol])
             _stream_manager.on_failover(_on_failover)
             print('[TradeSimulator] Polygon forex + crypto-failover stream starting.')
