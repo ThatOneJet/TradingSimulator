@@ -97,6 +97,15 @@ function ProtectionGuide({ prot, bearish, isShort }) {
   )
 }
 
+function fmtQty(n) {
+  const v = Math.abs(Number(n))
+  if (isNaN(v)) return '—'
+  if (v >= 100)  return v.toFixed(2)
+  if (v >= 1)    return v.toFixed(4)
+  if (v >= 0.01) return v.toFixed(6)
+  return v.toFixed(8)
+}
+
 function PositionCard({ p, isReal, totalValue, onClose, protData }) {
   const isShort = p.side === 'short'
   const absQty  = Math.abs(p.qty)
@@ -131,7 +140,7 @@ function PositionCard({ p, isReal, totalValue, onClose, protData }) {
         )}
       </div>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
-        <span style={{ fontSize: 9.5, color: 'var(--t-4)', fontFamily: 'var(--font-mono)' }}>{isShort ? '-' : ''}{absQty}</span>
+        <span style={{ fontSize: 9.5, color: 'var(--t-4)', fontFamily: 'var(--font-mono)' }}>{fmtQty(absQty)}</span>
         <span style={{ fontSize: 9.5, color: 'var(--t-4)', fontFamily: 'var(--font-mono)' }}>${Number(p.avg_entry_price).toFixed(2)} → ${Number(p.current_price).toFixed(2)}</span>
         <span style={{ fontSize: 10, fontWeight: 700, color: plColor, fontFamily: 'var(--font-mono)', marginLeft: 'auto' }}>
           {plPos ? '+' : ''}{Number(p.unrealized_pl).toFixed(2)}
