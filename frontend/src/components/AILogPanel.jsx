@@ -317,9 +317,11 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
   const [loading,    setLoading]    = useState(false)
   const [modal,      setModal]      = useState(null)   // run object for open modal
   const [flash,      setFlash]      = useState(false)
-  const [review,     setReview]     = useState(null)
-  const [reviewLoad, setReviewLoad] = useState(false)
-  const [reviewTab,  setReviewTab]  = useState('scans')  // 'scans' | '30d'
+  const [review,      setReview]      = useState(null)
+  const [reviewLoad,  setReviewLoad]  = useState(false)
+  const [reviewTab,   setReviewTab]   = useState('scans')  // 'scans' | '30d' | 'trades'
+  const [tradeHist,   setTradeHist]   = useState(null)
+  const [tradeLoad,   setTradeLoad]   = useState(false)
   const prevCountRef = useRef(0)
 
   useEffect(() => {
@@ -328,6 +330,14 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
     api.get(`/portfolios/${portfolioId}/history/review`)
       .then(r => { setReview(r.data); setReviewLoad(false) })
       .catch(() => setReviewLoad(false))
+  }, [reviewTab, portfolioId])
+
+  useEffect(() => {
+    if (reviewTab !== 'trades' || !portfolioId) return
+    setTradeLoad(true)
+    api.get(`/portfolios/${portfolioId}/trades?limit=200`)
+      .then(r => { setTradeHist(r.data); setTradeLoad(false) })
+      .catch(() => setTradeLoad(false))
   }, [reviewTab, portfolioId])
 
   useEffect(() => {
@@ -402,7 +412,7 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
 
         {/* ── Tab switcher ── */}
         <div style={{ display: 'flex', borderBottom: '1px solid rgba(140,170,220,0.08)', flexShrink: 0 }}>
-          {[['scans', 'Scans'], ['30d', '30D Review']].map(([key, label]) => (
+          {[['scans', 'Scans'], ['trades', 'Trade P&L'], ['30d', '30D Review']].map(([key, label]) => (
             <button key={key} onClick={() => setReviewTab(key)} style={{
               flex: 1, padding: '6px 0', border: 'none', cursor: 'pointer',
               background: reviewTab === key ? 'rgba(179,157,255,0.08)' : 'transparent',
@@ -417,6 +427,70 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
         </div>
 
         {/* ── 30D Review panel ── */}
+        {/* ── Trade P&L History ── */}
+        {reviewTab === 'trades' && (
+          <div style={{ flex: 1, overflowY: 'auto', padding: '10px 12px' }}>
+            {tradeLoad && <div style={{ color: 'var(--t-4)', fontSize: 11, textAlign: 'center', marginTop: 20 }}>Loading…</div>}
+            {tradeHist && !tradeLoad && (
+              <>
+                {/* Summary bar */}
+                {tradeHist.summary && (
+                  <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 10, padding: '8px 10px', background: 'rgba(140,170,220,0.04)', borderRadius: 6, border: '1px solid rgba(140,170,220,0.1)' }}>
+                    {[
+                      { label: 'Total P&L', value: `${tradeHist.summary.total_pl >= 0 ? '+' : ''}$${tradeHist.summary.total_pl?.toFixed(2)}`, color: tradeHist.summary.total_pl >= 0 ? 'var(--ok)' : 'var(--err)' },
+                      { label: 'Closed', value: tradeHist.summary.closed, color: 'var(--t-2)' },
+                      { label: 'Win rate', value: `${tradeHist.summary.win_rate}%`, color: tradeHist.summary.win_rate >= 50 ? 'var(--ok)' : 'var(--err)' },
+                      { label: 'Avg win', value: `+$${tradeHist.summary.avg_win?.toFixed(2)}`, color: 'var(--ok)' },
+                      { label: 'Avg loss', value: `$${tradeHist.summary.avg_loss?.toFixed(2)}`, color: 'var(--err)' },
+                    ].map(({ label, value, color }) => (
+                      <div key={label} style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                        <span style={{ fontSize: 8, color: 'var(--t-4)', letterSpacing: '0.07em', textTransform: 'uppercase' }}>{label}</span>
+                        <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', fontWeight: 700, color }}>{value}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Trade rows */}
+                {(tradeHist.trades || []).map((t, i) => {
+                  const isClose = !t.is_open
+                  const pl = t.pl
+                  const plColor = pl > 0 ? 'var(--ok)' : pl < 0 ? 'var(--err)' : 'var(--t-4)'
+                  const sideColor = t.side === 'buy' ? '#3ddc97' : t.side === 'sell' ? '#ff476f'
+                               : t.side === 'short' ? '#ff6a6a' : '#4ad9ff' // cover
+                  return (
+                    <div key={t.id || i} style={{
+                      display: 'flex', alignItems: 'center', gap: 8,
+                      padding: '5px 0', borderBottom: '1px solid rgba(140,170,220,0.05)',
+                    }}>
+                      {/* Side badge */}
+                      <span style={{ fontSize: 8, fontWeight: 700, color: sideColor, fontFamily: 'var(--font-mono)', width: 36, flexShrink: 0, textTransform: 'uppercase' }}>
+                        {t.side}
+                      </span>
+                      {/* Symbol */}
+                      <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--t-1)', fontFamily: 'var(--font-mono)', width: 80, flexShrink: 0 }}>
+                        {t.symbol}
+                      </span>
+                      {/* Qty @ price */}
+                      <span style={{ fontSize: 9, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {Number(t.qty).toFixed(4)} @ ${Number(t.price).toFixed(4)}
+                      </span>
+                      {/* P&L */}
+                      <span style={{ fontSize: 10, fontWeight: 700, fontFamily: 'var(--font-mono)', color: isClose ? plColor : 'var(--t-4)', flexShrink: 0, width: 70, textAlign: 'right' }}>
+                        {isClose ? `${pl >= 0 ? '+' : ''}$${pl?.toFixed(2)}` : '—'}
+                      </span>
+                      {/* Time */}
+                      <span style={{ fontSize: 8, color: 'var(--t-4)', flexShrink: 0 }}>
+                        {fmtTime(t.created_at)}
+                      </span>
+                    </div>
+                  )
+                })}
+              </>
+            )}
+          </div>
+        )}
+
         {reviewTab === '30d' && (
           <div style={{ flex: 1, overflowY: 'auto', padding: '10px 12px' }}>
             {reviewLoad && <div style={{ color: 'var(--t-4)', fontSize: 11, textAlign: 'center', marginTop: 20 }}>Loading…</div>}

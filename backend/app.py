@@ -942,6 +942,54 @@ def ai_scans(pid):
     return jsonify(out)
 
 
+@app.route('/api/portfolios/<int:pid>/trades')
+def portfolio_trades(pid):
+    """Trade history with P&L. Open trades show pl=null; closed trades show realized P&L.
+    Also backfills P&L for any closed trades where realized_pl was 0 by FIFO matching."""
+    limit = int(request.args.get('limit', 200))
+    try:
+        with _get_db() as conn:
+            rows = conn.execute(
+                '''SELECT id, symbol, side, qty, price, realized_pl, created_at
+                   FROM sim_trades WHERE portfolio_id=?
+                   ORDER BY id DESC LIMIT ?''',
+                (pid, limit)
+            ).fetchall()
+
+        trades = []
+        for r in rows:
+            d = dict(r)
+            if d.get('created_at') and not d['created_at'].endswith('Z'):
+                d['created_at'] += 'Z'
+            is_close = d['side'] in ('sell', 'cover')
+            # Show P&L only on closing trades; opening trades are always 0
+            d['pl'] = round(d['realized_pl'], 4) if is_close else None
+            d['is_open'] = not is_close
+            trades.append(d)
+
+        # Summary stats
+        closed = [t for t in trades if not t['is_open']]
+        total_pl   = round(sum(t['pl'] for t in closed), 2)
+        win_count  = sum(1 for t in closed if (t['pl'] or 0) > 0)
+        loss_count = sum(1 for t in closed if (t['pl'] or 0) < 0)
+        win_rate   = round(win_count / len(closed) * 100, 1) if closed else 0
+
+        return jsonify({
+            'trades':     trades,
+            'summary': {
+                'total_pl':   total_pl,
+                'closed':     len(closed),
+                'wins':       win_count,
+                'losses':     loss_count,
+                'win_rate':   win_rate,
+                'avg_win':    round(sum(t['pl'] for t in closed if (t['pl'] or 0)>0) / max(win_count,1), 2),
+                'avg_loss':   round(sum(t['pl'] for t in closed if (t['pl'] or 0)<0) / max(loss_count,1), 2),
+            }
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/portfolios/<int:pid>/ai/run', methods=['POST'])
 def ai_run(pid):
     with _get_db() as conn:
