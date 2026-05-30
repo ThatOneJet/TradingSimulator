@@ -175,6 +175,107 @@ function RealPortfolio({ onSelectSymbol }) {
   )
 }
 
+// ── Trade row with collapsible reasoning ─────────────────────────────────────
+function TradeRow({ o }) {
+  const [open, setOpen] = useState(false)
+  const side = (o.side || '').toLowerCase()
+  const isClose = side === 'sell' || side === 'cover'
+  const pl = o.pl ?? o.realized_pl ?? null
+  const plPos = pl != null && pl >= 0
+  const hasReason = !!o.reason
+
+  const sideColor = side === 'buy'   ? '#3ddc97'
+                  : side === 'sell'  ? '#ff476f'
+                  : side === 'short' ? '#ff6a6a'
+                  : '#4ad9ff' // cover
+
+  const fmtQty = (q) => {
+    const n = Number(q)
+    if (isNaN(n)) return q
+    return n >= 1 ? n.toFixed(2) : n.toFixed(4)
+  }
+
+  const fmtTime = (ts) => {
+    if (!ts) return '—'
+    const d = new Date(ts.endsWith('Z') ? ts : ts + 'Z')
+    return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  }
+
+  return (
+    <div style={{ borderBottom: '1px solid rgba(140,170,220,0.05)' }}>
+      {/* Main row */}
+      <div
+        onClick={() => hasReason && setOpen(v => !v)}
+        style={{
+          display: 'grid', gridTemplateColumns: '1.4fr 0.7fr 1fr 0.8fr 0.9fr',
+          gap: 4, padding: '7px 8px', alignItems: 'center',
+          cursor: hasReason ? 'pointer' : 'default',
+          transition: 'background 0.1s',
+        }}
+        onMouseEnter={e => { if (hasReason) e.currentTarget.style.background = 'rgba(140,170,220,0.04)' }}
+        onMouseLeave={e => { e.currentTarget.style.background = 'transparent' }}
+      >
+        {/* Symbol */}
+        <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, color: 'var(--cy)', fontSize: 12, display: 'flex', alignItems: 'center', gap: 5 }}>
+          {o.symbol}
+          {hasReason && <span style={{ fontSize: 8, color: 'var(--t-4)', opacity: 0.6 }}>{open ? '▲' : '▼'}</span>}
+        </span>
+        {/* Side */}
+        <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, color: sideColor, fontSize: 10, textTransform: 'uppercase' }}>
+          {o.side}
+        </span>
+        {/* Qty */}
+        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--t-2)' }}>
+          {fmtQty(o.qty)}
+        </span>
+        {/* Fill price + P&L inline */}
+        <div>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--t-1)' }}>
+            ${Number(o.price ?? o.fill_price ?? 0).toFixed(2)}
+          </span>
+          {isClose && pl != null && (
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9.5, fontWeight: 700, color: plPos ? 'var(--ok)' : 'var(--err)', marginTop: 1 }}>
+              {plPos ? '+' : ''}${Number(pl).toFixed(2)}
+            </div>
+          )}
+        </div>
+        {/* Time */}
+        <span style={{ fontSize: 10, color: 'var(--t-4)' }}>
+          {fmtTime(o.created_at)}
+        </span>
+      </div>
+
+      {/* Expanded reasoning */}
+      {open && hasReason && (
+        <div style={{
+          margin: '0 8px 8px 8px', padding: '8px 10px',
+          background: 'rgba(0,0,0,0.2)', borderRadius: 6,
+          border: `1px solid ${sideColor}20`,
+        }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
+            {o.ai_score != null && (
+              <span style={{ fontSize: 8.5, fontFamily: 'var(--font-mono)', fontWeight: 700, color: Number(o.ai_score) >= 0 ? 'var(--ok)' : 'var(--err)' }}>
+                score {Number(o.ai_score) >= 0 ? '+' : ''}{Number(o.ai_score).toFixed(2)}
+              </span>
+            )}
+            {o.market_state && (
+              <span style={{ fontSize: 8, color: '#f5b342', background: 'rgba(245,179,66,0.1)', border: '1px solid rgba(245,179,66,0.25)', borderRadius: 3, padding: '1px 5px', fontFamily: 'var(--font-mono)' }}>
+                {o.market_state.replace(/_/g, ' ')}
+              </span>
+            )}
+            {o.strategy && (
+              <span style={{ fontSize: 8, color: '#4ad9ff', background: 'rgba(74,217,255,0.08)', border: '1px solid rgba(74,217,255,0.2)', borderRadius: 3, padding: '1px 5px', fontFamily: 'var(--font-mono)' }}>
+                {o.strategy}
+              </span>
+            )}
+          </div>
+          <div style={{ fontSize: 9.5, color: 'var(--t-2)', lineHeight: 1.65 }}>{o.reason}</div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Sim Portfolio tab ───────────────────────────────────────────────────────
 function SimPortfolio({ positions, portfolioId, onSelectSymbol, onRefresh }) {
   const [orders,  setOrders]  = useState([])
@@ -183,8 +284,8 @@ function SimPortfolio({ positions, portfolioId, onSelectSymbol, onRefresh }) {
   useEffect(() => {
     if (!portfolioId) return
     setLoading(true)
-    api.get('/orders', { params: { portfolio_id: portfolioId } })
-      .then(r => { setOrders(r.data); setLoading(false) })
+    api.get(`/portfolios/${portfolioId}/trades?limit=200`)
+      .then(r => { setOrders(r.data?.trades || []); setLoading(false) })
       .catch(() => setLoading(false))
   }, [portfolioId])
 
@@ -285,34 +386,14 @@ function SimPortfolio({ positions, portfolioId, onSelectSymbol, onRefresh }) {
         )}
 
         {!loading && orders.length > 0 && (
-          <div style={{ overflowX: 'auto' }}>
-            <table className="pos-table" style={{ minWidth: 460 }}>
-              <thead>
-                <tr>
-                  <th>Symbol</th>
-                  <th>Side</th>
-                  <th>Qty</th>
-                  <th>Fill Price</th>
-                  <th>Time</th>
-                </tr>
-              </thead>
-              <tbody>
-                {orders.map((o, i) => (
-                  <tr key={o.id ?? i}>
-                    <td className="mono bold" style={{ color: 'var(--cy)' }}>{o.symbol}</td>
-                    <td className="mono" style={{
-                      color: o.side?.toLowerCase() === 'buy' ? 'var(--ok)' : 'var(--err)',
-                      fontWeight: 600, textTransform: 'uppercase', fontSize: 10,
-                    }}>
-                      {o.side}
-                    </td>
-                    <td className="mono">{o.qty}</td>
-                    <td className="mono">{o.fill_price != null ? `$${Number(o.fill_price).toFixed(2)}` : '—'}</td>
-                    <td className="muted" style={{ fontSize: 11 }}>{fmtTimestamp(o.created_at || o.timestamp)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div>
+            {/* Column headers */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 0.7fr 1fr 0.8fr 0.9fr', gap: 4, padding: '4px 8px 6px', borderBottom: '1px solid rgba(140,170,220,0.1)' }}>
+              {['SYMBOL','SIDE','QTY','FILL PRICE','TIME'].map(h => (
+                <span key={h} style={{ fontSize: 8.5, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', letterSpacing: '0.07em' }}>{h}</span>
+              ))}
+            </div>
+            {orders.map((o, i) => <TradeRow key={o.id ?? i} o={o} />)}
           </div>
         )}
       </div>
