@@ -1,4 +1,5 @@
-import os, threading, sqlite3, time as _time, json as _json, csv, io, hashlib, random, math, logging
+import os, threading, sqlite3, time as _time, json as _json, csv, io, hashlib, random, math, logging, warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning)  # suppress Eventlet deprecation
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory
@@ -2295,7 +2296,8 @@ def delete_holding(holding_id):
 
 # ── News feed ─────────────────────────────────────────────────────────────────
 _news_cache: dict[str, tuple[list, float]] = {}
-_NEWS_TTL = 300  # 5 minutes
+_NEWS_TTL = 1800  # 30 minutes — reduce API call frequency
+_FINNHUB_GENERAL_LAST = 0.0  # rate-limit tracker for general news
 
 def _fetch_news_av(symbol: str = '', topics: str = 'technology,finance') -> list:
     """Fetch from Alpha Vantage NEWS_SENTIMENT."""
@@ -2470,7 +2472,8 @@ def _fetch_news_finnhub_general() -> list:
             })
         return result
     except Exception as e:
-        print(f'[TradeSimulator] Finnhub general news failed: {e}')
+        if '429' not in str(e):  # only log non-rate-limit errors
+            print(f'[TradeSimulator] Finnhub general news failed: {e}')
         return []
 
 @app.route('/api/news/<symbol>')

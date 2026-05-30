@@ -102,6 +102,9 @@ class AnomalyDetector:
                         continue
 
                     z = (val - mean) / std
+                    # Cap z-scores at ±10 — values beyond this indicate a data
+                    # source switch (daily→1m bars) rather than a real anomaly
+                    z = max(-10.0, min(10.0, z))
                     z_scores[key] = round(z, 2)
 
                     if abs(z) >= self.Z_THRESHOLD:
@@ -119,7 +122,7 @@ class AnomalyDetector:
                     f'Anomaly detected: {", ".join(parts)} '
                     f'— unusual market conditions'
                 )
-                log.warning('[ANOMALY] %s: %s', symbol, description)
+                log.debug('[ANOMALY] %s: %s', symbol, description)
 
             return {
                 'anomaly':     anomaly,
