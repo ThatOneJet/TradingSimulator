@@ -258,6 +258,10 @@ def _init_db():
             conn.execute("ALTER TABLE ai_scan_runs ADD COLUMN history_context TEXT")
         except Exception:
             pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE ai_scan_runs ADD COLUMN skipped_json TEXT")
+        except Exception:
+            pass  # column already exists
 
         conn.execute('''
             CREATE TABLE IF NOT EXISTS sim_options_positions (
@@ -914,7 +918,8 @@ def ai_scans(pid):
     with _get_db() as conn:
         rows = conn.execute(
             '''SELECT id, portfolio_id, scanned, bought_count, sold_count, error_count,
-                      bought_json, sold_json, batch_json, mode, skip_reason, created_at
+                      bought_json, sold_json, batch_json, mode, skip_reason, created_at,
+                      skipped_json
                FROM ai_scan_runs WHERE portfolio_id=? ORDER BY id DESC LIMIT ?''',
             (pid, limit)
         ).fetchall()
@@ -3787,7 +3792,7 @@ def _ai_run_portfolio(pid: int) -> dict:
     mode        = 'full' if market_open else 'crypto_forex'
     summary     = {'pid': pid, 'scanned': 0, 'bought': [], 'sold': [],
                    'shorted': [], 'covered': [],
-                   'errors': [], 'mode': mode, 'skip_reason': None}
+                   'errors': [], 'skipped': [], 'mode': mode, 'skip_reason': None}
     batch_data  = []
 
     # Load strategy engine (lazy import — engine is in same directory)
@@ -4138,7 +4143,7 @@ def _ai_run_portfolio(pid: int) -> dict:
             try:
                 heat = _compute_portfolio_heat(pid, equity)
                 if heat >= MAX_PORTFOLIO_HEAT:
-                    summary['errors'].append(f'skip {c["symbol"]}: portfolio heat {heat:.1%} at max')
+                    summary['skipped'].append(f'{c["symbol"]}: heat {heat:.1%}')
                     continue
                 heat_room = (MAX_PORTFOLIO_HEAT - heat) * equity
                 trade_heat = raw_shares * stop_dist
@@ -4153,7 +4158,7 @@ def _ai_run_portfolio(pid: int) -> dict:
             try:
                 cluster_exp = _compute_cluster_exposure(c['symbol'], held, pid, equity, held_prices)
                 if cluster_exp >= MAX_CLUSTER_EXPOSURE:
-                    summary['errors'].append(f'skip {c["symbol"]}: cluster exposure {cluster_exp:.1%} at max')
+                    summary['skipped'].append(f'{c["symbol"]}: correlated cluster {cluster_exp:.1%}')
                     continue
                 cluster_room = max(0.0, (MAX_CLUSTER_EXPOSURE - cluster_exp) * equity)
                 position_value = min(position_value, cluster_room)
@@ -4171,7 +4176,7 @@ def _ai_run_portfolio(pid: int) -> dict:
             # ── 8. Minimum confidence gate ────────────────────────────────────
             conf = c.get('confidence', 50)
             if conf < 35:
-                summary['errors'].append(f"skip {c['symbol']}: low confidence ({conf})")
+                summary['skipped'].append(f"{c['symbol']}: low confidence ({conf})")
                 continue
 
             # ── Circuit breaker check ─────────────────────────────────────────
@@ -4263,8 +4268,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                     '''INSERT INTO ai_scan_runs
                        (portfolio_id, scanned, bought_count, sold_count, error_count,
                         bought_json, sold_json, batch_json, mode, skip_reason,
-                        history_context)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                        history_context, skipped_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
                     (pid, summary['scanned'],
                      len(summary['bought']) + len(summary['shorted']),
                      len(summary['sold'])   + len(summary['covered']),
@@ -4274,7 +4279,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                      _json.dumps(batch_data),
                      summary.get('mode', 'full'),
                      summary.get('skip_reason'),
-                     history_ctx.get('summary', ''))
+                     history_ctx.get('summary', ''),
+                     _json.dumps(summary.get('skipped', [])))
                 )
         except Exception:
             pass

@@ -66,9 +66,10 @@ function ScanModal({ run, onClose }) {
   const [batchOpen, setBatchOpen] = useState(false)
   if (!run) return null
 
-  const bought = run.bought_json || []
-  const sold   = run.sold_json   || []
-  const batch  = run.batch_json  || []
+  const bought   = run.bought_json   || []
+  const sold     = run.sold_json     || []
+  const batch    = run.batch_json    || []
+  const skipped  = run.skipped_json  || []
 
   return (
     <div
@@ -112,9 +113,10 @@ function ScanModal({ run, onClose }) {
             {run.mode === 'crypto_forex' && <Chip label="CRYPTO/FX" color="#4ad9ff" />}
             {run.skip_reason === 'max_positions' && <Chip label="MAX POS" color="#f5b342" />}
             {run.skip_reason === 'low_cash'      && <Chip label="LOW CASH" color="#f5b342" />}
-            {bought.length > 0 && <Chip label={`${bought.length} bought`}  color="#3ddc97" />}
-            {sold.length   > 0 && <Chip label={`${sold.length} sold`}     color="#ff476f" />}
-            {run.error_count > 0 && <Chip label={`${run.error_count} err`} color="#f5b342" />}
+            {bought.length  > 0 && <Chip label={`${bought.length} bought`}    color="#3ddc97" />}
+            {sold.length    > 0 && <Chip label={`${sold.length} sold`}       color="#ff476f" />}
+            {skipped.length > 0 && <Chip label={`${skipped.length} skipped`} color="#f5b342" />}
+            {run.error_count > 0 && <Chip label={`${run.error_count} no data`} color="#ff476f" />}
           </div>
           <button
             onClick={onClose}
@@ -203,6 +205,21 @@ function ScanModal({ run, onClose }) {
             </section>
           )}
 
+          {/* Skipped — risk gates (low confidence, heat cap, cluster cap) */}
+          {skipped.length > 0 && (
+            <section style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 9, fontWeight: 700, color: '#f5b342', letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: 6, display: 'flex', alignItems: 'center', gap: 5 }}>
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#f5b342', display: 'inline-block' }} />
+                Skipped — risk gate
+              </div>
+              {skipped.map((s, i) => (
+                <div key={i} style={{ fontSize: 9.5, color: 'var(--t-3)', padding: '2px 0', fontFamily: 'var(--font-mono)' }}>
+                  ⊘ {s}
+                </div>
+              ))}
+            </section>
+          )}
+
           {/* No action */}
           {bought.length === 0 && sold.length === 0 && (
             <div style={{ textAlign: 'center', padding: '12px 0 16px', color: 'var(--t-4)', fontSize: 11 }}>
@@ -224,8 +241,8 @@ function ScanModal({ run, onClose }) {
                 <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--t-3)', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
                   Scanned Batch ({batch.length})
                   {batch.filter(b => b.error).length > 0 && (
-                    <span style={{ color: '#f5b342', fontWeight: 400, marginLeft: 6 }}>
-                      · {batch.filter(b => !b.error).length} w/ data · {batch.filter(b => b.error).length} failed
+                    <span style={{ color: '#ff476f', fontWeight: 400, marginLeft: 6 }}>
+                      · {batch.filter(b => !b.error).length} w/ data · {batch.filter(b => b.error).length} no data
                     </span>
                   )}
                 </span>
