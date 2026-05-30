@@ -813,6 +813,23 @@ def update_portfolio(pid):
             conn.execute('UPDATE portfolios SET ai_controlled=? WHERE id=?', (1 if ai_controlled else 0, pid))
     return jsonify({'status': 'updated'})
 
+@app.route('/api/portfolios/<int:pid>/reset', methods=['POST'])
+def reset_portfolio(pid):
+    """Reset portfolio: clear positions, trades, AI log, and restore initial cash."""
+    try:
+        with _get_db() as conn:
+            state = conn.execute('SELECT initial_cash FROM sim_state WHERE portfolio_id=?', (pid,)).fetchone()
+            initial_cash = state['initial_cash'] if state else 100000.0
+            conn.execute("UPDATE sim_state SET cash=?, last_equity=?, reset_at=datetime('now') WHERE portfolio_id=?",
+                         (initial_cash, initial_cash, pid))
+            conn.execute('DELETE FROM sim_positions WHERE portfolio_id=?', (pid,))
+            conn.execute('DELETE FROM sim_trades WHERE portfolio_id=?', (pid,))
+            conn.execute('DELETE FROM ai_log WHERE portfolio_id=?', (pid,))
+            conn.execute('DELETE FROM ai_scan_runs WHERE portfolio_id=?', (pid,))
+        return jsonify({'status': 'reset', 'cash': initial_cash})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/portfolios/<int:pid>', methods=['DELETE'])
 def delete_portfolio(pid):
     if pid == 1:

@@ -332,6 +332,8 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
   const [showForm, setShowForm]     = useState(false)
   const [loading, setLoading]       = useState(true)
   const [ctxMenu, setCtxMenu]       = useState(null)
+  const [renaming, setRenaming]     = useState(null)   // {id, name}
+  const [renameVal, setRenameVal]   = useState('')
 
   const loadAll = useCallback(async () => {
     if (!userId) return
@@ -401,6 +403,31 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
     } catch (err) {
       console.error('PortfolioTabs: delete failed', err)
       alert(err?.response?.data?.error || 'Failed to delete portfolio.')
+    }
+  }
+
+  const handleRename = async () => {
+    const name = renameVal.trim()
+    if (!name || !renaming) return
+    try {
+      await api.patch(`/portfolios/${renaming.id}`, { name })
+      await loadAll()
+    } catch (err) {
+      console.error('Rename failed', err)
+    } finally {
+      setRenaming(null)
+      setRenameVal('')
+    }
+  }
+
+  const handleResetBalance = async (portfolio) => {
+    if (!window.confirm(`Reset "${portfolio.name}" balance to $100,000? All positions and trade history will be cleared.`)) return
+    try {
+      await api.post(`/portfolios/${portfolio.id}/reset`)
+      await loadAll()
+      setCtxMenu(null)
+    } catch (err) {
+      console.error('Reset failed', err)
     }
   }
 
@@ -500,6 +527,47 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
         />
       )}
 
+      {renaming && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 10000,
+          background: 'rgba(0,0,8,0.7)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }} onClick={() => setRenaming(null)}>
+          <div onClick={e => e.stopPropagation()} style={{
+            background: '#141925', border: '1px solid rgba(140,170,220,0.18)',
+            borderRadius: 10, padding: '20px 24px', minWidth: 300,
+            boxShadow: '0 16px 48px rgba(0,0,0,0.6)',
+          }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--t-2)', marginBottom: 12, letterSpacing: '0.05em' }}>
+              RENAME PORTFOLIO
+            </div>
+            <input
+              autoFocus
+              value={renameVal}
+              onChange={e => setRenameVal(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') handleRename(); if (e.key === 'Escape') setRenaming(null) }}
+              style={{
+                width: '100%', boxSizing: 'border-box',
+                background: 'rgba(140,170,220,0.07)', border: '1px solid rgba(140,170,220,0.2)',
+                borderRadius: 6, padding: '8px 10px', fontSize: 13,
+                color: 'var(--t-1)', outline: 'none', fontFamily: 'var(--font-sans)',
+                marginBottom: 12,
+              }}
+            />
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button onClick={() => setRenaming(null)} style={{
+                background: 'none', border: '1px solid rgba(140,170,220,0.2)',
+                borderRadius: 6, padding: '6px 14px', color: 'var(--t-3)', cursor: 'pointer', fontSize: 12,
+              }}>Cancel</button>
+              <button onClick={handleRename} style={{
+                background: 'rgba(179,157,255,0.15)', border: '1px solid rgba(179,157,255,0.3)',
+                borderRadius: 6, padding: '6px 14px', color: '#b39dff', cursor: 'pointer', fontSize: 12, fontWeight: 700,
+              }}>Rename</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {ctxMenu && (
         <div
           onMouseDown={e => e.stopPropagation()}
@@ -531,21 +599,21 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
           </div>
           {/* Rename */}
           <div
-            onClick={() => setCtxMenu(null)}
+            onClick={() => { setRenaming({ id: ctxMenu.portfolio.id, name: ctxMenu.portfolio.name }); setRenameVal(ctxMenu.portfolio.name); setCtxMenu(null) }}
             style={{ padding: '8px 14px', cursor: 'pointer', color: '#aab4c5' }}
             onMouseEnter={e => e.currentTarget.style.background = 'rgba(140,170,220,0.07)'}
             onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
           >
-            Rename
+            ✎ Rename
           </div>
           {/* Reset Balance */}
           <div
-            onClick={() => setCtxMenu(null)}
+            onClick={() => handleResetBalance(ctxMenu.portfolio)}
             style={{ padding: '8px 14px', cursor: 'pointer', color: '#aab4c5' }}
             onMouseEnter={e => e.currentTarget.style.background = 'rgba(140,170,220,0.07)'}
             onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
           >
-            Reset Balance
+            ↺ Reset Balance
           </div>
           {/* Delete — only for non-default portfolios */}
           {ctxMenu.portfolio.id !== 1 && (
