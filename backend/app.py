@@ -248,6 +248,42 @@ def _init_db():
             except Exception:
                 pass  # column already exists
 
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS sim_options_positions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id    INTEGER NOT NULL DEFAULT 1,
+                underlying      TEXT    NOT NULL,
+                symbol          TEXT    NOT NULL,
+                strategy        TEXT    NOT NULL,
+                side            TEXT    NOT NULL DEFAULT 'long',
+                contracts       INTEGER NOT NULL DEFAULT 1,
+                entry_price     REAL    NOT NULL,
+                current_price   REAL    NOT NULL DEFAULT 0,
+                delta           REAL,
+                gamma           REAL,
+                theta           REAL,
+                vega            REAL,
+                iv_at_entry     REAL,
+                strike          REAL    NOT NULL,
+                expiry          TEXT    NOT NULL,
+                dte_at_entry    INTEGER,
+                status          TEXT    NOT NULL DEFAULT 'open',
+                exit_reason     TEXT,
+                realized_pl     REAL    NOT NULL DEFAULT 0,
+                opened_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+                closed_at       TEXT
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS iv_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol      TEXT NOT NULL,
+                iv          REAL NOT NULL,
+                recorded_at TEXT NOT NULL DEFAULT (date('now'))
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS ix_iv_sym ON iv_history(symbol, recorded_at)')
+
 _init_db()
 
 # in-memory watchlist
@@ -917,6 +953,39 @@ def market_breadth():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/rl/stats')
+def rl_stats():
+    """Q-table statistics and top-performing state/action pairs."""
+    try:
+        import rl_engine as _rl_mod
+        eng = _rl_mod.get_engine()
+        if not eng:
+            return jsonify({'status': 'not_initialized'})
+        return jsonify(eng.stats())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/macro')
+def macro_signal():
+    """Current macro environment (cross-asset signals)."""
+    try:
+        import macro_engine as _me
+        return jsonify(_me.latest())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/orderflow/<symbol>')
+def order_flow_signal(symbol):
+    """Real-time order flow / bid-ask imbalance for a symbol."""
+    try:
+        import order_flow as _of
+        return jsonify(_of.get_signal(symbol.upper()))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/sentiment/<symbol>')
 def symbol_news(symbol):
     """News sentiment and event calendar for a symbol."""
@@ -939,6 +1008,129 @@ def run_backtest_endpoint():
         from backtester import run_backtest
         result = run_backtest(symbol, start, end, capital)
         return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/options/signal/<symbol>')
+def options_signal(symbol):
+    """Get options trade recommendation for a symbol."""
+    try:
+        sym = symbol.upper()
+        data   = _compute_indicators_fast(sym)
+        data['symbol'] = sym
+        detail = _ai_score_detailed(data)
+        score  = detail['score']
+        regime = detail['market_state']
+        price  = data.get('last_price') or _get_current_price(sym)
+
+        import options_strategy as _os_mod
+        mgr = _os_mod.get_manager()
+        if not mgr:
+            return jsonify({'error': 'Options strategy manager not initialized'}), 503
+
+        pid    = int(request.args.get('pid', 1))
+        equity = _sim_state(pid).get('cash', 100000)
+        result = mgr.evaluate(sym, price, score, regime,
+                              uncertainty=detail.get('uncertainty', 0.3),
+                              portfolio_equity=equity, pid=pid)
+        result['ai_score']  = score
+        result['regime']    = regime
+        result['price']     = price
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/portfolios/<int:pid>/options')
+def portfolio_options(pid):
+    """List open options positions for a portfolio."""
+    try:
+        with _get_db() as conn:
+            rows = conn.execute(
+                '''SELECT * FROM sim_options_positions
+                   WHERE portfolio_id=? AND status='open'
+                   ORDER BY opened_at DESC''', (pid,)
+            ).fetchall()
+        positions = [dict(r) for r in rows]
+
+        # Compute total portfolio Greeks
+        import options_strategy as _os_mod
+        mgr = _os_mod.get_manager()
+        greeks_summary = {}
+        if mgr:
+            snap = mgr.portfolio_greeks_summary(pid)
+            greeks_summary = snap
+
+        return jsonify({'positions': positions, 'portfolio_greeks': greeks_summary})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/portfolios/<int:pid>/options/<int:pos_id>/close', methods=['POST'])
+def close_options_position(pid, pos_id):
+    """Manually close an options position."""
+    try:
+        with _get_db() as conn:
+            row = conn.execute(
+                'SELECT * FROM sim_options_positions WHERE id=? AND portfolio_id=?',
+                (pos_id, pid)
+            ).fetchone()
+            if not row:
+                return jsonify({'error': 'Position not found'}), 404
+
+            # Get current price from options engine
+            import options_engine as _oe_mod
+            eng = _oe_mod.get_engine()
+            current_price = row['entry_price']  # fallback
+            if eng:
+                try:
+                    quote = eng.chain.get_quote(row['symbol'])
+                    if quote:
+                        current_price = quote['mid']
+                except Exception:
+                    pass
+
+            realized_pl = (current_price - row['entry_price']) * row['contracts'] * 100
+            if row['side'] == 'short':
+                realized_pl = -realized_pl
+
+            conn.execute(
+                '''UPDATE sim_options_positions
+                   SET status='closed', exit_reason='manual', realized_pl=?,
+                       current_price=?, closed_at=datetime('now')
+                   WHERE id=?''',
+                (round(realized_pl, 2), current_price, pos_id)
+            )
+        return jsonify({'closed': True, 'realized_pl': round(realized_pl, 2)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/options/chain/<symbol>')
+def options_chain(symbol):
+    """Fetch live options chain for a symbol."""
+    try:
+        import options_engine as _oe_mod
+        eng = _oe_mod.get_engine()
+        if not eng:
+            return jsonify({'error': 'Options engine not initialized'}), 503
+
+        sym   = symbol.upper()
+        price = _get_current_price(sym)
+        dte_min = int(request.args.get('dte_min', 20))
+        dte_max = int(request.args.get('dte_max', 60))
+        opt_type = request.args.get('type')  # 'call', 'put', or None for both
+
+        contracts = eng.chain.get_contracts(sym, dte_min, dte_max, opt_type)
+        # Enrich top 10 contracts with Greeks + IV (limited to control API calls)
+        enriched = []
+        for c in contracts[:10]:
+            ec = eng.chain.enrich_contract(c, price)
+            enriched.append(ec)
+
+        return jsonify({'symbol': sym, 'underlying_price': price,
+                        'contracts': enriched, 'count': len(enriched)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -2603,6 +2795,33 @@ def _ai_score_detailed(data: dict) -> dict:
         except Exception:
             pass
 
+    # ── Order flow signal ─────────────────────────────────────────────────────
+    if symbol:
+        try:
+            import order_flow as _of
+            of_sig = _of.get_signal(symbol)
+            of_contrib = of_sig.get('score_contrib', 0.0)
+            if of_contrib != 0:
+                score += of_contrib
+                breakdown['order_flow'] = {'bias': of_sig.get('bias', 'neutral'),
+                                           'contrib': round(of_contrib, 3),
+                                           'bid_ask_ratio': of_sig.get('bid_ask_ratio', 0.5)}
+        except Exception:
+            pass
+
+    # ── Macro environment signal ──────────────────────────────────────────────
+    try:
+        import macro_engine as _me
+        asset_class = _get_asset_class(symbol) if symbol else 'equity'
+        mac = _me.get_signal(asset_class)
+        mac_contrib = mac.get('score_contrib', 0.0)
+        if mac_contrib != 0:
+            score += mac_contrib * 0.5  # macro is background context, weight 50%
+            breakdown['macro'] = {'regime': mac.get('regime', 'neutral'),
+                                  'contrib': round(mac_contrib * 0.5, 3)}
+    except Exception:
+        pass
+
     # ── Uncertainty score ─────────────────────────────────────────────────────
     bull_count = sum(1 for k, v in breakdown.items()
                      if isinstance(v, dict) and v.get('contribution', 0) > 0)
@@ -3131,6 +3350,21 @@ def _ai_run_portfolio(pid: int) -> dict:
                             )
                         except Exception:
                             pass
+                        # RL outcome recording
+                        try:
+                            import rl_engine as _rl_mod
+                            if _rl_mod.get_engine():
+                                # Find the original RL state/action from ai_log (best effort)
+                                with _get_db() as _conn:
+                                    _log = _conn.execute(
+                                        'SELECT reason FROM ai_log WHERE portfolio_id=? AND symbol=? AND action=? ORDER BY id DESC LIMIT 1',
+                                        (pid, sym, 'BUY')
+                                    ).fetchone()
+                                pl = (fill - row['avg_cost']) * row['shares']
+                                max_r = ATR_STOP_M * atr * row['shares']
+                                _rl_mod.record_outcome('', '', pl, max(max_r, 1.0))
+                        except Exception:
+                            pass
                         summary['sold'].append({'symbol': sym, 'price': round(fill, 2),
                                                 'score': score, 'reason': reason,
                                                 'market_state': detail['market_state']})
@@ -3273,12 +3507,47 @@ def _ai_run_portfolio(pid: int) -> dict:
 
             asset_class = _get_asset_class(c['symbol'])
 
+            # ── RL engine: get recommended action for this market state ────────
+            rl_action = {}
+            rl_state_key  = ''
+            rl_action_key = ''
+            rl_risk_pct   = 0.005
+            try:
+                import rl_engine as _rl_mod
+                if _rl_mod.get_engine():
+                    mtf_b  = c.get('detail', {}).get('mtf_bias', {}).get('bias', 'neutral')
+                    swing_b = 'undefined'
+                    try:
+                        import structure_engine as _se
+                        snap = _se.snapshot(c['symbol'])
+                        swing_b = snap.get('swing_bias', 'undefined')
+                    except Exception:
+                        pass
+                    heat = _compute_portfolio_heat(pid, equity)
+                    rl_action = _rl_mod.get_action(
+                        regime=c.get('detail', {}).get('market_state', 'neutral'),
+                        mtf_bias=mtf_b, swing_bias=swing_b, portfolio_heat=heat
+                    )
+                    rl_state_key  = rl_action.get('state_key', '')
+                    rl_action_key = f"{rl_action.get('strategy','momentum')}|{rl_action.get('size_tier','medium')}|{rl_action.get('timing','immediate')}"
+                    # RL size override: blend RL risk_pct with base sizing
+                    rl_risk_pct = rl_action.get('risk_pct', 0.005)
+            except Exception:
+                rl_risk_pct = 0.005
+
+            # Store RL keys in candidate for later outcome recording
+            c['_rl_state']  = rl_state_key
+            c['_rl_action'] = rl_action_key
+
             # ── 1. Risk-per-trade sizing ──────────────────────────────────────
             # Risk 0.5%–1.0% of equity per trade, scaled by signal conviction
             RISK_PER_TRADE     = 0.005
             MAX_RISK_PER_TRADE = 0.010
             score_factor = min(1.0, max(0.0, (abs(c['score']) - BUY_THRESH) / max(5.0 - BUY_THRESH, 1)))
-            risk_pct     = RISK_PER_TRADE + score_factor * (MAX_RISK_PER_TRADE - RISK_PER_TRADE)
+            rule_risk_pct = RISK_PER_TRADE + score_factor * (MAX_RISK_PER_TRADE - RISK_PER_TRADE)
+            # Blend 70% rule-based + 30% RL-recommended risk
+            rl_r = rl_risk_pct
+            risk_pct = rule_risk_pct * 0.7 + rl_r * 0.3
 
             atr_val       = c.get('atr') or (c['price'] * 0.02)
             stop_m, _     = _regime_stop_multiplier(c['detail']['market_state'])
@@ -4308,6 +4577,41 @@ if __name__ == '__main__':
         print('[TradeSimulator] CircuitBreakers initialized.')
     except Exception as e:
         print(f'[TradeSimulator] CircuitBreakers failed: {e}')
+
+    try:
+        import options_engine as _oe
+        _oe.init(DB_PATH)
+        print('[TradeSimulator] OptionsEngine initialized (Black-Scholes + Alpaca chain).')
+    except Exception as e:
+        print(f'[TradeSimulator] OptionsEngine failed: {e}')
+
+    try:
+        import options_strategy as _os
+        _os.init(DB_PATH)
+        print('[TradeSimulator] OptionsStrategyManager initialized.')
+    except Exception as e:
+        print(f'[TradeSimulator] OptionsStrategy failed: {e}')
+
+    try:
+        import rl_engine as _rl
+        _rl.init(DB_PATH)
+        print('[TradeSimulator] RLEngine initialized (Q-table strategy adaptation).')
+    except Exception as e:
+        print(f'[TradeSimulator] RLEngine failed: {e}')
+
+    try:
+        import order_flow as _of
+        _of.init(event_bus=event_bus)
+        print('[TradeSimulator] OrderFlowEngine started (bid/ask imbalance tracking).')
+    except Exception as e:
+        print(f'[TradeSimulator] OrderFlow failed: {e}')
+
+    try:
+        import macro_engine as _me
+        _me.init()
+        print('[TradeSimulator] MacroEngine started (cross-asset signals, 15m poll).')
+    except Exception as e:
+        print(f'[TradeSimulator] MacroEngine failed: {e}')
 
     try:
         import news_engine as _ne
