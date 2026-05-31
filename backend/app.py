@@ -3641,11 +3641,11 @@ def _ai_score(data: dict) -> float:
 
 
 def _ai_log_entry(pid: int, symbol: str, action: str, score: float,
-                  price: float, shares: float, reason: str):
+                  price: float, shares: float, reason: str, market_state: str = ''):
     with _get_db() as conn:
         conn.execute(
-            'INSERT INTO ai_log (portfolio_id, symbol, action, score, price, shares, reason) VALUES (?,?,?,?,?,?,?)',
-            (pid, symbol, action, score, price, shares, reason)
+            'INSERT INTO ai_log (portfolio_id, symbol, action, score, price, shares, reason, market_state) VALUES (?,?,?,?,?,?,?,?)',
+            (pid, symbol, action, score, price, shares, reason, market_state or '')
         )
 
 
@@ -4060,7 +4060,9 @@ ASSET_CLASS_CAPS = {
     'futures': 0.25,
 }
 # Profit floor multiplier × ATR% per asset class (replaces fixed 1.5%)
-_PROFIT_FLOOR_ATR = {'crypto': 0.8, 'equity': 1.0, 'futures': 1.2, 'forex': 0.5}
+_PROFIT_FLOOR_ATR = {'crypto': 1.5, 'equity': 1.8, 'futures': 2.0, 'forex': 1.0}
+# Raised — avg win was +$3 on $3-5k positions (0.06%) which is noise.
+# New targets require ~0.3-0.5% move before taking profit.
 # Max single position size per asset class (as % of equity)
 SINGLE_POS_CAPS = {
     'crypto':  0.06,   # raised: 3% → 6% per position
@@ -4484,9 +4486,9 @@ def _ai_run_portfolio(pid: int) -> dict:
     ATR_STOP_M   = 1.5
     ATR_TGT_M    = 2.5
     BATCH_SIZE   = 30   # raised from 25 — scan more symbols per cycle
-    BUY_THRESH   = 2.5     # require strong conviction to enter
+    BUY_THRESH   = 3.5     # raised: overnight longs lost while shorts won — need higher long conviction
     SELL_THRESH  = -1.8    # exit sooner when signals turn bearish
-    SHORT_THRESH = -3.0    # strong bearish signal required to open a short
+    SHORT_THRESH = -2.5    # lowered: shorts working — allow more short entries
     COVER_THRESH = 1.0     # close short when signal turns neutral/bullish
 
     history_ctx = _build_history_context(pid)
@@ -4565,7 +4567,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                                                    'market_state': detail['market_state'],
                                                    'type': 'cover'})
                         _ai_log_entry(pid, sym, 'COVER', score, fill, short_qty,
-                                      f"{reason} | short closed | {detail['summary'][:80]}")
+                                      f"{reason} | short closed | {detail['summary'][:80]}",
+                                      market_state=detail.get('market_state',''))
                 else:
                     # ── Long position: profit-protection engine ────────────────────
                     stop_m, tgt_m = _regime_stop_multiplier(detail['market_state'])
@@ -4622,7 +4625,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                                                 'market_state': detail['market_state'],
                                                 'type': 'sell'})
                         _ai_log_entry(pid, sym, 'SELL', score, fill, row['shares'],
-                                      f"{reason} | {detail['summary'][:80]}")
+                                      f"{reason} | {detail['summary'][:80]}",
+                                      market_state=detail.get('market_state',''))
                     # ── Bearish intelligence: gradual trim ────────────────────────
                     elif tradeable and not (score <= SELL_THRESH or price <= trailing or price >= tgt or hit_profit_floor):
                         try:
@@ -4641,7 +4645,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                                         'trim_pct': int(trim_frac * 100),
                                     })
                                     _ai_log_entry(pid, sym, 'SELL', score, fill, trim_shares,
-                                                  f'bearish trim {int(trim_frac*100)}% | {b_result["description"][:60]}')
+                                                  f'bearish trim {int(trim_frac*100)}% | {b_result["description"][:60]}',
+                                                  market_state=detail.get('market_state',''))
                         except Exception:
                             pass
             except Exception as e:
@@ -4732,6 +4737,24 @@ def _ai_run_portfolio(pid: int) -> dict:
                 summary['scanned'] += 1
                 qualifies_long  = score >= BUY_THRESH
                 qualifies_short = score <= SHORT_THRESH
+
+                # Daily trend gate: block longs if daily trend is DOWN
+                # Overnight data showed longs in downtrending crypto lost while shorts won
+                if qualifies_long and _is_fractional_asset(sym):
+                    try:
+                        import yfinance as _yf_tg
+                        _daily = _yf_tg.Ticker(sym).history(period='10d', interval='1d')
+                        if not _daily.empty and len(_daily) >= 5:
+                            _closes = list(_daily['Close'].dropna())
+                            _ma5  = sum(_closes[-5:]) / 5
+                            _last = _closes[-1]
+                            if _last < _ma5 * 0.99:  # price below 5-day MA → downtrend
+                                qualifies_long = False
+                                _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
+                                              'daily_downtrend', f'price ${_last:.4f} below 5d MA ${_ma5:.4f}')
+                    except Exception:
+                        pass
+
                 # Skip long entries in regimes with poor 30-day history
                 if qualifies_long and detail['market_state'] in history_ctx['cautious_regimes']:
                     qualifies_long = False
@@ -4942,14 +4965,9 @@ def _ai_run_portfolio(pid: int) -> dict:
                     # Low volume: reduce size 50% (uncertain signal)
                     position_value *= 0.5
 
-            # ── 8. Minimum confidence gate ────────────────────────────────────
-            conf = c.get('confidence', 50)
-            if conf < 35:
-                summary['skipped'].append(f"{c['symbol']}: low confidence ({conf})")
-                _log_decision(pid, c['symbol'], 'REJECT', c.get('score', 0),
-                              c.get('detail', {}).get('market_state', ''),
-                              'confidence_gate', f'confidence {conf}/35')
-                continue
+            # Confidence gate REMOVED — confidence is already baked into quality score.
+            # Blocking on confidence separately caused 98.1% of all rejections (crypto
+            # structurally scores 15-30 due to ATR penalty, so this gate blocked everything).
 
             # ── Circuit breaker check ─────────────────────────────────────────
             try:
@@ -5017,7 +5035,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                         'trade_quality': c.get('trade_quality', None),
                     })
                     _ai_log_entry(pid, c['symbol'], 'BUY', c['score'], fill, shares,
-                                  f"score {c['score']:+.1f} | {c['detail']['summary'][:80]}")
+                                  f"score {c['score']:+.1f} | {c['detail']['summary'][:80]}",
+                                  market_state=c.get('detail', {}).get('market_state', ''))
                     import json as _json_d
                     _log_decision(pid, c['symbol'], 'ACCEPT', c.get('score', 0),
                                   c.get('detail', {}).get('market_state', ''),
@@ -5039,7 +5058,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                         'type': 'short',
                     })
                     _ai_log_entry(pid, c['symbol'], 'SHORT', c['score'], fill, shares,
-                                  f"score {c['score']:+.1f} | bearish short | {c['detail']['summary'][:80]}")
+                                  f"score {c['score']:+.1f} | bearish short | {c['detail']['summary'][:80]}",
+                                  market_state=c.get('detail', {}).get('market_state', ''))
                     import json as _json_d
                     _log_decision(pid, c['symbol'], 'ACCEPT', c.get('score', 0),
                                   c.get('detail', {}).get('market_state', ''),
