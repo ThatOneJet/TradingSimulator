@@ -4194,7 +4194,28 @@ def _seed_intraday_candles(symbols: list) -> None:
             if bars:
                 with _candle_engine._lock:
                     _candle_engine._history[sym]['1m'].extend(bars)
-                print(f'[SEED_1M] {sym}: {len(bars)} intraday bars loaded')
+
+                # Immediately compute indicators on seeded history so
+                # candle_engine.latest() returns real data — not None — from first scan
+                try:
+                    from candle_engine import _compute_indicators
+                    with _candle_engine._lock:
+                        hist_deque = _candle_engine._history[sym]['1m']
+                        indicators = _compute_indicators(hist_deque)
+                    if indicators:
+                        payload = {
+                            'symbol': sym, 'interval': '1m',
+                            'open':  bars[-1].open, 'high': bars[-1].high,
+                            'low':   bars[-1].low,  'close': bars[-1].close,
+                            'volume': bars[-1].volume,
+                            'timestamp': bars[-1].ts, 'closed': True,
+                            'source': 'seed', **indicators,
+                        }
+                        with _candle_engine._lock:
+                            _candle_engine._latest[sym]['1m'] = payload
+                    print(f'[SEED_1M] {sym}: {len(bars)} bars + indicators ready')
+                except Exception as ie:
+                    print(f'[SEED_1M] {sym}: {len(bars)} bars loaded (indicator error: {ie})')
         except Exception as e:
             print(f'[SEED_1M] {sym} failed: {e}')
 
