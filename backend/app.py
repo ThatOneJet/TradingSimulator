@@ -1805,7 +1805,7 @@ def _quote_yfinance(symbol: str) -> dict:
     _price_cache[symbol] = (price, now)
     return q
 
-_FINNHUB_QUOTE_TTL = 8   # seconds — REST cache when WebSocket hasn't updated yet
+_FINNHUB_QUOTE_TTL = 30  # 30s cache — reduce Finnhub 429s on free tier
 
 def _quote_finnhub(symbol: str) -> dict:
     import requests

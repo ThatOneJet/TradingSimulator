@@ -25,9 +25,9 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-SENTIMENT_TTL  = 900    # 15 min cache for sentiment
-EARNINGS_TTL   = 3600   # 1 hour cache for earnings dates
-EVENT_TTL      = 1800   # 30 min cache for headline event detection
+SENTIMENT_TTL  = 3600   # 1 hour cache — was 15min, causing 429s on free tier (60 req/min limit)
+EARNINGS_TTL   = 7200   # 2 hour cache
+EVENT_TTL      = 3600   # 1 hour cache
 NEWS_WINDOW_H  = 4      # look at news in last 4 hours for velocity
 HIGH_VELOCITY  = 5      # articles in window = news_driven flag
 
@@ -148,18 +148,25 @@ _ECONOMIC_EVENTS = [
 # Internal Finnhub fetch helper
 # ---------------------------------------------------------------------------
 
+_finnhub_last_call = 0.0
+_finnhub_min_gap   = 2.0   # minimum 2 seconds between Finnhub calls (free tier: 60/min)
+
 def _fetch_finnhub(path: str, params: dict):
-    """Fetch from Finnhub REST API. Returns parsed JSON or None on failure."""
+    """Fetch from Finnhub REST API with rate limiting. Returns parsed JSON or None."""
+    global _finnhub_last_call
     key = os.getenv('FINNHUB_KEY', '')
     if not key:
         return None
-    import urllib.request
-    import urllib.parse
-    import json as _json
+    import urllib.request, urllib.parse, json as _json
+    # Rate limit: wait if called too fast
+    elapsed = time.time() - _finnhub_last_call
+    if elapsed < _finnhub_min_gap:
+        time.sleep(_finnhub_min_gap - elapsed)
     params = dict(params)
     params['token'] = key
     url = f'https://finnhub.io/api/v1{path}?' + urllib.parse.urlencode(params)
     try:
+        _finnhub_last_call = time.time()
         with urllib.request.urlopen(url, timeout=5) as r:
             return _json.loads(r.read())
     except Exception as e:
