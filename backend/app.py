@@ -5008,17 +5008,14 @@ def _ai_run_portfolio(pid: int) -> dict:
             if anomaly_mult < 1.0:
                 position_value *= anomaly_mult
 
-            # ── Futures: convert to contracts with multiplier ─────────────────
+            # ── Futures: skip entirely — notional exposure is too large for sim
+            # YM=F at $51k per contract, ES=F at $250k notional — distort portfolio badly
+            # Futures signals are useful for market context but not for sim trading
             if asset_class == 'futures':
-                multiplier = FUTURES_MULTIPLIERS.get(c['symbol'], 1)
-                if multiplier > 1:
-                    # Notional per contract = price × multiplier
-                    notional_per_contract = c['price'] * multiplier
-                    # Contracts that fit within our position_value budget
-                    contracts = max(1, int(position_value / notional_per_contract))
-                    contracts = min(contracts, MAX_FUTURES_CONTRACTS)
-                    raw_shares = contracts
-                    position_value = contracts * c['price']  # sim books at price, not notional
+                _log_decision(pid, c['symbol'], 'REJECT', c.get('score', 0),
+                              c.get('detail', {}).get('market_state', ''),
+                              'futures_skipped', 'futures excluded from sim — notional too large')
+                continue
 
             alloc = min(position_value, available)
             if alloc < 10:
