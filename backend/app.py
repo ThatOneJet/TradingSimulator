@@ -3649,8 +3649,9 @@ def _compute_trade_quality(c: dict, history_ctx: dict, portfolio_reg: dict,
         # 1. Signal conviction (0-20)
         pts_signal = min(20, score / 10 * 20)
 
-        # 2. Confidence score (0-15)
-        pts_conf = conf / 100 * 15
+        # 2. Confidence score (0-15) — floor at 5 so volatile assets aren't unfairly penalized
+        # Crypto gets confidence 15-30 due to ATR penalties, which unfairly caps quality scores
+        pts_conf = max(5.0, conf / 100 * 15)
 
         # 3. EV historical (0-15) — default 8 (unknown) if no history yet
         pts_ev = 8.0  # neutral: no history yet
@@ -3696,22 +3697,28 @@ def _compute_trade_quality(c: dict, history_ctx: dict, portfolio_reg: dict,
                  pts_mtf + pts_liq + pts_pattern + pts_portfolio)
         total = round(min(100, max(0, total)), 1)
 
-        # Dynamic threshold: lower for shorts (volatile downtrends naturally reduce confidence)
-        # raise when decay detected
+        # Calibrated thresholds — realistic given crypto confidence scoring constraints
+        # Confidence component max ~4pts for crypto (volatility penalty), so 62 is unreachable.
+        # Thresholds target top ~40% of setups passing (not top 5%).
         is_short_side = c.get('side', 'long') == 'short'
         if history_ctx.get('decay_detected'):
-            threshold = 65 if is_short_side else 68
+            threshold = 53 if is_short_side else 57   # tighter when losing streak
         else:
-            threshold = 52 if is_short_side else 62
+            threshold = 44 if is_short_side else 50   # normal: ~55-60 typical good setup passes
 
-        # Counter-trend trades require higher conviction
+        # Counter-trend trades require moderately higher conviction (not 72 — too restrictive)
         _regime = (c.get('detail') or {}).get('market_state', 'neutral')
         _is_counter_trend = (
             (not is_short_side and _regime in ('trending_down', 'distribution', 'mild_downtrend')) or
             (is_short_side and _regime in ('trending_up', 'breakout', 'mild_uptrend'))
         )
         if _is_counter_trend:
-            threshold = max(threshold, 72)  # require very high quality for counter-trend trades
+            threshold = max(threshold, 60)  # counter-trend: needs solid setup, but not impossible
+
+        # Strong signal floor: if score is very strong (>5), lower threshold slightly
+        _abs_score = abs(c.get('score', 0))
+        if _abs_score >= 5.0:
+            threshold = max(threshold - 4, 38)  # strong conviction → 4pt threshold bonus
 
         return {
             'score':     total,
