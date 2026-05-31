@@ -2776,7 +2776,7 @@ _AI_UNIVERSE = [
     'ADA-USD','AVAX-USD','DOGE-USD','LINK-USD',
     'ATOM-USD','AAVE-USD',
     # Replacements with real liquidity and market depth:
-    'UNI-USD',    # Uniswap — largest DEX, real protocol revenue
+    # 'UNI-USD' — delisted from yfinance, removed
     'LTC-USD',    # Litecoin — OG crypto, highly liquid
     'BCH-USD',    # Bitcoin Cash — high volume, liquid
     'XLM-USD',    # Stellar — institutional partnerships, liquid
@@ -3869,7 +3869,7 @@ def _compute_trade_quality(c: dict, history_ctx: dict, portfolio_reg: dict,
             elif _sym_wr <= 0.30 or _sym_pl < -20: _base += 7   # symbol consistently losing
             elif _sym_wr <= 0.40:                   _base += 3   # below average
 
-        threshold = int(max(36, min(72, _base)))
+        threshold = int(max(34, min(70, _base)))  # slightly more permissive floor/ceiling
 
         return {
             'score':     total,
