@@ -618,7 +618,7 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
         </div>
 
         {/* ── Tab switcher ── */}
-        <div style={{ display: 'flex', borderBottom: '1px solid rgba(140,170,220,0.08)', flexShrink: 0 }}>
+        <div style={{ display: 'flex', borderBottom: '1px solid rgba(140,170,220,0.08)', flexShrink: 0, alignItems: 'center' }}>
           {[['scans', 'Scans'], ['trades', 'Trade P&L'], ['30d', '30D Review']].map(([key, label]) => (
             <button key={key} onClick={() => setReviewTab(key)} style={{
               flex: 1, padding: '6px 0', border: 'none', cursor: 'pointer',
@@ -631,6 +631,34 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
               {label}
             </button>
           ))}
+          {/* Refresh button — shown when on trades or 30d tab */}
+          {(reviewTab === 'trades' || reviewTab === '30d') && (
+            <button
+              onClick={() => {
+                if (reviewTab === 'trades') {
+                  setTradeLoad(true)
+                  api.get(`/portfolios/${portfolioId}/trades?limit=200`)
+                    .then(r => { setTradeHist(r.data); setTradeLoad(false) })
+                    .catch(() => setTradeLoad(false))
+                } else {
+                  setReviewLoad(true)
+                  setReview(null); setDecisions(null)
+                  api.get(`/portfolios/${portfolioId}/history/review`)
+                    .then(r => { setReview(r.data); setReviewLoad(false) })
+                    .catch(() => setReviewLoad(false))
+                  api.get(`/portfolios/${portfolioId}/decisions/summary?days=7`)
+                    .then(r => setDecisions(r.data)).catch(() => {})
+                }
+              }}
+              disabled={reviewTab === 'trades' ? tradeLoad : reviewLoad}
+              title="Refresh"
+              style={{
+                background: 'none', border: 'none', cursor: 'pointer', padding: '0 8px',
+                color: (reviewTab === 'trades' ? tradeLoad : reviewLoad) ? 'var(--t-4)' : 'var(--t-3)',
+                fontSize: 13, lineHeight: 1, flexShrink: 0,
+              }}
+            >↻</button>
+          )}
         </div>
 
         {/* ── 30D Review panel ── */}

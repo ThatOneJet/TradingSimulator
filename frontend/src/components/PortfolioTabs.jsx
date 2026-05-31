@@ -614,6 +614,20 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
           >
             ✎ Rename
           </div>
+          {/* Refresh P&L */}
+          <div
+            onClick={async () => {
+              try {
+                await loadAll()
+                setCtxMenu(null)
+              } catch {}
+            }}
+            style={{ padding: '8px 14px', cursor: 'pointer', color: '#4ad9ff' }}
+            onMouseEnter={e => e.currentTarget.style.background = 'rgba(140,170,220,0.07)'}
+            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+          >
+            ↻ Refresh P&L
+          </div>
           {/* Reset Balance */}
           <div
             onClick={() => handleResetBalance(ctxMenu.portfolio)}
