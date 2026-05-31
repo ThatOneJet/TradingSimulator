@@ -3239,8 +3239,15 @@ def _ai_score_detailed(data: dict) -> dict:
         weights = {**weights, 'volume': weights['volume'] * 1.2,
                    'macd': weights['macd'] * 1.2}
 
-    # Trend gate: RSI/BB buy signals at 40% weight in confirmed downtrend
-    trend_penalty = 0.4 if slope < -0.05 else 1.0
+    # Countertrend penalty based on regime confirmation
+    _strong_downtrend = market_state in ('trending_down', 'distribution', 'euphoric')
+    _strong_uptrend   = market_state in ('trending_up', 'breakout')
+    if _strong_downtrend and slope < -0.05:
+        trend_penalty = 0.15  # 15% weight on bullish signals — strong downtrend confirmed
+    elif slope < -0.05:
+        trend_penalty = 0.35  # moderate downtrend
+    else:
+        trend_penalty = 1.0
 
     breakdown = {}
     score = 0.0
@@ -3358,6 +3365,20 @@ def _ai_score_detailed(data: dict) -> dict:
             score += breadth_contrib * 0.5   # breadth is market-wide, weight 50%
             breakdown['breadth'] = {'contrib': round(breadth_contrib * 0.5, 2),
                                     'signal': _be.latest().get('signal', 'neutral')}
+    except Exception:
+        pass
+
+    # ── Macro market filter ───────────────────────────────────────────────────
+    # If SPY is trending down, dampen all bullish signals across all symbols
+    try:
+        _spy_data = _proj_cache.get('SPY', (None, 0))
+        if _spy_data[0] and isinstance(_spy_data[0], dict):
+            _spy_trend = _spy_data[0].get('trend', 'sideways')
+            _spy_rsi   = float(_spy_data[0].get('rsi', 50) or 50)
+            if _spy_trend == 'down' and _spy_rsi < 45 and score > 0:
+                # SPY is in downtrend — dampen all bullish individual signals by 40%
+                score = score * 0.60
+                breakdown['macro_filter'] = {'signal': 'spy_downtrend', 'contrib': round(score * -0.40, 2)}
     except Exception:
         pass
 
@@ -3682,6 +3703,15 @@ def _compute_trade_quality(c: dict, history_ctx: dict, portfolio_reg: dict,
             threshold = 65 if is_short_side else 68
         else:
             threshold = 52 if is_short_side else 62
+
+        # Counter-trend trades require higher conviction
+        _regime = (c.get('detail') or {}).get('market_state', 'neutral')
+        _is_counter_trend = (
+            (not is_short_side and _regime in ('trending_down', 'distribution', 'mild_downtrend')) or
+            (is_short_side and _regime in ('trending_up', 'breakout', 'mild_uptrend'))
+        )
+        if _is_counter_trend:
+            threshold = max(threshold, 72)  # require very high quality for counter-trend trades
 
         return {
             'score':     total,
@@ -4647,6 +4677,14 @@ def _ai_run_portfolio(pid: int) -> dict:
                 summary.setdefault('session_notes', []).append(
                     f"{c['symbol']}: session factor {session_f:.0%}"
                 )
+
+            # ── Volume confirmation ───────────────────────────────────────────
+            _vol_sig = c.get('detail', {}).get('breakdown', {}).get('volume', {})
+            if isinstance(_vol_sig, dict):
+                _vsig_name = _vol_sig.get('signal', '')
+                if _vsig_name == 'low_volume':
+                    # Low volume: reduce size 50% (uncertain signal)
+                    position_value *= 0.5
 
             # ── 8. Minimum confidence gate ────────────────────────────────────
             conf = c.get('confidence', 50)

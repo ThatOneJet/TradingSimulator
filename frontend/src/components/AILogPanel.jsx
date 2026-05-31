@@ -125,7 +125,7 @@ function ScanModal({ run, onClose }) {
             {sold.length     > 0 && <Chip label={`${sold.length} sold`}        color="#ff476f" />}
             {covered.length  > 0 && <Chip label={`${covered.length} covered`}  color="#4ad9ff" />}
             {skipped.length  > 0 && <Chip label={`${skipped.length} skipped`}  color="#f5b342" />}
-            {run.error_count > 0 && <Chip label={`${run.error_count} no data`} color="#ff476f" />}
+            {run.error_count > 0 && <Chip label={`${run.error_count} skipped/no data`} color="#f5b342" />}
           </div>
           <button
             onClick={onClose}
@@ -307,10 +307,15 @@ function ScanModal({ run, onClose }) {
 
               {batchOpen && (() => {
                 const catLong    = batch.filter(b => !b.error && b.qualifies)
+                                        .sort((a,b) => (b.score||0) - (a.score||0))           // highest score first
                 const catShort   = batch.filter(b => !b.error && b.qualifies_short)
+                                        .sort((a,b) => (a.score||0) - (b.score||0))           // most negative first (strongest short)
                 const catWatch   = batch.filter(b => !b.error && !b.qualifies && !b.qualifies_short && Math.abs(b.score||0) >= 1.5)
+                                        .sort((a,b) => Math.abs(b.score||0) - Math.abs(a.score||0))  // strongest signal first
                 const catNeutral = batch.filter(b => !b.error && !b.qualifies && !b.qualifies_short && Math.abs(b.score||0) < 1.5)
+                                        .sort((a,b) => Math.abs(b.score||0) - Math.abs(a.score||0))
                 const catFailed  = batch.filter(b => b.error)
+                const catSkipped = skipped  // symbols skipped by quality gate / circuit breaker
 
                 const COLS = '1.8fr 0.9fr 1.1fr 0.6fr'
                 function BatchRow({ b }) {
@@ -380,11 +385,35 @@ function ScanModal({ run, onClose }) {
                       <span style={{ fontSize: 8, color: '#f5b342' }}>Decay → +6pts</span>
                       <span style={{ fontSize: 8, color: '#a78bfa' }}>Builds with trade history</span>
                     </div>
-                    <CatSection label="Qualify — Long" color="#3ddc97" items={catLong} bg="rgba(61,220,151,0.04)" />
-                    <CatSection label="Qualify — Short" color="#ff476f" items={catShort} bg="rgba(255,71,111,0.04)" />
+                    <CatSection label="Signal Long — score ≥ 2.5" color="#3ddc97" items={catLong} bg="rgba(61,220,151,0.04)" />
+                    <CatSection label="Signal Short — score ≤ -3.0" color="#ff476f" items={catShort} bg="rgba(255,71,111,0.04)" />
                     <CatSection label="Watching (near threshold)" color="#f5b342" items={catWatch} bg="rgba(245,179,66,0.03)" />
                     <CatSection label="Neutral" color="#475061" items={catNeutral} bg="transparent" />
-                    <CatSection label="No Data" color="#6b7689" items={catFailed} bg="transparent" />
+                    {catSkipped.length > 0 && (
+                      <div style={{ marginBottom: 8 }}>
+                        <div style={{ fontSize: 8, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#f5b342', marginBottom: 3, paddingLeft: 8 }}>
+                          Blocked by Gate <span style={{ fontWeight: 400, opacity: 0.6 }}>({catSkipped.length})</span>
+                        </div>
+                        <div style={{ background: 'rgba(245,179,66,0.03)', borderRadius: 4 }}>
+                          {catSkipped.map((s, i) => (
+                            <div key={i} style={{ padding: '3px 8px', borderBottom: '1px solid rgba(140,170,220,0.04)', display: 'flex', gap: 8, alignItems: 'center' }}>
+                              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: '#f5b342', fontWeight: 600, flexShrink: 0 }}>
+                                {typeof s === 'string' ? s : (s.symbol || '?')}
+                              </span>
+                              {typeof s === 'object' && s.reason && (
+                                <span style={{ fontSize: 8.5, color: 'var(--t-4)', fontFamily: 'var(--font-mono)' }}>{s.reason}</span>
+                              )}
+                              {typeof s === 'object' && s.score != null && (
+                                <span style={{ fontSize: 8.5, color: 'var(--t-3)', fontFamily: 'var(--font-mono)', marginLeft: 'auto', flexShrink: 0 }}>
+                                  {(s.score||0) >= 0 ? '+' : ''}{f(s.score, 1)}
+                                </span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {catFailed.length > 0 && <CatSection label="No Data" color="#6b7689" items={catFailed} bg="transparent" />}
                   </div>
                 )
               })()}
