@@ -4073,10 +4073,10 @@ _PROFIT_FLOOR_ATR = {'crypto': 1.5, 'equity': 1.8, 'futures': 2.0, 'forex': 1.0}
 # New targets require ~0.3-0.5% move before taking profit.
 # Max single position size per asset class (as % of equity)
 SINGLE_POS_CAPS = {
-    'crypto':  0.06,   # raised: 3% → 6% per position
-    'equity':  0.10,   # raised: 5% → 10% per position
-    'forex':   0.07,   # raised: 4% → 7% per position
-    'futures': 0.06,
+    'crypto':  0.04,   # max 4% per crypto position ($4k on $100k)
+    'equity':  0.05,   # max 5% per stock position ($5k on $100k)
+    'forex':   0.04,   # max 4% per forex position
+    'futures': 0.03,   # max 3% — futures excluded from sim anyway
 }
 MAX_PORTFOLIO_HEAT = 0.05   # max 5% of equity at risk simultaneously
 MAX_CLUSTER_EXPOSURE = 0.07 # max 7% of equity in any correlated cluster
@@ -4489,8 +4489,8 @@ def _check_single_position_exit(pid: int, symbol: str, data: dict) -> None:
 
 def _ai_run_portfolio(pid: int) -> dict:
     """One AI scan cycle: check existing positions, then scan a batch for buys."""
-    MAX_POS      = 15   # raised to 15 — more concurrent positions
-    CASH_RESERVE = 0.05    # reduced: 10% → 5% reserve — deploy more capital
+    MAX_POS      = 10   # max 10 positions — concentrate on quality
+    CASH_RESERVE = 0.35    # keep 35% cash always — no more 50% in one trade
     ATR_STOP_M   = 1.5
     ATR_TGT_M    = 2.5
     BATCH_SIZE   = 30   # raised from 25 — scan more symbols per cycle
@@ -4679,6 +4679,15 @@ def _ai_run_portfolio(pid: int) -> dict:
 
         # Portfolio regime — computed once after equity is known
         port_regime = _portfolio_regime(pid, equity)
+
+        # ── Portfolio P&L awareness: don't open new longs when bleeding ──────
+        state_initial = _sim_state(pid).get('initial_cash', 100000)
+        portfolio_loss_pct = (state_initial - equity) / state_initial if state_initial > 0 else 0
+        if portfolio_loss_pct > 0.05:   # down >5% total → stop all new longs
+            BUY_THRESH = 99.0  # effectively disable new longs
+            summary['skip_reason'] = summary.get('skip_reason') or 'portfolio_loss_protection'
+        elif portfolio_loss_pct > 0.03:  # down 3-5% → raise bar significantly
+            BUY_THRESH = max(BUY_THRESH, 5.0)
 
         # FIX: reserve is a % of CASH, not equity
         available = cash - cash * CASH_RESERVE
@@ -4897,8 +4906,8 @@ def _ai_run_portfolio(pid: int) -> dict:
 
             # ── 1. Risk-per-trade sizing ──────────────────────────────────────
             # Risk 1.5%–2.5% of equity per trade — was 0.5–1.0%, was leaving $90k idle
-            RISK_PER_TRADE     = 0.015
-            MAX_RISK_PER_TRADE = 0.025
+            RISK_PER_TRADE     = 0.005   # back to 0.5% — was causing 50% single position
+            MAX_RISK_PER_TRADE = 0.008   # max 0.8% per trade
             score_factor = min(1.0, max(0.0, (abs(c['score']) - BUY_THRESH) / max(5.0 - BUY_THRESH, 1)))
             rule_risk_pct = RISK_PER_TRADE + score_factor * (MAX_RISK_PER_TRADE - RISK_PER_TRADE)
             # Blend 70% rule-based + 30% RL-recommended risk
