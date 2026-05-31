@@ -942,6 +942,12 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
           )}
 
           {runs.map(run => {
+            const allSoldJ  = run.sold_json   || []
+            const allBoughtJ= run.bought_json || []
+            const shortedJ  = allBoughtJ.filter(b => b.type === 'short' || (!b.type && (b.score ?? 0) < 0))
+            const boughtJ   = allBoughtJ.filter(b => b.type === 'buy'   || (!b.type && (b.score ?? 0) >= 0))
+            const soldJ     = allSoldJ.filter(s => s.type === 'sell'    || (!s.type && !(s.reason||'').toLowerCase().includes('cover')))
+            const coveredJ  = allSoldJ.filter(s => s.type === 'cover'   || (!s.type &&  (s.reason||'').toLowerCase().includes('cover')))
             const hasTrades   = run.bought_count > 0 || run.sold_count > 0
             const isCryptoOnly = run.mode === 'crypto_forex'
             const skipReason   = run.skip_reason
@@ -985,22 +991,24 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
 
                 {/* Row 2: trade badges, skip reason, or "no trades" */}
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-                  {run.bought_count > 0 && (
-                    <span style={{
-                      fontSize: 9, fontFamily: 'var(--font-mono)', fontWeight: 700,
-                      color: '#3ddc97', background: 'rgba(61,220,151,0.10)',
-                      border: '1px solid rgba(61,220,151,0.25)', borderRadius: 4, padding: '2px 7px',
-                    }}>
-                      ▲ {run.bought_count} bought
+                  {boughtJ.length > 0 && (
+                    <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', fontWeight: 700, color: '#3ddc97', background: 'rgba(61,220,151,0.10)', border: '1px solid rgba(61,220,151,0.25)', borderRadius: 4, padding: '2px 7px' }}>
+                      ▲ {boughtJ.length} bought
                     </span>
                   )}
-                  {run.sold_count > 0 && (
-                    <span style={{
-                      fontSize: 9, fontFamily: 'var(--font-mono)', fontWeight: 700,
-                      color: '#ff476f', background: 'rgba(255,71,111,0.10)',
-                      border: '1px solid rgba(255,71,111,0.25)', borderRadius: 4, padding: '2px 7px',
-                    }}>
-                      ▼ {run.sold_count} sold
+                  {shortedJ.length > 0 && (
+                    <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', fontWeight: 700, color: '#ff6a6a', background: 'rgba(255,106,106,0.10)', border: '1px solid rgba(255,106,106,0.25)', borderRadius: 4, padding: '2px 7px' }}>
+                      ↓ {shortedJ.length} shorted
+                    </span>
+                  )}
+                  {soldJ.length > 0 && (
+                    <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', fontWeight: 700, color: '#ff476f', background: 'rgba(255,71,111,0.10)', border: '1px solid rgba(255,71,111,0.25)', borderRadius: 4, padding: '2px 7px' }}>
+                      ▼ {soldJ.length} sold
+                    </span>
+                  )}
+                  {coveredJ.length > 0 && (
+                    <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', fontWeight: 700, color: '#4ad9ff', background: 'rgba(74,217,255,0.10)', border: '1px solid rgba(74,217,255,0.25)', borderRadius: 4, padding: '2px 7px' }}>
+                      ✓ {coveredJ.length} covered
                     </span>
                   )}
                   {skipReason && (
