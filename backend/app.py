@@ -1528,7 +1528,7 @@ def account():
 
     # Day P&L = realized gains/losses from trades CLOSED today (not open positions)
     import datetime
-    today_start = datetime.datetime.utcnow().strftime('%Y-%m-%d') + 'T00:00:00'
+    today_start = datetime.datetime.utcnow().strftime('%Y-%m-%d') + ' 00:00:00'
     with _get_db() as conn:
         prow = conn.execute('SELECT ai_controlled, strategy_type FROM portfolios WHERE id=?', (pid,)).fetchone()
         ai_controlled = int(prow['ai_controlled']) if prow else 0
@@ -4063,9 +4063,9 @@ ASSET_CLASS_CAPS = {
 _PROFIT_FLOOR_ATR = {'crypto': 0.8, 'equity': 1.0, 'futures': 1.2, 'forex': 0.5}
 # Max single position size per asset class (as % of equity)
 SINGLE_POS_CAPS = {
-    'crypto':  0.03,
-    'equity':  0.05,
-    'forex':   0.04,
+    'crypto':  0.06,   # raised: 3% → 6% per position
+    'equity':  0.10,   # raised: 5% → 10% per position
+    'forex':   0.07,   # raised: 4% → 7% per position
     'futures': 0.06,
 }
 MAX_PORTFOLIO_HEAT = 0.05   # max 5% of equity at risk simultaneously
@@ -4479,8 +4479,8 @@ def _check_single_position_exit(pid: int, symbol: str, data: dict) -> None:
 
 def _ai_run_portfolio(pid: int) -> dict:
     """One AI scan cycle: check existing positions, then scan a batch for buys."""
-    MAX_POS      = 12   # raised from 8 — allow more concurrent positions
-    CASH_RESERVE = 0.10    # keep ≥10% of CASH in reserve (not equity — bug fix)
+    MAX_POS      = 15   # raised to 15 — more concurrent positions
+    CASH_RESERVE = 0.05    # reduced: 10% → 5% reserve — deploy more capital
     ATR_STOP_M   = 1.5
     ATR_TGT_M    = 2.5
     BATCH_SIZE   = 30   # raised from 25 — scan more symbols per cycle
@@ -4859,9 +4859,9 @@ def _ai_run_portfolio(pid: int) -> dict:
             c['_rl_action'] = rl_action_key
 
             # ── 1. Risk-per-trade sizing ──────────────────────────────────────
-            # Risk 0.5%–1.0% of equity per trade, scaled by signal conviction
-            RISK_PER_TRADE     = 0.005
-            MAX_RISK_PER_TRADE = 0.010
+            # Risk 1.5%–2.5% of equity per trade — was 0.5–1.0%, was leaving $90k idle
+            RISK_PER_TRADE     = 0.015
+            MAX_RISK_PER_TRADE = 0.025
             score_factor = min(1.0, max(0.0, (abs(c['score']) - BUY_THRESH) / max(5.0 - BUY_THRESH, 1)))
             rule_risk_pct = RISK_PER_TRADE + score_factor * (MAX_RISK_PER_TRADE - RISK_PER_TRADE)
             # Blend 70% rule-based + 30% RL-recommended risk
