@@ -184,6 +184,7 @@ class PerformanceEngine:
                 t = s['trades']
                 result[kw] = {
                     'trades': t,
+                    'total_pl': round(s['total_pl'], 2),
                     'avg_pl': round(s['total_pl'] / t, 2) if t else 0.0,
                     'win_rate': round(s['wins'] / t, 4) if t else 0.0,
                 }
@@ -287,6 +288,70 @@ class PerformanceEngine:
                 'message': 'Error computing decay',
             }
 
+    def ev_by_setup(self, pid: int, days: int = 90) -> list:
+        """
+        Compute Expected Value per (regime, dominant_signal) setup.
+        Returns list sorted by EV descending.
+        Each entry: {setup, regime, signal, trades, win_rate, avg_win, avg_loss, ev, profitable}
+        """
+        try:
+            with self._get_db() as conn:
+                _migrate_db(conn)
+                cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+                rows = conn.execute('''
+                    SELECT t.realized_pl, t.created_at,
+                           l.market_state, l.reason, l.score
+                    FROM sim_trades t
+                    LEFT JOIN ai_log l ON l.portfolio_id = ?
+                        AND l.symbol = t.symbol
+                        AND l.action IN ('BUY', 'SHORT')
+                        AND l.created_at <= t.created_at
+                    WHERE t.portfolio_id = ? AND t.status = 'filled'
+                    AND t.side IN ('sell', 'cover') AND t.created_at > ?
+                ''', (pid, pid, cutoff)).fetchall()
+
+            groups = defaultdict(list)
+            for row in rows:
+                regime = row['market_state'] or 'unknown'
+                reason = (row['reason'] or '').lower()
+                # Extract dominant signal from reason text
+                signal = 'neutral'
+                for kw in ['rsi', 'macd', 'vwap', 'volume', 'trend', 'bb', 'stoch', 'pattern', 'news']:
+                    if kw in reason:
+                        signal = kw
+                        break
+                key = f'{regime}:{signal}'
+                groups[key].append(float(row['realized_pl'] or 0))
+
+            result = []
+            for setup, pls in groups.items():
+                if len(pls) < 3:
+                    continue
+                regime, signal = setup.split(':', 1)
+                wins   = [p for p in pls if p > 0]
+                losses = [p for p in pls if p <= 0]
+                wr     = len(wins) / len(pls)
+                avg_w  = sum(wins) / len(wins) if wins else 0
+                avg_l  = sum(losses) / len(losses) if losses else 0
+                ev     = wr * avg_w - (1 - wr) * abs(avg_l)
+                result.append({
+                    'setup':      setup,
+                    'regime':     regime,
+                    'signal':     signal,
+                    'trades':     len(pls),
+                    'win_rate':   round(wr, 3),
+                    'avg_win':    round(avg_w, 2),
+                    'avg_loss':   round(avg_l, 2),
+                    'ev':         round(ev, 2),
+                    'profitable': ev > 0,
+                    'total_pl':   round(sum(pls), 2),
+                })
+
+            return sorted(result, key=lambda x: x['ev'], reverse=True)
+        except Exception as e:
+            log.debug('[PERF] ev_by_setup error: %s', e)
+            return []
+
     def summary(self, pid: int) -> dict:
         try:
             regime_data = self.by_regime(pid, days=90)
@@ -344,3 +409,11 @@ def init_engine(db_path) -> PerformanceEngine:
 
 def get_engine() -> PerformanceEngine | None:
     return _engine
+
+
+def get_ev_by_setup(db_path, pid: int, days: int = 90) -> list:
+    """Module-level convenience for app.py to call."""
+    try:
+        return PerformanceEngine(db_path).ev_by_setup(pid, days)
+    except Exception:
+        return []

@@ -692,7 +692,7 @@ const ASSET_COLORS = {
   equity:  { text: '#f59e0b', bg: 'rgba(245,158,11,0.12)'  },
 }
 
-function ContextBar({ brief, price }) {
+function ContextBar({ brief, price, portReg }) {
   const [guideOpen, setGuideOpen] = useState(false)
   if (!brief) return null
   const ac    = brief.asset_class || 'equity'
@@ -790,11 +790,22 @@ function ContextBar({ brief, price }) {
           )}
         </>
       )}
+      {portReg && portReg.regime !== 'normal' && (
+        <div style={{
+          marginTop: 6, padding: '4px 8px',
+          background: portReg.regime === 'favorable' ? 'rgba(74,222,128,0.07)' : 'rgba(255,106,106,0.07)',
+          borderRadius: 4,
+          border: `1px solid ${portReg.regime === 'favorable' ? 'rgba(74,222,128,0.2)' : 'rgba(255,106,106,0.2)'}`,
+          fontSize: 9, color: portReg.regime === 'favorable' ? '#4ade80' : '#fb923c',
+        }}>
+          Portfolio: {portReg.reason}
+        </div>
+      )}
     </div>
   )
 }
 
-function AnalysisTab({ data, price, symbol, brief }) {
+function AnalysisTab({ data, price, symbol, brief, portReg }) {
   if (!data) return <div className="ap-placeholder">Loading indicators…</div>
 
   const macdDiff   = (data.macd_value ?? 0) - (data.macd_signal_value ?? 0)
@@ -990,7 +1001,7 @@ function AnalysisTab({ data, price, symbol, brief }) {
 
   return (
     <div className="ap-content">
-      <ContextBar brief={brief} price={price} />
+      <ContextBar brief={brief} price={price} portReg={portReg} />
       <TabbedIndicatorCard momentumPages={momentumPages} contextPages={contextPages} />
       <div style={{ borderTop: '1px solid rgba(140,170,220,0.07)', marginTop: 2 }}>
         <AIThesisPanel data={data} price={price} symbol={symbol} />
@@ -1337,7 +1348,7 @@ function LiveQuoteBar({ quote, extQuote, secsAgo }) {
 
 // ── Main export ────────────────────────────────────────────────────────────────
 
-export default function AnalysisPanel({ symbol, quote, delta }) {
+export default function AnalysisPanel({ symbol, quote, delta, portfolioId }) {
   const [tab,       setTab]      = useState('analysis')
   const [data,      setData]     = useState(null)
   const [loading,   setLoading]  = useState(false)
@@ -1347,6 +1358,7 @@ export default function AnalysisPanel({ symbol, quote, delta }) {
   const [aiLoading, setAiLoading]= useState(false)
   const [aiError,   setAiError]  = useState(null)
   const [brief,     setBrief]    = useState(null)
+  const [portReg,   setPortReg]  = useState(null)
   const lastUpdRef = useRef(null)
   const refreshRef = useRef(null)
 
@@ -1394,6 +1406,14 @@ export default function AnalysisPanel({ symbol, quote, delta }) {
     }).catch(() => {})
     return () => { cancelled = true }
   }, [symbol])
+
+  // Portfolio regime fetch
+  useEffect(() => {
+    if (!portfolioId || portfolioId === 0) return
+    api.get(`/portfolios/${portfolioId}/portfolio_regime`)
+      .then(r => setPortReg(r.data))
+      .catch(() => {})
+  }, [portfolioId])
 
   useEffect(() => {
     if (!quote) return
@@ -1499,7 +1519,7 @@ export default function AnalysisPanel({ symbol, quote, delta }) {
 
       <LiveQuoteBar quote={quote} extQuote={extQuote} secsAgo={secsAgo} />
 
-      {tab === 'analysis' && <AnalysisTab data={data} price={price} symbol={symbol} brief={brief} />}
+      {tab === 'analysis' && <AnalysisTab data={data} price={price} symbol={symbol} brief={brief} portReg={portReg} />}
       {tab === 'ai'       && <AIDecisionTab data={data} price={price} />}
       {tab === 'intel'    && <AIIntelTab detail={aiDetail} aiLoading={aiLoading} aiError={aiError} />}
 

@@ -1338,6 +1338,27 @@ def portfolio_history_review(pid):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/portfolios/<int:pid>/ev')
+def portfolio_ev(pid):
+    """Expected Value per setup from 90-day trade history."""
+    try:
+        from performance_engine import get_ev_by_setup
+        days = int(request.args.get('days', 90))
+        return jsonify(get_ev_by_setup(DB_PATH, pid, days))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/portfolios/<int:pid>/portfolio_regime')
+def portfolio_regime_endpoint(pid):
+    """Current portfolio regime and size multiplier."""
+    try:
+        state  = _sim_state(pid)
+        equity = state.get('equity') or state.get('cash') or 100000
+        return jsonify(_portfolio_regime(pid, equity))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/portfolios/<int:pid>/positions/protection')
 def positions_protection(pid):
     """Protection status for each open position — stage, stop, bearish risk."""
@@ -3022,6 +3043,69 @@ def _regime_stop_multiplier(market_state: str) -> tuple[float, float]:
     return 1.5, 1.5        # default: symmetric stop and target
 
 
+def _predict_regime_transition(symbol: str, current_regime: str, data: dict) -> dict:
+    """
+    Detect early signs of regime change from current indicators.
+    Returns {transition, confidence, description, score_adj}
+    where score_adj is a score adjustment to apply (+/- up to 0.5).
+    """
+    try:
+        adx     = float(data.get('adx', 0) or 0)
+        rsi     = float(data.get('rsi', 50) or 50)
+        vol_sig = data.get('volume_signal', '') or ''
+        vol_r   = float(data.get('volume_ratio', 1) or 1)
+        slope   = float(data.get('slope_pct', 0) or 0)
+        macd_x  = data.get('macd_cross', '') or ''
+        bb_pos  = data.get('bb_position', '') or ''
+
+        # Use _prev_signals to detect divergence
+        prev = _prev_signals.get(symbol, {})
+        prev_adx  = float(prev.get('adx', adx))
+        prev_rsi  = float(prev.get('rsi', rsi))
+
+        adx_rising  = adx > prev_adx + 2
+        adx_falling = adx < prev_adx - 2
+        rsi_diverge = (rsi < prev_rsi - 5) and slope > 0  # price up, RSI down = divergence
+
+        transition = 'none'
+        confidence = 0.0
+        desc       = ''
+        score_adj  = 0.0
+
+        if current_regime in ('ranging', 'accumulation') and adx_rising and vol_r > 1.3:
+            transition = 'breakout_forming'
+            confidence = min(1.0, adx / 25 * vol_r / 1.5)
+            desc = f'ADX rising ({adx:.0f}) with volume — breakout likely'
+            score_adj = +0.4 * confidence  # boost breakout setups
+
+        elif current_regime in ('trending_up',) and adx_falling and vol_r < 0.8:
+            transition = 'distribution_forming'
+            confidence = min(1.0, (prev_adx - adx) / 10)
+            desc = f'ADX declining ({adx:.0f}) on low volume — trend weakening'
+            score_adj = -0.3 * confidence  # dampen long signals
+
+        elif rsi_diverge and current_regime in ('trending_up', 'breakout'):
+            transition = 'momentum_fade'
+            confidence = min(1.0, (prev_rsi - rsi) / 10)
+            desc = f'RSI divergence ({rsi:.0f}) while price rising — exhaustion signal'
+            score_adj = -0.4 * confidence
+
+        elif current_regime == 'panic' and rsi < 25 and vol_r > 2:
+            transition = 'capitulation_reversal'
+            confidence = min(1.0, (25 - rsi) / 15 * vol_r / 3)
+            desc = f'Panic at RSI {rsi:.0f} with {vol_r:.1f}× volume — reversal possible'
+            score_adj = +0.5 * confidence
+
+        return {
+            'transition':  transition,
+            'confidence':  round(confidence, 2),
+            'description': desc,
+            'score_adj':   round(score_adj, 2),
+        }
+    except Exception:
+        return {'transition': 'none', 'confidence': 0, 'description': '', 'score_adj': 0}
+
+
 def _protection_stage(avg_cost: float, current_price: float,
                       stop_price: float | None, atr: float) -> dict:
     """
@@ -3319,6 +3403,20 @@ def _ai_score_detailed(data: dict) -> dict:
     except Exception:
         pass
 
+    # ── Regime transition prediction ──────────────────────────────────────────
+    if symbol:
+        try:
+            trans = _predict_regime_transition(symbol, market_state, data)
+            if trans['score_adj'] != 0:
+                score += trans['score_adj']
+                breakdown['transition'] = {
+                    'signal': trans['transition'],
+                    'contrib': trans['score_adj'],
+                    'description': trans['description'],
+                }
+        except Exception:
+            pass
+
     # ── Extended signal engines (Tier A–C) — each adds a small weighted nudge ──
     # All wrapped individually so any one failing never breaks scoring.
     _ext_price = price or 0
@@ -3506,6 +3604,99 @@ def _compute_confidence(score: float, data: dict, detail: dict) -> int:
     return max(5, min(95, confidence))
 
 
+def _compute_trade_quality(c: dict, history_ctx: dict, portfolio_reg: dict,
+                            liq: dict, data: dict) -> dict:
+    """
+    Composite trade quality score 0–100. Threshold ≥62 to open position.
+
+    Components:
+      Signal conviction (20): abs(score)/10 * 20, capped at 20
+      Confidence (15): existing confidence/100 * 15
+      EV historical (15): 15 if EV>0 known, 8 if unknown, 0 if EV<0
+      Regime suitability (10): strong=10, normal=5, cautious=0, avoid=-5
+      MTF alignment (10): all agree=10, 2/3=6, 1/3=2, opposing=0
+      Liquidity (10): liq.score/10 * 10
+      Pattern confirmation (10): detected candlestick/momentum = 10, none = 5
+      Portfolio regime (10): favorable=10, normal=8, defensive=5, preservation=0
+    """
+    try:
+        score = abs(c.get('score', 0))
+        conf  = c.get('confidence', 50) or 50
+        detail = c.get('detail', {}) or {}
+        mtf   = (detail.get('mtf_bias') or detail.get('breakdown', {}).get('mtf') or {})
+
+        # 1. Signal conviction (0-20)
+        pts_signal = min(20, score / 10 * 20)
+
+        # 2. Confidence score (0-15)
+        pts_conf = conf / 100 * 15
+
+        # 3. EV historical (0-15) — default 8 (unknown) if no history yet
+        pts_ev = 8.0  # neutral: no history yet
+
+        # 4. Regime suitability (0-10)
+        regime = detail.get('market_state', 'neutral') or 'neutral'
+        if regime in history_ctx.get('strong_regimes', set()):
+            pts_regime = 10
+        elif regime in history_ctx.get('cautious_regimes', set()):
+            pts_regime = 0
+        elif regime in ('panic', 'news_driven', 'euphoric'):
+            pts_regime = 2
+        else:
+            pts_regime = 5
+
+        # 5. MTF alignment (0-10)
+        mtf_bias   = mtf.get('bias', 'neutral') if isinstance(mtf, dict) else 'neutral'
+        alignment  = float(mtf.get('alignment', 0.33) if isinstance(mtf, dict) else 0.33)
+        score_dir  = 1 if c.get('score', 0) > 0 else -1
+        bias_dir   = 1 if mtf_bias == 'bullish' else -1 if mtf_bias == 'bearish' else 0
+        if bias_dir != 0 and bias_dir == score_dir:
+            pts_mtf = alignment * 10
+        elif bias_dir != 0 and bias_dir != score_dir:
+            pts_mtf = 0
+        else:
+            pts_mtf = 3  # neutral MTF
+
+        # 6. Liquidity (0-10)
+        pts_liq = float(liq.get('score', 5)) if liq else 5.0
+
+        # 7. Pattern confirmation (0-10)
+        breakdown = detail.get('breakdown', {}) or {}
+        pattern_score = float((breakdown.get('pattern') or {}).get('score', 0) if isinstance(breakdown.get('pattern'), dict) else breakdown.get('pattern', 0) or 0)
+        momentum_score = float((breakdown.get('momentum') or {}).get('score', 0) if isinstance(breakdown.get('momentum'), dict) else breakdown.get('momentum', 0) or 0)
+        pts_pattern = min(10, max(0, (abs(pattern_score) + abs(momentum_score)) * 3 + 5))
+
+        # 8. Portfolio regime (0-10)
+        port_regime = portfolio_reg.get('regime', 'normal')
+        pts_portfolio = {'favorable': 10, 'normal': 8, 'defensive': 5,
+                         'capital_preservation': 0}.get(port_regime, 8)
+
+        total = (pts_signal + pts_conf + pts_ev + pts_regime +
+                 pts_mtf + pts_liq + pts_pattern + pts_portfolio)
+        total = round(min(100, max(0, total)), 1)
+
+        # Dynamic threshold: raise if recent win rate is poor
+        threshold = 68 if history_ctx.get('decay_detected') else 62
+
+        return {
+            'score':     total,
+            'threshold': threshold,
+            'passed':    total >= threshold,
+            'breakdown': {
+                'signal':    round(pts_signal, 1),
+                'confidence': round(pts_conf, 1),
+                'ev':        round(pts_ev, 1),
+                'regime':    round(pts_regime, 1),
+                'mtf':       round(pts_mtf, 1),
+                'liquidity': round(pts_liq, 1),
+                'pattern':   round(pts_pattern, 1),
+                'portfolio': round(pts_portfolio, 1),
+            },
+        }
+    except Exception:
+        return {'score': 50, 'threshold': 62, 'passed': True, 'breakdown': {}}
+
+
 def _compute_exposure(pid: int, equity: float, held_prices: dict) -> dict:
     """Return current exposure by asset class as fraction of equity."""
     if equity <= 0:
@@ -3611,6 +3802,65 @@ def _is_fractional_asset(sym: str) -> bool:
     return sym.endswith('-USD') or sym.endswith('=X') or sym.endswith('=F')
 
 
+def _liquidity_check(symbol: str, position_value: float, price: float) -> dict:
+    """
+    Estimate liquidity quality and slippage for a proposed trade.
+    Returns {liquid, spread_pct, slippage_pct, score_0_10, skip_reason}
+    """
+    try:
+        # Get avg daily volume from proj_cache or quick yfinance fetch
+        avg_vol = 0
+        if symbol in _proj_cache:
+            payload, _ = _proj_cache[symbol]
+            avg_vol = float(payload.get('_avg_vol', 0))
+
+        if avg_vol <= 0:
+            try:
+                import yfinance as yf
+                hist = yf.Ticker(symbol).history(period='20d', interval='1d')
+                if not hist.empty:
+                    avg_vol = float(hist['Volume'].mean())
+                    # Cache it
+                    if symbol in _proj_cache:
+                        _proj_cache[symbol][0]['_avg_vol'] = avg_vol
+            except Exception:
+                pass
+
+        # Spread from order_flow if available
+        spread_pct = 0.05  # default 5bps assumption
+        try:
+            import order_flow as _of
+            of_sig = _of.get_signal(symbol)
+            ratio = of_sig.get('bid_ask_ratio', 0.5)
+            spread_pct = abs(ratio - 0.5) * 0.2  # rough spread proxy
+        except Exception:
+            pass
+
+        # Slippage estimate: position_value / (avg_daily_notional) × impact factor
+        avg_notional = avg_vol * price if avg_vol > 0 and price > 0 else 1e9
+        slippage_pct = min(0.05, (position_value / avg_notional) * 0.10) if avg_notional > 0 else 0.01
+
+        # Liquidity score 0-10 (higher = more liquid)
+        liq_score = 10.0
+        if avg_notional < 1_000_000:    liq_score -= 4  # very thin
+        elif avg_notional < 10_000_000: liq_score -= 2  # thin
+        if spread_pct > 0.01:           liq_score -= 2  # wide spread
+        if slippage_pct > 0.005:        liq_score -= 1  # significant impact
+        liq_score = max(0.0, liq_score)
+
+        return {
+            'liquid':        liq_score >= 5,
+            'spread_pct':    round(spread_pct * 100, 3),
+            'slippage_pct':  round(slippage_pct * 100, 4),
+            'score':         round(liq_score, 1),
+            'avg_daily_vol': int(avg_vol),
+            'skip_reason':   f'Illiquid ({liq_score:.0f}/10)' if liq_score < 3 else '',
+        }
+    except Exception:
+        return {'liquid': True, 'spread_pct': 0, 'slippage_pct': 0,
+                'score': 5.0, 'avg_daily_vol': 0, 'skip_reason': ''}
+
+
 def _get_asset_class(sym: str) -> str:
     if sym.endswith('-USD'): return 'crypto'
     if sym.endswith('=X'):   return 'forex'
@@ -3624,6 +3874,8 @@ ASSET_CLASS_CAPS = {
     'forex':   0.20,
     'futures': 0.25,
 }
+# Profit floor multiplier × ATR% per asset class (replaces fixed 1.5%)
+_PROFIT_FLOOR_ATR = {'crypto': 0.8, 'equity': 1.0, 'futures': 1.2, 'forex': 0.5}
 # Max single position size per asset class (as % of equity)
 SINGLE_POS_CAPS = {
     'crypto':  0.03,
@@ -3835,6 +4087,56 @@ def _build_history_context(pid: int) -> dict:
         return default
 
 
+def _portfolio_regime(pid: int, equity: float) -> dict:
+    """Classify the portfolio's own regime and return a size multiplier."""
+    try:
+        from performance_engine import PerformanceEngine
+        pe = PerformanceEngine(DB_PATH)
+        decay = pe.decay_check(pid, short_window=7, long_window=30)
+        recent_wr = decay.get('recent_win_rate', 0.5)
+
+        # Drawdown from high-water mark
+        cb = None
+        try:
+            import circuit_breakers as _cb_mod
+            cb = _cb_mod.get()
+        except Exception:
+            pass
+        hwm = cb._hwm.get(pid, equity) if cb else equity
+        drawdown = (hwm - equity) / hwm if hwm > equity else 0.0
+
+        # Breadth signal
+        try:
+            import breadth_engine as _be
+            breadth = _be.latest().get('signal', 'neutral')
+        except Exception:
+            breadth = 'neutral'
+
+        # Classify portfolio regime
+        if drawdown >= 0.10:
+            regime = 'capital_preservation'
+            mult   = 0.40
+            reason = f'Drawdown {drawdown:.1%} — capital preservation mode'
+        elif drawdown >= 0.06 and breadth in ('bear', 'strong_bear'):
+            regime = 'defensive'
+            mult   = 0.70
+            reason = f'Drawdown {drawdown:.1%} + weak breadth — defensive sizing'
+        elif recent_wr >= 0.60 and breadth in ('bull', 'strong_bull') and drawdown < 0.02:
+            regime = 'favorable'
+            mult   = 1.15
+            reason = f'Win rate {recent_wr:.0%} + strong breadth — increasing allocation'
+        else:
+            regime = 'normal'
+            mult   = 1.0
+            reason = 'Normal conditions'
+
+        return {'regime': regime, 'size_multiplier': mult, 'reason': reason,
+                'drawdown': round(drawdown, 4), 'recent_win_rate': recent_wr}
+    except Exception:
+        return {'regime': 'normal', 'size_multiplier': 1.0, 'reason': 'default',
+                'drawdown': 0.0, 'recent_win_rate': 0.5}
+
+
 def _check_single_position_exit(pid: int, symbol: str, data: dict) -> None:
     """Event-triggered exit check for a single held position (called on bar close)."""
     try:
@@ -3904,7 +4206,6 @@ def _ai_run_portfolio(pid: int) -> dict:
     SELL_THRESH  = -1.8    # exit sooner when signals turn bearish
     SHORT_THRESH = -3.0    # strong bearish signal required to open a short
     COVER_THRESH = 1.0     # close short when signal turns neutral/bullish
-    PROFIT_FLOOR = 0.015   # always sell if up >1.5% regardless of ATR target
 
     history_ctx = _build_history_context(pid)
     BUY_THRESH  = BUY_THRESH  + history_ctx['buy_thresh_adj']
@@ -3998,7 +4299,10 @@ def _ai_run_portfolio(pid: int) -> dict:
                             conn.execute('UPDATE sim_positions SET stop_price=? WHERE id=?',
                                          (round(trailing, 4), row['id']))
                     profit_pct = (price - row['avg_cost']) / row['avg_cost'] if row['avg_cost'] > 0 else 0
-                    hit_profit_floor = profit_pct >= PROFIT_FLOOR
+                    _pf_mult    = _PROFIT_FLOOR_ATR.get(_get_asset_class(sym), 1.0)
+                    _atr_pct_v  = float(data.get('atr_pct', 2.0) or 2.0)
+                    profit_floor = _pf_mult * _atr_pct_v / 100   # dynamic: e.g., crypto 0.8×3% = 2.4%
+                    hit_profit_floor = profit_pct >= profit_floor
                     if tradeable and (score <= SELL_THRESH or price <= trailing or price >= tgt or hit_profit_floor):
                         reason = ('sell_signal'   if score <= SELL_THRESH
                                   else 'stop_loss'    if price <= trailing
@@ -4078,6 +4382,9 @@ def _ai_run_portfolio(pid: int) -> dict:
             except Exception:
                 pass
 
+        # Portfolio regime — computed once after equity is known
+        port_regime = _portfolio_regime(pid, equity)
+
         # FIX: reserve is a % of CASH, not equity
         available = cash - cash * CASH_RESERVE
         can_buy   = len(held) < MAX_POS and available > 100
@@ -4154,6 +4461,7 @@ def _ai_run_portfolio(pid: int) -> dict:
                     'qualifies': qualifies_long,
                     'qualifies_short': qualifies_short,
                     'confidence': confidence,
+                    'trade_quality': None,  # filled in during buy loop if trade quality is computed
                 })
                 if qualifies_long:
                     candidates.append({'symbol': sym, 'score': score, 'price': price,
@@ -4195,6 +4503,21 @@ def _ai_run_portfolio(pid: int) -> dict:
                 break
 
             asset_class = _get_asset_class(c['symbol'])
+
+            # ── Liquidity check ───────────────────────────────────────────────
+            liq_info = _liquidity_check(c['symbol'], 0, c['price'])  # position_value TBD
+            if liq_info.get('score', 5) < 3:  # extremely illiquid
+                summary['errors'].append(f"skip {c['symbol']}: {liq_info['skip_reason']}")
+                continue
+
+            # ── Trade Quality gate ────────────────────────────────────────────
+            quality = _compute_trade_quality(c, history_ctx, port_regime, liq_info, {})
+            c['trade_quality'] = quality['score']
+            if not quality['passed']:
+                summary['errors'].append(
+                    f"skip {c['symbol']}: quality {quality['score']:.0f}/{quality['threshold']} below threshold"
+                )
+                continue
 
             # ── RL engine: get recommended action for this market state ────────
             rl_action = {}
@@ -4289,6 +4612,9 @@ def _ai_run_portfolio(pid: int) -> dict:
             except Exception:
                 pass
 
+            # ── Portfolio regime sizing ───────────────────────────────────────
+            position_value *= port_regime.get('size_multiplier', 1.0)
+
             # ── 7. Session quality factor ─────────────────────────────────────
             session_f  = _session_size_factor(c['symbol'])
             position_value *= session_f
@@ -4363,6 +4689,7 @@ def _ai_run_portfolio(pid: int) -> dict:
                         'market_state': c['detail']['market_state'],
                         'summary': c['detail']['summary'][:100],
                         'type': 'buy',
+                        'trade_quality': c.get('trade_quality', None),
                     })
                     _ai_log_entry(pid, c['symbol'], 'BUY', c['score'], fill, shares,
                                   f"score {c['score']:+.1f} | {c['detail']['summary'][:80]}")

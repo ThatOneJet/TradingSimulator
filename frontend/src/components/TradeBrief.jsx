@@ -202,6 +202,33 @@ export default function TradeBrief({ symbol, onClose }) {
         </p>
       )}
 
+      {/* EV hint — show when brief has score data */}
+      {data && Math.abs(data.score) >= 2.5 && (
+        <div style={{
+          marginTop: 8, padding: '5px 8px',
+          background: 'rgba(140,170,220,0.04)', borderRadius: 4,
+          border: '1px solid rgba(140,170,220,0.1)',
+        }}>
+          <div style={{ fontSize: 8, color: 'var(--t-4)', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 3 }}>
+            Trade Quality Factors
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {[
+              { label: 'Signal', value: `${Math.abs(data.score).toFixed(1)}/10`, ok: Math.abs(data.score) >= 3 },
+              { label: 'Regime', value: data.regime?.replace(/_/g,' '), ok: !['panic','neutral','ranging'].includes(data.regime) },
+              { label: 'MTF', value: data.mtf_bias?.bias || '—', ok: data.mtf_bias?.bias !== 'neutral' },
+              { label: 'Liquidity', value: data.asset_class, ok: data.asset_class !== 'other' },
+            ].map(({ label, value, ok }) => (
+              <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+                <div style={{ width: 5, height: 5, borderRadius: '50%', background: ok ? '#4ade80' : '#f59e0b', flexShrink: 0 }} />
+                <span style={{ fontSize: 8.5, color: 'var(--t-4)' }}>{label}:</span>
+                <span style={{ fontSize: 8.5, color: 'var(--t-2)', fontFamily: 'var(--font-mono)' }}>{value}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
     </div>
   )
 }

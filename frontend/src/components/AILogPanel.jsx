@@ -313,8 +313,8 @@ function ScanModal({ run, onClose }) {
               {batchOpen && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                   {/* Column headers */}
-                  <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1.2fr 1fr', padding: '3px 8px' }}>
-                    {['SYMBOL', 'SCORE', 'REGIME', 'RSI'].map(h => (
+                  <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1.2fr 0.8fr 0.8fr', padding: '3px 8px' }}>
+                    {['SYMBOL', 'SCORE', 'REGIME', 'RSI', 'QUAL'].map(h => (
                       <span key={h} style={{ fontSize: 8, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', letterSpacing: '0.08em' }}>{h}</span>
                     ))}
                   </div>
@@ -324,7 +324,7 @@ function ScanModal({ run, onClose }) {
                     const scoreColor = b.score >= 2.5 ? '#3ddc97' : b.score <= -2.5 ? '#ff476f' : b.score > 0 ? '#5ee8a9' : 'var(--t-4)'
                     return (
                       <div key={i} style={{
-                        display: 'grid', gridTemplateColumns: '2fr 1fr 1.2fr 1fr',
+                        display: 'grid', gridTemplateColumns: '2fr 1fr 1.2fr 0.8fr 0.8fr',
                         padding: '5px 8px',
                         background: b.qualifies ? 'rgba(61,220,151,0.04)' : b.qualifies_short ? 'rgba(255,71,111,0.04)' : 'transparent',
                         borderRadius: 5,
@@ -345,6 +345,12 @@ function ScanModal({ run, onClose }) {
                         </span>
                         <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: failed ? 'var(--t-4)' : b.rsi <= 30 ? '#3ddc97' : b.rsi >= 70 ? '#ff476f' : 'var(--t-3)' }}>
                           {failed ? '—' : f(b.rsi, 0)}
+                        </span>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color:
+                          !b.trade_quality ? 'var(--t-4)' :
+                          b.trade_quality >= 62 ? '#4ade80' : b.trade_quality >= 45 ? '#f59e0b' : '#ff476f'
+                        }}>
+                          {b.trade_quality != null ? `${Math.round(b.trade_quality)}` : '—'}
                         </span>
                       </div>
                     )
