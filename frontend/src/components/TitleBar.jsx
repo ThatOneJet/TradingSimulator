@@ -62,8 +62,16 @@ export default function TitleBar({ symbol, account }) {
       {account && (
         <span className="tb-cluster-item">
           <span className="lbl" style={{ color: 'var(--t-3)' }}>DAY P&L</span>
-          <span className="val mono" style={{ color: account.pnl_day >= 0 ? 'var(--ok)' : 'var(--err)' }}>
-            {account.pnl_day >= 0 ? '+' : ''}{Number(account.pnl_day).toFixed(2)}
+          <span className="val mono" style={{ color: (account.pnl_day || 0) >= 0 ? 'var(--ok)' : 'var(--err)' }}>
+            {(account.pnl_day || 0) >= 0 ? '+' : ''}{Number(account.pnl_day || 0).toFixed(2)}
+          </span>
+        </span>
+      )}
+      {account && account.pnl_unrealized != null && (
+        <span className="tb-cluster-item">
+          <span className="lbl" style={{ color: 'var(--t-3)' }}>OPEN</span>
+          <span className="val mono" style={{ color: account.pnl_unrealized >= 0 ? 'var(--ok)' : 'var(--err)' }}>
+            {account.pnl_unrealized >= 0 ? '+' : ''}{Number(account.pnl_unrealized).toFixed(2)}
           </span>
         </span>
       )}

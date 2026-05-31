@@ -207,7 +207,8 @@ function NewPortfolioForm({ onCancel, onCreate }) {
 function PortfolioCard({ portfolio, account, isActive, onClick, onDelete, canDelete, onContextMenu }) {
   const [hover, setHover] = useState(false)
 
-  const pnl    = account?.pnl_day
+  const pnl    = account?.pnl_day          // realized today (closed trades)
+  const pnlOpen = account?.pnl_unrealized  // open position gain/loss
   const equity = account?.equity
 
   const cardStyle = {
@@ -282,13 +283,20 @@ function PortfolioCard({ portfolio, account, isActive, onClick, onDelete, canDel
             </span>
           ) : null}
         </span>
-        <span style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
+        <span style={{ display: 'flex', gap: 6, alignItems: 'baseline', flexWrap: 'wrap' }}>
           <span style={{ fontSize: 11, color: 'var(--t-2)', fontFamily: 'var(--font-mono)' }}>
             {fmt(equity)}
           </span>
+          {/* Day P&L — realized from closed trades today */}
           {pnlStr && (
-            <span style={{ fontSize: 10, color: pnlColor, fontFamily: 'var(--font-mono)' }}>
+            <span title="Day P&L — realized from closed trades today" style={{ fontSize: 10, color: pnlColor, fontFamily: 'var(--font-mono)' }}>
               {pnlStr}
+            </span>
+          )}
+          {/* Unrealized — open positions currently up/down */}
+          {pnlOpen != null && pnlOpen !== 0 && (
+            <span title="Unrealized — open positions" style={{ fontSize: 9, color: pnlOpen >= 0 ? 'rgba(61,220,151,0.7)' : 'rgba(255,71,111,0.7)', fontFamily: 'var(--font-mono)' }}>
+              ({pnlOpen >= 0 ? '+' : ''}{pnlOpen.toFixed(2)} open)
             </span>
           )}
         </span>

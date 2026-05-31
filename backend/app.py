@@ -1523,23 +1523,39 @@ def account():
         })
     state     = _sim_state(pid)
     positions = _sim_positions_with_prices(pid)
-    # market_value is positive for longs, negative for shorts (signed after equity fix)
     portfolio_value = state['cash'] + sum(p['market_value'] for p in positions)
-    # Buying power = equity (what you actually own, not inflated cash from short proceeds)
-    # Short sale proceeds are locked as collateral and cannot be freely spent
-    buying_power = round(portfolio_value * 0.90, 2)  # keep 10% reserve
-    pnl_day      = portfolio_value - state['last_equity']
+    buying_power    = round(portfolio_value * 0.90, 2)
+
+    # Day P&L = realized gains/losses from trades CLOSED today (not open positions)
+    import datetime
+    today_start = datetime.datetime.utcnow().strftime('%Y-%m-%d') + 'T00:00:00'
     with _get_db() as conn:
-        prow = conn.execute('SELECT ai_controlled FROM portfolios WHERE id=?', (pid,)).fetchone()
+        prow = conn.execute('SELECT ai_controlled, strategy_type FROM portfolios WHERE id=?', (pid,)).fetchone()
         ai_controlled = int(prow['ai_controlled']) if prow else 0
+        strategy_type = prow['strategy_type'] if prow and 'strategy_type' in prow.keys() else 'balanced'
+        day_realized = conn.execute(
+            '''SELECT COALESCE(SUM(realized_pl), 0) as total
+               FROM sim_trades
+               WHERE portfolio_id=? AND status='filled'
+               AND side IN ('sell','cover')
+               AND created_at >= ?''',
+            (pid, today_start)
+        ).fetchone()['total']
+
+    # Unrealized P&L = current gain/loss on ALL open positions
+    unrealized_pl = sum(p.get('unrealized_pl', 0) or 0 for p in positions)
+
     return jsonify({
-        'equity':          portfolio_value,
+        'equity':          round(portfolio_value, 2),
         'cash':            round(state['cash'], 2),
         'buying_power':    buying_power,
-        'portfolio_value': portfolio_value,
+        'portfolio_value': round(portfolio_value, 2),
         'daytrade_count':  0,
-        'pnl_day':         pnl_day,
+        'pnl_day':         round(day_realized, 2),      # realized P&L from closed trades today
+        'pnl_unrealized':  round(unrealized_pl, 2),     # open position gain/loss
+        'pnl_total':       round(day_realized + unrealized_pl, 2),
         'ai_controlled':   ai_controlled,
+        'strategy_type':   strategy_type,
     })
 
 @app.route('/api/positions')
