@@ -2771,9 +2771,9 @@ _AI_UNIVERSE = [
 
     # ── Crypto (spot) — only tickers with reliable yfinance history ───────────
     'BTC-USD','ETH-USD','SOL-USD','BNB-USD','XRP-USD',
-    'ADA-USD','AVAX-USD','DOGE-USD','DOT-USD','LINK-USD',
-    'ATOM-USD','NEAR-USD','OP-USD','INJ-USD',
-    'AAVE-USD','ALGO-USD','HBAR-USD',
+    # Only major crypto for longs — micro-caps (ALGO, HBAR, INJ) bounce but don't sustain
+    'ADA-USD','AVAX-USD','DOGE-USD','LINK-USD',
+    'ATOM-USD','AAVE-USD',
 ]
 _AI_UNIVERSE = list(dict.fromkeys(_AI_UNIVERSE))  # deduplicate, preserve order
 
@@ -4738,20 +4738,26 @@ def _ai_run_portfolio(pid: int) -> dict:
                 qualifies_long  = score >= BUY_THRESH
                 qualifies_short = score <= SHORT_THRESH
 
-                # Daily trend gate: block longs if daily trend is DOWN
-                # Overnight data showed longs in downtrending crypto lost while shorts won
-                if qualifies_long and _is_fractional_asset(sym):
+                # Crypto macro filter: if BTC is trending down on 1h, block ALL crypto longs
+                isCrypto = lambda s: s.endswith('-USD')
+                # Micro-caps bounce off RSI oversold but don't sustain without BTC leadership
+                if qualifies_long and isCrypto(sym):
                     try:
-                        import yfinance as _yf_tg
-                        _daily = _yf_tg.Ticker(sym).history(period='10d', interval='1d')
-                        if not _daily.empty and len(_daily) >= 5:
-                            _closes = list(_daily['Close'].dropna())
-                            _ma5  = sum(_closes[-5:]) / 5
-                            _last = _closes[-1]
-                            if _last < _ma5 * 0.99:  # price below 5-day MA → downtrend
-                                qualifies_long = False
-                                _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
-                                              'daily_downtrend', f'price ${_last:.4f} below 5d MA ${_ma5:.4f}')
+                        _btc_data = _candle_engine.latest('BTC-USD', '1h') if _candle_engine else None
+                        if not _btc_data:
+                            import yfinance as _yf_btc
+                            _btc_hist = _yf_btc.Ticker('BTC-USD').history(period='2d', interval='1h')
+                            if not _btc_hist.empty and len(_btc_hist) >= 5:
+                                _btc_closes = list(_btc_hist['Close'].dropna())
+                                _btc_trend = 'up' if _btc_closes[-1] > sum(_btc_closes[-5:])/5 else 'down'
+                            else:
+                                _btc_trend = 'neutral'
+                        else:
+                            _btc_trend = _btc_data.get('trend', 'sideways')
+                        if _btc_trend == 'down':
+                            qualifies_long = False
+                            _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
+                                          'btc_macro', f'BTC 1h trending down — no crypto longs')
                     except Exception:
                         pass
 
