@@ -3748,6 +3748,25 @@ def _compute_trade_quality(c: dict, history_ctx: dict, portfolio_reg: dict,
         )
         if _is_counter_trend: _base += 12   # counter-trend needs meaningful extra conviction
 
+        # 9. Historical regime performance — auto-adjust from past trade outcomes
+        _regime_history = history_ctx.get('regime_win_rates', {}).get(_regime, {})
+        if _regime_history.get('trades', 0) >= 5:
+            _wr = _regime_history['win_rate']
+            if _wr >= 0.70:   _base -= 6   # this regime has been very profitable — lower bar
+            elif _wr >= 0.60: _base -= 3   # above average — slight advantage
+            elif _wr <= 0.30: _base += 8   # this regime has been losing — raise bar significantly
+            elif _wr <= 0.40: _base += 4   # below average — tighten
+
+        # 10. Historical per-symbol performance — learns from specific stock behavior
+        _sym_history = history_ctx.get('symbol_win_rates', {}).get(_sym, {})
+        if _sym_history.get('trades', 0) >= 3:
+            _sym_wr = _sym_history['win_rate']
+            _sym_pl = _sym_history.get('avg_pl', 0)
+            if _sym_wr >= 0.70 and _sym_pl > 0:   _base -= 5   # symbol consistently profitable
+            elif _sym_wr >= 0.60:                   _base -= 2   # slightly above average
+            elif _sym_wr <= 0.30 or _sym_pl < -20: _base += 7   # symbol consistently losing
+            elif _sym_wr <= 0.40:                   _base += 3   # below average
+
         threshold = int(max(36, min(72, _base)))
 
         return {
@@ -4116,9 +4135,15 @@ def _session_size_factor(sym: str) -> float:
 
 
 def _build_history_context(pid: int) -> dict:
-    """Read 30-day trade history, return threshold adjustments for this scan cycle."""
+    """Read 30-day trade history, return threshold adjustments for this scan cycle.
+
+    Includes per-regime win rates and per-symbol historical performance so the
+    adaptive quality threshold can learn from specific past trades.
+    """
     default = {'buy_thresh_adj': 0.0, 'sell_thresh_adj': 0.0,
                 'cautious_regimes': set(), 'strong_regimes': set(),
+                'regime_win_rates': {},    # {regime: win_rate} for threshold tuning
+                'symbol_win_rates': {},    # {symbol: {win_rate, trades, avg_pl}} for per-symbol tuning
                 'decay_detected': False, 'summary': ''}
     try:
         from performance_engine import PerformanceEngine
@@ -4134,24 +4159,56 @@ def _build_history_context(pid: int) -> dict:
             ctx['sell_thresh_adj'] = 0.4
             ctx['decay_detected']  = True
 
-        # Classify regimes by win rate (min 5 trades for statistical relevance)
+        # Classify regimes + store win rates for threshold adaptation
         for regime, stats in by_regime.items():
             if regime == '_total':
                 continue
-            n = stats.get('trades', 0)
+            n  = stats.get('trades', 0)
             wr = stats.get('win_rate', 0.5)
+            ctx['regime_win_rates'][regime] = {'win_rate': wr, 'trades': n,
+                                               'avg_pl': stats.get('avg_pl', 0)}
             if n >= 5 and wr < 0.35:
                 ctx['cautious_regimes'].add(regime)
             elif n >= 5 and wr > 0.65:
                 ctx['strong_regimes'].add(regime)
 
+        # Per-symbol historical performance (min 3 trades to be meaningful)
+        try:
+            import sqlite3
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            from datetime import datetime, timedelta
+            cutoff = (datetime.utcnow() - timedelta(days=60)).isoformat()
+            rows = conn.execute('''
+                SELECT symbol, COUNT(*) as n,
+                       AVG(CASE WHEN realized_pl > 0 THEN 1.0 ELSE 0.0 END) as win_rate,
+                       AVG(realized_pl) as avg_pl
+                FROM sim_trades
+                WHERE portfolio_id=? AND side IN ('sell','cover')
+                AND status='filled' AND created_at > ?
+                GROUP BY symbol HAVING COUNT(*) >= 3
+            ''', (pid, cutoff)).fetchall()
+            conn.close()
+            for r in rows:
+                ctx['symbol_win_rates'][r['symbol']] = {
+                    'win_rate': round(float(r['win_rate'] or 0.5), 3),
+                    'trades':   int(r['n']),
+                    'avg_pl':   round(float(r['avg_pl'] or 0), 2),
+                }
+        except Exception:
+            pass
+
         parts = []
         if ctx['decay_detected']:
             parts.append(f"7d win rate {decay['recent_win_rate']:.0%} — thresholds raised")
         if ctx['cautious_regimes']:
-            parts.append(f"Cautious: {', '.join(sorted(ctx['cautious_regimes']))}")
+            parts.append(f"Cautious regimes: {', '.join(sorted(ctx['cautious_regimes']))}")
         if ctx['strong_regimes']:
-            parts.append(f"Strong: {', '.join(sorted(ctx['strong_regimes']))}")
+            parts.append(f"Strong regimes: {', '.join(sorted(ctx['strong_regimes']))}")
+        good_syms = [s for s,v in ctx['symbol_win_rates'].items() if v['win_rate'] > 0.65]
+        bad_syms  = [s for s,v in ctx['symbol_win_rates'].items() if v['win_rate'] < 0.35]
+        if good_syms: parts.append(f"Profitable symbols: {', '.join(good_syms[:3])}")
+        if bad_syms:  parts.append(f"Losing symbols: {', '.join(bad_syms[:3])}")
         ctx['summary'] = ' | '.join(parts) or 'Normal — no history adjustments'
 
         return ctx
