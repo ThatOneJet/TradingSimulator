@@ -197,8 +197,10 @@ export default function TradePanel({ symbol, account, positions, onOrderPlaced, 
   const [loading,    setLoading]    = useState(false)
   const [showModal,  setShowModal]  = useState(false)
 
-  const pos    = positions?.find(p => p.symbol === symbol)
-  const isReal = portfolioId === 0
+  const pos       = positions?.find(p => p.symbol === symbol)
+  const isReal    = portfolioId === 0
+  const hasLong   = pos && pos.qty > 0
+  const hasShort  = pos && pos.qty < 0
 
   // Validate then open confirmation modal
   function submit(e) {
@@ -231,7 +233,7 @@ export default function TradePanel({ symbol, account, positions, onOrderPlaced, 
   const shares         = Number(qty)
   const estimatedCost  = shares > 0 && effectivePrice > 0 ? shares * effectivePrice : null
   const buyingPower    = account ? Number(account.buying_power) : null
-  const overBudget     = side === 'buy' && estimatedCost != null && buyingPower != null && estimatedCost > buyingPower
+  const overBudget     = (side === 'buy' || side === 'short') && estimatedCost != null && buyingPower != null && estimatedCost > buyingPower
   const fmt            = n => n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
   return (
@@ -254,24 +256,62 @@ export default function TradePanel({ symbol, account, positions, onOrderPlaced, 
           <div className="tp-card-hd">Place Order</div>
           <form onSubmit={submit}>
             <div className="of-symbol mono">{symbol}</div>
+            {/* Direction row */}
             <div className="of-row">
-              <div className="of-side-toggle">
-                <button type="button" className={`of-side-btn${side === 'buy'  ? ' active-buy'  : ''}`} onClick={() => setSide('buy')}>BUY</button>
-                <button type="button" className={`of-side-btn${side === 'sell' ? ' active-sell' : ''}`} onClick={() => setSide('sell')}>SELL</button>
+              <div className="of-side-toggle" style={{ flex: 1 }}>
+                <button type="button"
+                  className={`of-side-btn${side === 'buy'   ? ' active-buy'  : ''}`}
+                  onClick={() => setSide('buy')}
+                  title="Buy — go long, profit if price rises">
+                  LONG
+                </button>
+                <button type="button"
+                  className={`of-side-btn${side === 'short' ? ' active-sell' : ''}`}
+                  onClick={() => setSide('short')}
+                  title="Short — borrow and sell, profit if price falls">
+                  SHORT
+                </button>
+                {hasLong && (
+                  <button type="button"
+                    className={`of-side-btn${side === 'sell'  ? ' active-sell' : ''}`}
+                    onClick={() => setSide('sell')}
+                    title="Sell — close your long position">
+                    SELL
+                  </button>
+                )}
+                {hasShort && (
+                  <button type="button"
+                    className={`of-side-btn${side === 'cover' ? ' active-buy'  : ''}`}
+                    onClick={() => setSide('cover')}
+                    title="Cover — buy back to close your short position">
+                    COVER
+                  </button>
+                )}
               </div>
+            </div>
+
+            {/* Order type row */}
+            <div className="of-row" style={{ marginTop: 6 }}>
               <div className="of-type-toggle">
                 <button type="button" className={`of-type-btn${orderType === 'market' ? ' active' : ''}`} onClick={() => setOrderType('market')}>Market</button>
                 <button type="button" className={`of-type-btn${orderType === 'limit'  ? ' active' : ''}`} onClick={() => setOrderType('limit')}>Limit</button>
               </div>
+              {orderType === 'limit' && (
+                <span style={{ fontSize: 9, color: 'var(--t-4)', marginLeft: 8, lineHeight: 1.4 }}>
+                  Only fills if price reaches your target
+                </span>
+              )}
             </div>
+
             <div className="of-inputs">
-              <label>Shares
-                <input type="number" min="1" step="1" value={qty}
+              <label>Qty
+                <input type="number" min="0.0001" step="any" value={qty}
                   onChange={e => setQty(e.target.value)} placeholder="0" />
               </label>
               {orderType === 'limit' && (
-                <label>Limit Price
-                  <input type="number" step="0.01" value={limitPrice}
+                <label title="Your target price — order only fills when market reaches this level">
+                  Limit Price
+                  <input type="number" step="0.0001" value={limitPrice}
                     onChange={e => setLimitPrice(e.target.value)} placeholder="0.00" />
                 </label>
               )}
@@ -285,7 +325,9 @@ export default function TradePanel({ symbol, account, positions, onOrderPlaced, 
               )}
               {estimatedCost != null && (
                 <div className="of-cost-row of-cost-total">
-                  <span className="of-cost-label">{side === 'buy' ? 'Est. Cost' : 'Est. Proceeds'}</span>
+                  <span className="of-cost-label">
+                    {side === 'buy' ? 'Est. Cost' : side === 'short' ? 'Margin Required' : 'Est. Proceeds'}
+                  </span>
                   <span className={`of-cost-value mono${overBudget ? ' err' : ''}`}>${fmt(estimatedCost)}</span>
                 </div>
               )}
@@ -301,8 +343,10 @@ export default function TradePanel({ symbol, account, positions, onOrderPlaced, 
             </div>
             {status?.err && <div className="of-err">{status.err}</div>}
             {status?.ok  && <div className="of-ok">{status.ok}</div>}
-            <button type="submit" className={`of-submit ${side === 'buy' ? 'buy' : 'sell'}`} disabled={loading}>
-              {loading ? '…' : `${side.toUpperCase()} ${symbol}`}
+            <button type="submit"
+              className={`of-submit ${side === 'buy' || side === 'cover' ? 'buy' : 'sell'}`}
+              disabled={loading}>
+              {loading ? '…' : `${side === 'buy' ? 'BUY LONG' : side === 'short' ? 'SELL SHORT' : side === 'cover' ? 'COVER SHORT' : 'SELL'} ${symbol}`}
             </button>
           </form>
         </div>
