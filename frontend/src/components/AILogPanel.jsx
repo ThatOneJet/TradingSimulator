@@ -331,8 +331,13 @@ function ScanModal({ run, onClose }) {
                       <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: b.error ? 'var(--t-4)' : (b.rsi||50) <= 30 ? '#3ddc97' : (b.rsi||50) >= 70 ? '#ff476f' : 'var(--t-3)' }}>
                         {b.error ? '—' : f(b.rsi, 0)}
                       </span>
-                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: !b.trade_quality ? 'var(--t-4)' : b.trade_quality >= 62 ? '#4ade80' : b.trade_quality >= 45 ? '#f59e0b' : '#ff476f' }}>
-                        {b.trade_quality != null ? Math.round(b.trade_quality) : '—'}
+                      <span
+                        title={b.trade_quality != null ? `Quality ${b.trade_quality}/${b.quality_threshold ?? 62} — ${b.trade_quality >= (b.quality_threshold ?? 62) ? 'passes gate' : `blocked (need ${b.quality_threshold ?? 62})`}` : 'No data'}
+                        style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: !b.trade_quality ? 'var(--t-4)' : b.trade_quality >= (b.quality_threshold ?? 62) ? '#4ade80' : b.trade_quality >= 45 ? '#f59e0b' : '#ff476f' }}>
+                        {b.trade_quality != null ? `${Math.round(b.trade_quality)}` : '—'}
+                        {b.trade_quality != null && b.quality_threshold && b.quality_threshold !== 62 && (
+                          <span style={{ fontSize: 7.5, opacity: 0.6, marginLeft: 1 }}>/{b.quality_threshold}</span>
+                        )}
                       </span>
                     </div>
                   )
@@ -357,6 +362,14 @@ function ScanModal({ run, onClose }) {
                 }
                 return (
                   <div style={{ paddingBottom: 4 }}>
+                    {/* Adaptive quality info */}
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8, padding: '4px 8px', background: 'rgba(140,170,220,0.04)', borderRadius: 4 }}>
+                      <span style={{ fontSize: 8, color: 'var(--t-4)' }}>Quality gate adapts:</span>
+                      <span style={{ fontSize: 8, color: '#3ddc97' }}>Long ≥62</span>
+                      <span style={{ fontSize: 8, color: '#ff476f' }}>Short ≥52</span>
+                      <span style={{ fontSize: 8, color: '#f5b342' }}>Decay → +6pts</span>
+                      <span style={{ fontSize: 8, color: '#a78bfa' }}>Builds with trade history</span>
+                    </div>
                     <CatSection label="Qualify — Long" color="#3ddc97" items={catLong} bg="rgba(61,220,151,0.04)" />
                     <CatSection label="Qualify — Short" color="#ff476f" items={catShort} bg="rgba(255,71,111,0.04)" />
                     <CatSection label="Watching (near threshold)" color="#f5b342" items={catWatch} bg="rgba(245,179,66,0.03)" />

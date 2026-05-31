@@ -4458,6 +4458,25 @@ def _ai_run_portfolio(pid: int) -> dict:
                 # Skip long entries in regimes with poor 30-day history
                 if qualifies_long and detail['market_state'] in history_ctx['cautious_regimes']:
                     qualifies_long = False
+
+                # Compute quality preview for every symbol (not just qualifying ones)
+                # Uses lightweight assumptions for liquidity (avoids slow per-symbol API calls)
+                _preview_side = 'short' if score < 0 else 'long'
+                try:
+                    _preview_q = _compute_trade_quality(
+                        {'score': score, 'confidence': confidence, 'detail': detail,
+                         'side': _preview_side},
+                        history_ctx,
+                        port_regime,
+                        {'score': 6.0, 'liquid': True},   # assume reasonable liquidity
+                        data,
+                    )
+                    _preview_qual = _preview_q['score']
+                    _preview_thresh = _preview_q['threshold']
+                except Exception:
+                    _preview_qual  = None
+                    _preview_thresh = 62
+
                 batch_data.append({
                     'symbol': sym, 'score': round(score, 2), 'price': round(price, 2),
                     'market_state': detail['market_state'],
@@ -4466,7 +4485,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                     'qualifies': qualifies_long,
                     'qualifies_short': qualifies_short,
                     'confidence': confidence,
-                    'trade_quality': None,  # filled in during buy loop if trade quality is computed
+                    'trade_quality': round(_preview_qual, 1) if _preview_qual is not None else None,
+                    'quality_threshold': _preview_thresh,
                 })
                 if qualifies_long:
                     candidates.append({'symbol': sym, 'score': score, 'price': price,
