@@ -4487,7 +4487,8 @@ def _check_single_position_exit(pid: int, symbol: str, data: dict) -> None:
                 reason = ('cover_signal' if score >= COVER_THRESH else 'stop_loss' if price >= trail else 'take_profit')
                 fill = _apply_slippage(price, 'buy', atr, data.get('volume_ratio', 1.0))
                 _sim_cover(symbol, abs(row['shares']), fill, pid)
-                _ai_log_entry(pid, symbol, 'COVER', score, fill, abs(row['shares']), f'{reason} (event) | {detail["summary"][:60]}')
+                _ai_log_entry(pid, symbol, 'COVER', score, fill, abs(row['shares']), f'{reason} (event) | {detail["summary"][:60]}',
+                             market_state=detail.get('market_state', ''))
         else:
             prot = _protection_stage(row['avg_cost'], price, row['stop_price'], atr)
             trail = prot['new_stop'] or (row['avg_cost'] - ATR_STOP_M * atr)
@@ -4503,7 +4504,8 @@ def _check_single_position_exit(pid: int, symbol: str, data: dict) -> None:
                 reason = ('sell_signal' if score <= SELL_THRESH else 'stop_loss' if price <= trail else 'profit_floor' if hit_floor else 'take_profit')
                 fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0))
                 _sim_sell(symbol, row['shares'], fill, pid)
-                _ai_log_entry(pid, symbol, 'SELL', score, fill, row['shares'], f'{reason} (event) | {detail["summary"][:60]}')
+                _ai_log_entry(pid, symbol, 'SELL', score, fill, row['shares'], f'{reason} (event) | {detail["summary"][:60]}',
+                             market_state=detail.get('market_state', ''))
     except Exception:
         pass
 
@@ -4775,6 +4777,13 @@ def _ai_run_portfolio(pid: int) -> dict:
                 summary['scanned'] += 1
                 qualifies_long  = score >= BUY_THRESH
                 qualifies_short = score <= SHORT_THRESH
+                # Block shorts in ranging/neutral — price bounces both ways and stops us out
+                _no_short_regimes = ('ranging', 'neutral', 'mild_uptrend', 'accumulation',
+                                     'oversold_extreme')
+                if qualifies_short and detail['market_state'] in _no_short_regimes:
+                    qualifies_short = False
+                    _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
+                                  'regime_no_short', f'no shorts in {detail["market_state"]} — sideways market')
 
                 # Crypto macro filter: if BTC is trending down on 1h, block ALL crypto longs
                 isCrypto = lambda s: s.endswith('-USD')
