@@ -2771,9 +2771,17 @@ _AI_UNIVERSE = [
 
     # ── Crypto (spot) — only tickers with reliable yfinance history ───────────
     'BTC-USD','ETH-USD','SOL-USD','BNB-USD','XRP-USD',
-    # Only major crypto for longs — micro-caps (ALGO, HBAR, INJ) bounce but don't sustain
+    # Major crypto only — sufficient liquidity and institutional participation
+    # Removed: HBAR, ALGO, INJ, DOT, NEAR, OP (low-cap, bounce-and-fail pattern)
     'ADA-USD','AVAX-USD','DOGE-USD','LINK-USD',
     'ATOM-USD','AAVE-USD',
+    # Replacements with real liquidity and market depth:
+    'UNI-USD',    # Uniswap — largest DEX, real protocol revenue
+    'LTC-USD',    # Litecoin — OG crypto, highly liquid
+    'BCH-USD',    # Bitcoin Cash — high volume, liquid
+    'XLM-USD',    # Stellar — institutional partnerships, liquid
+    'TRX-USD',    # Tron — high transaction volume, liquid
+    'FIL-USD',    # Filecoin — real utility, institutional interest
 ]
 _AI_UNIVERSE = list(dict.fromkeys(_AI_UNIVERSE))  # deduplicate, preserve order
 
