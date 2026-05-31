@@ -301,62 +301,70 @@ function ScanModal({ run, onClose }) {
               >
                 <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--t-3)', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
                   Scanned Batch ({batch.length})
-                  {batch.filter(b => b.error).length > 0 && (
-                    <span style={{ color: '#ff476f', fontWeight: 400, marginLeft: 6 }}>
-                      · {batch.filter(b => !b.error).length} w/ data · {batch.filter(b => b.error).length} no data
-                    </span>
-                  )}
                 </span>
                 <span style={{ fontSize: 9, color: 'var(--t-4)' }}>{batchOpen ? '▲' : '▼'}</span>
               </button>
 
-              {batchOpen && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                  {/* Column headers */}
-                  <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1.2fr 0.8fr 0.8fr', padding: '3px 8px' }}>
-                    {['SYMBOL', 'SCORE', 'REGIME', 'RSI', 'QUAL'].map(h => (
-                      <span key={h} style={{ fontSize: 8, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', letterSpacing: '0.08em' }}>{h}</span>
-                    ))}
-                  </div>
-                  {batch.map((b, i) => {
-                    const failed     = !!b.error
-                    const stCfg      = MARKET_STATE_CFG[b.market_state] ?? MARKET_STATE_CFG.neutral
-                    const scoreColor = b.score >= 2.5 ? '#3ddc97' : b.score <= -2.5 ? '#ff476f' : b.score > 0 ? '#5ee8a9' : 'var(--t-4)'
-                    return (
-                      <div key={i} style={{
-                        display: 'grid', gridTemplateColumns: '2fr 1fr 1.2fr 0.8fr 0.8fr',
-                        padding: '5px 8px',
-                        background: b.qualifies ? 'rgba(61,220,151,0.04)' : b.qualifies_short ? 'rgba(255,71,111,0.04)' : 'transparent',
-                        borderRadius: 5,
-                        borderBottom: '1px solid rgba(140,170,220,0.04)',
-                        opacity: failed ? 0.4 : 1,
-                      }}>
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: b.qualifies || b.qualifies_short ? 700 : 400, color: b.qualifies ? '#3ddc97' : b.qualifies_short ? '#ff476f' : failed ? 'var(--t-4)' : 'var(--t-2)' }}>
-                          {b.symbol}
-                          {b.qualifies       && <span style={{ fontSize: 8, color: '#3ddc97', marginLeft: 4 }}>★</span>}
-                          {b.qualifies_short && <span style={{ fontSize: 8, color: '#ff476f', marginLeft: 4 }}>↓</span>}
-                          {failed            && <span style={{ fontSize: 8, color: '#475061', marginLeft: 4 }}>✕</span>}
-                        </span>
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: 700, color: failed ? 'var(--t-4)' : scoreColor }}>
-                          {failed ? '—' : (b.score >= 0 ? '+' : '') + f(b.score, 1)}
-                        </span>
-                        <span style={{ fontSize: 8, fontFamily: 'var(--font-mono)', color: failed ? 'var(--t-4)' : stCfg.color }}>
-                          {failed ? 'NO DATA' : stCfg.label}
-                        </span>
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: failed ? 'var(--t-4)' : b.rsi <= 30 ? '#3ddc97' : b.rsi >= 70 ? '#ff476f' : 'var(--t-3)' }}>
-                          {failed ? '—' : f(b.rsi, 0)}
-                        </span>
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color:
-                          !b.trade_quality ? 'var(--t-4)' :
-                          b.trade_quality >= 62 ? '#4ade80' : b.trade_quality >= 45 ? '#f59e0b' : '#ff476f'
-                        }}>
-                          {b.trade_quality != null ? `${Math.round(b.trade_quality)}` : '—'}
-                        </span>
+              {batchOpen && (() => {
+                const catLong    = batch.filter(b => !b.error && b.qualifies)
+                const catShort   = batch.filter(b => !b.error && b.qualifies_short)
+                const catWatch   = batch.filter(b => !b.error && !b.qualifies && !b.qualifies_short && Math.abs(b.score||0) >= 1.5)
+                const catNeutral = batch.filter(b => !b.error && !b.qualifies && !b.qualifies_short && Math.abs(b.score||0) < 1.5)
+                const catFailed  = batch.filter(b => b.error)
+
+                const COLS = '2fr 1fr 1.2fr 0.7fr 0.7fr'
+                function BatchRow({ b }) {
+                  const stCfg = MARKET_STATE_CFG[b.market_state] ?? MARKET_STATE_CFG.neutral
+                  const sc = b.score || 0
+                  const scoreColor = sc >= 2.5 ? '#3ddc97' : sc <= -2.5 ? '#ff476f' : sc > 0 ? '#5ee8a9' : '#ff8080'
+                  return (
+                    <div style={{ display: 'grid', gridTemplateColumns: COLS, padding: '4px 8px', borderBottom: '1px solid rgba(140,170,220,0.04)', opacity: b.error ? 0.35 : 1 }}>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: b.qualifies ? '#3ddc97' : b.qualifies_short ? '#ff476f' : b.error ? 'var(--t-4)' : 'var(--t-2)', fontWeight: b.qualifies || b.qualifies_short ? 700 : 400 }}>
+                        {b.symbol}
+                      </span>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: 700, color: b.error ? 'var(--t-4)' : scoreColor }}>
+                        {b.error ? '—' : (sc >= 0 ? '+' : '') + f(sc, 1)}
+                      </span>
+                      <span style={{ fontSize: 8, fontFamily: 'var(--font-mono)', color: b.error ? 'var(--t-4)' : stCfg.color }}>
+                        {b.error ? 'NO DATA' : stCfg.label}
+                      </span>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: b.error ? 'var(--t-4)' : (b.rsi||50) <= 30 ? '#3ddc97' : (b.rsi||50) >= 70 ? '#ff476f' : 'var(--t-3)' }}>
+                        {b.error ? '—' : f(b.rsi, 0)}
+                      </span>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: !b.trade_quality ? 'var(--t-4)' : b.trade_quality >= 62 ? '#4ade80' : b.trade_quality >= 45 ? '#f59e0b' : '#ff476f' }}>
+                        {b.trade_quality != null ? Math.round(b.trade_quality) : '—'}
+                      </span>
+                    </div>
+                  )
+                }
+                function CatSection({ label, color, items, bg }) {
+                  if (!items.length) return null
+                  return (
+                    <div style={{ marginBottom: 8 }}>
+                      <div style={{ fontSize: 8, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color, marginBottom: 3, paddingLeft: 8 }}>
+                        {label} <span style={{ fontWeight: 400, opacity: 0.6 }}>({items.length})</span>
                       </div>
-                    )
-                  })}
-                </div>
-              )}
+                      <div style={{ background: bg, borderRadius: 4 }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: COLS, padding: '2px 8px' }}>
+                          {['SYMBOL','SCORE','REGIME','RSI','QUAL'].map(h => (
+                            <span key={h} style={{ fontSize: 7.5, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', letterSpacing: '0.06em' }}>{h}</span>
+                          ))}
+                        </div>
+                        {items.map((b, i) => <BatchRow key={i} b={b} />)}
+                      </div>
+                    </div>
+                  )
+                }
+                return (
+                  <div style={{ paddingBottom: 4 }}>
+                    <CatSection label="Qualify — Long" color="#3ddc97" items={catLong} bg="rgba(61,220,151,0.04)" />
+                    <CatSection label="Qualify — Short" color="#ff476f" items={catShort} bg="rgba(255,71,111,0.04)" />
+                    <CatSection label="Watching (near threshold)" color="#f5b342" items={catWatch} bg="rgba(245,179,66,0.03)" />
+                    <CatSection label="Neutral" color="#475061" items={catNeutral} bg="transparent" />
+                    <CatSection label="No Data" color="#6b7689" items={catFailed} bg="transparent" />
+                  </div>
+                )
+              })()}
             </section>
           )}
         </div>

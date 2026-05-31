@@ -2697,7 +2697,7 @@ _AI_UNIVERSE = [
     # ── Crypto (spot) — only tickers with reliable yfinance history ───────────
     'BTC-USD','ETH-USD','SOL-USD','BNB-USD','XRP-USD',
     'ADA-USD','AVAX-USD','DOGE-USD','DOT-USD','LINK-USD',
-    'ATOM-USD','NEAR-USD','OP-USD','ARB-USD','INJ-USD',
+    'ATOM-USD','NEAR-USD','OP-USD','INJ-USD',
     'AAVE-USD','ALGO-USD','HBAR-USD',
 ]
 _AI_UNIVERSE = list(dict.fromkeys(_AI_UNIVERSE))  # deduplicate, preserve order
@@ -3675,8 +3675,13 @@ def _compute_trade_quality(c: dict, history_ctx: dict, portfolio_reg: dict,
                  pts_mtf + pts_liq + pts_pattern + pts_portfolio)
         total = round(min(100, max(0, total)), 1)
 
-        # Dynamic threshold: raise if recent win rate is poor
-        threshold = 68 if history_ctx.get('decay_detected') else 62
+        # Dynamic threshold: lower for shorts (volatile downtrends naturally reduce confidence)
+        # raise when decay detected
+        is_short_side = c.get('side', 'long') == 'short'
+        if history_ctx.get('decay_detected'):
+            threshold = 65 if is_short_side else 68
+        else:
+            threshold = 52 if is_short_side else 62
 
         return {
             'score':     total,
