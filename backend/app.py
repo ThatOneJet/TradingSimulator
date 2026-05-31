@@ -3697,28 +3697,58 @@ def _compute_trade_quality(c: dict, history_ctx: dict, portfolio_reg: dict,
                  pts_mtf + pts_liq + pts_pattern + pts_portfolio)
         total = round(min(100, max(0, total)), 1)
 
-        # Calibrated thresholds — realistic given crypto confidence scoring constraints
-        # Confidence component max ~4pts for crypto (volatility penalty), so 62 is unreachable.
-        # Thresholds target top ~40% of setups passing (not top 5%).
+        # ── Adaptive threshold — specific to this asset in this condition ────────
+        # The threshold reflects what quality score is achievable and expected
+        # for this exact asset class, regime, volatility, and trend strength.
         is_short_side = c.get('side', 'long') == 'short'
-        if history_ctx.get('decay_detected'):
-            threshold = 53 if is_short_side else 57   # tighter when losing streak
-        else:
-            threshold = 44 if is_short_side else 50   # normal: ~55-60 typical good setup passes
+        _detail  = c.get('detail') or {}
+        _sym     = c.get('symbol', '')
+        _regime  = _detail.get('market_state', 'neutral')
+        _adx     = float((data or {}).get('adx', 0) or 0)
+        _atr_pct = float((data or {}).get('atr_pct', 2) or 2)
+        _abs_score = abs(c.get('score', 0))
 
-        # Counter-trend trades require moderately higher conviction (not 72 — too restrictive)
-        _regime = (c.get('detail') or {}).get('market_state', 'neutral')
+        # 1. Asset-class base (reflects structurally achievable confidence range)
+        _asset_cls = _get_asset_class(_sym)
+        _base = {'crypto': 44, 'forex': 46, 'futures': 46, 'equity': 50}.get(_asset_cls, 48)
+
+        # 2. Regime clarity adjustment
+        if _regime in ('trending_up', 'trending_down', 'breakout', 'accumulation'):
+            _base -= 3   # clear regime = signals more reliable
+        elif _regime in ('neutral', 'ranging'):
+            _base += 3   # unclear regime = need stronger setup
+        elif _regime in ('panic', 'news_driven', 'euphoric'):
+            _base += 5   # chaotic regime = need very strong setup
+
+        # 3. Trend strength (ADX)
+        if _adx > 30:    _base -= 4   # very strong trend, high reliability
+        elif _adx > 20:  _base -= 2   # confirmed trend
+        elif _adx < 10:  _base += 3   # no trend, signals noisy
+
+        # 4. Volatility — high ATR means confidence is structurally lower (not trader's fault)
+        if _atr_pct > 6:   _base -= 4   # very volatile, confidence scoring penalizes heavily
+        elif _atr_pct > 3: _base -= 2   # moderate-high volatility
+        elif _atr_pct < 1: _base += 3   # stable asset, high confidence should be achievable
+
+        # 5. Signal strength bonus — very strong signals get a lower bar
+        if _abs_score >= 6.0:  _base -= 5
+        elif _abs_score >= 4.5: _base -= 3
+        elif _abs_score >= 3.5: _base -= 1
+
+        # 6. Short direction gets slightly lower bar (downtrend confidence naturally lower)
+        if is_short_side: _base -= 4
+
+        # 7. Decay mode: tighten by 7pts when losing streak detected
+        if history_ctx.get('decay_detected'): _base += 7
+
+        # 8. Counter-trend: going against the confirmed regime needs higher bar
         _is_counter_trend = (
             (not is_short_side and _regime in ('trending_down', 'distribution', 'mild_downtrend')) or
             (is_short_side and _regime in ('trending_up', 'breakout', 'mild_uptrend'))
         )
-        if _is_counter_trend:
-            threshold = max(threshold, 60)  # counter-trend: needs solid setup, but not impossible
+        if _is_counter_trend: _base += 12   # counter-trend needs meaningful extra conviction
 
-        # Strong signal floor: if score is very strong (>5), lower threshold slightly
-        _abs_score = abs(c.get('score', 0))
-        if _abs_score >= 5.0:
-            threshold = max(threshold - 4, 38)  # strong conviction → 4pt threshold bonus
+        threshold = int(max(36, min(72, _base)))
 
         return {
             'score':     total,
