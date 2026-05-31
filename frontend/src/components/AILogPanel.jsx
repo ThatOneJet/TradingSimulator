@@ -312,16 +312,34 @@ function ScanModal({ run, onClose }) {
                 const catNeutral = batch.filter(b => !b.error && !b.qualifies && !b.qualifies_short && Math.abs(b.score||0) < 1.5)
                 const catFailed  = batch.filter(b => b.error)
 
-                const COLS = '2fr 1fr 1.2fr 0.7fr 0.7fr'
+                const COLS = '1.8fr 0.9fr 1.1fr 0.6fr'
                 function BatchRow({ b }) {
                   const stCfg = MARKET_STATE_CFG[b.market_state] ?? MARKET_STATE_CFG.neutral
                   const sc = b.score || 0
                   const scoreColor = sc >= 2.5 ? '#3ddc97' : sc <= -2.5 ? '#ff476f' : sc > 0 ? '#5ee8a9' : '#ff8080'
+                  const tq = b.trade_quality
+                  const thr = b.quality_threshold ?? (sc < 0 ? 52 : 62)
+                  const qColor = tq == null ? 'var(--t-4)' : tq >= thr ? '#4ade80' : tq >= thr * 0.75 ? '#f59e0b' : '#ff476f'
                   return (
-                    <div style={{ display: 'grid', gridTemplateColumns: COLS, padding: '4px 8px', borderBottom: '1px solid rgba(140,170,220,0.04)', opacity: b.error ? 0.35 : 1 }}>
-                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: b.qualifies ? '#3ddc97' : b.qualifies_short ? '#ff476f' : b.error ? 'var(--t-4)' : 'var(--t-2)', fontWeight: b.qualifies || b.qualifies_short ? 700 : 400 }}>
-                        {b.symbol}
-                      </span>
+                    <div style={{ display: 'grid', gridTemplateColumns: COLS, padding: '4px 8px', borderBottom: '1px solid rgba(140,170,220,0.04)', opacity: b.error ? 0.35 : 1, alignItems: 'center' }}>
+                      {/* Symbol + quality badge inline */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: b.qualifies ? '#3ddc97' : b.qualifies_short ? '#ff476f' : b.error ? 'var(--t-4)' : 'var(--t-2)', fontWeight: b.qualifies || b.qualifies_short ? 700 : 400, flexShrink: 0 }}>
+                          {b.symbol.replace('-USD','').replace('=X','').replace('=F','')}
+                        </span>
+                        {/* Quality score badge — always visible */}
+                        <span
+                          title={tq != null ? `Quality ${tq}/${thr} — ${tq >= thr ? 'passes gate' : `need ${thr}`}` : 'Computing...'}
+                          style={{
+                            fontSize: 8, fontFamily: 'var(--font-mono)', fontWeight: 700,
+                            color: qColor,
+                            background: tq == null ? 'rgba(140,170,220,0.06)' : tq >= thr ? 'rgba(74,222,128,0.1)' : tq >= thr * 0.75 ? 'rgba(245,179,66,0.1)' : 'rgba(255,71,111,0.1)',
+                            border: `1px solid ${tq == null ? 'rgba(140,170,220,0.15)' : tq >= thr ? 'rgba(74,222,128,0.25)' : tq >= thr * 0.75 ? 'rgba(245,179,66,0.25)' : 'rgba(255,71,111,0.25)'}`,
+                            borderRadius: 3, padding: '0px 4px', lineHeight: '16px', flexShrink: 0,
+                          }}>
+                          {tq != null ? `${Math.round(tq)}` : '?'}
+                        </span>
+                      </div>
                       <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: 700, color: b.error ? 'var(--t-4)' : scoreColor }}>
                         {b.error ? '—' : (sc >= 0 ? '+' : '') + f(sc, 1)}
                       </span>
@@ -330,14 +348,6 @@ function ScanModal({ run, onClose }) {
                       </span>
                       <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: b.error ? 'var(--t-4)' : (b.rsi||50) <= 30 ? '#3ddc97' : (b.rsi||50) >= 70 ? '#ff476f' : 'var(--t-3)' }}>
                         {b.error ? '—' : f(b.rsi, 0)}
-                      </span>
-                      <span
-                        title={b.trade_quality != null ? `Quality ${b.trade_quality}/${b.quality_threshold ?? 62} — ${b.trade_quality >= (b.quality_threshold ?? 62) ? 'passes gate' : `blocked (need ${b.quality_threshold ?? 62})`}` : 'No data'}
-                        style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: !b.trade_quality ? 'var(--t-4)' : b.trade_quality >= (b.quality_threshold ?? 62) ? '#4ade80' : b.trade_quality >= 45 ? '#f59e0b' : '#ff476f' }}>
-                        {b.trade_quality != null ? `${Math.round(b.trade_quality)}` : '—'}
-                        {b.trade_quality != null && b.quality_threshold && b.quality_threshold !== 62 && (
-                          <span style={{ fontSize: 7.5, opacity: 0.6, marginLeft: 1 }}>/{b.quality_threshold}</span>
-                        )}
                       </span>
                     </div>
                   )
@@ -351,7 +361,7 @@ function ScanModal({ run, onClose }) {
                       </div>
                       <div style={{ background: bg, borderRadius: 4 }}>
                         <div style={{ display: 'grid', gridTemplateColumns: COLS, padding: '2px 8px' }}>
-                          {['SYMBOL','SCORE','REGIME','RSI','QUAL'].map(h => (
+                          {['SYMBOL + QUALITY','SCORE','REGIME','RSI'].map(h => (
                             <span key={h} style={{ fontSize: 7.5, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', letterSpacing: '0.06em' }}>{h}</span>
                           ))}
                         </div>
