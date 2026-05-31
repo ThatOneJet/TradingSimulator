@@ -300,6 +300,24 @@ def _init_db():
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS ix_iv_sym ON iv_history(symbol, recorded_at)')
 
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS ai_decisions (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id INTEGER NOT NULL,
+                symbol       TEXT NOT NULL,
+                decision     TEXT NOT NULL,
+                score        REAL,
+                regime       TEXT,
+                reason       TEXT,
+                detail       TEXT,
+                quality_score REAL,
+                size_mult    REAL,
+                signal_json  TEXT,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS ix_aid_pid ON ai_decisions(portfolio_id, created_at)')
+
 _init_db()
 
 # in-memory watchlist
@@ -1399,6 +1417,47 @@ def positions_protection(pid):
                 result.append({'symbol': sym, 'error': str(e)})
 
         return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/portfolios/<int:pid>/decisions/summary')
+def decisions_summary(pid):
+    """Decision log summary: rejection reasons, accept rate, top symbols."""
+    try:
+        days = int(request.args.get('days', 7))
+        from datetime import datetime, timedelta
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        with _get_db() as conn:
+            by_decision = conn.execute(
+                'SELECT decision, COUNT(*) as n FROM ai_decisions WHERE portfolio_id=? AND created_at>? GROUP BY decision',
+                (pid, cutoff)
+            ).fetchall()
+            by_reason = conn.execute(
+                'SELECT reason, COUNT(*) as n FROM ai_decisions WHERE portfolio_id=? AND decision="REJECT" AND created_at>? GROUP BY reason ORDER BY n DESC',
+                (pid, cutoff)
+            ).fetchall()
+            top_rejected = conn.execute(
+                'SELECT symbol, COUNT(*) as n FROM ai_decisions WHERE portfolio_id=? AND decision="REJECT" AND created_at>? GROUP BY symbol ORDER BY n DESC LIMIT 10',
+                (pid, cutoff)
+            ).fetchall()
+            top_accepted = conn.execute(
+                'SELECT symbol, COUNT(*) as n FROM ai_decisions WHERE portfolio_id=? AND decision="ACCEPT" AND created_at>? GROUP BY symbol ORDER BY n DESC LIMIT 10',
+                (pid, cutoff)
+            ).fetchall()
+
+        total = sum(r['n'] for r in by_decision)
+        rejects = next((r['n'] for r in by_decision if r['decision'] == 'REJECT'), 0)
+        accepts = next((r['n'] for r in by_decision if r['decision'] == 'ACCEPT'), 0)
+
+        return jsonify({
+            'total': total, 'accepts': accepts, 'rejects': rejects,
+            'accept_rate': round(accepts/total*100, 1) if total else 0,
+            'by_reason': {r['reason']: {'count': r['n'], 'pct': round(r['n']/max(rejects,1)*100,1)} for r in by_reason},
+            'top_rejected_symbols': [dict(r) for r in top_rejected],
+            'top_accepted_symbols': [dict(r) for r in top_accepted],
+            'days': days,
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -2727,14 +2786,14 @@ def _compute_indicators_fast(symbol: str) -> dict:
     # A just-connected stream (e.g. Coinbase) has few closed 1m bars, so RSI/MACD
     # return their neutral defaults (RSI=50). Require 30+ closed bars before trusting
     # live data; otherwise fall through to yfinance daily history.
-    if _candle_engine:
-        ce = _candle_engine.latest(symbol, '1m')
-        if ce and ce.get('last_price', 0) > 0:
-            try:
-                if len(_candle_engine.get_recent_closes(symbol, '1m', 30)) >= 30:
-                    return ce
-            except Exception:
-                pass
+    if _candle_engine and _candle_engine.is_warmed_up(symbol, '1m', min_bars=26):
+        ce_data = _candle_engine.latest(symbol, '1m')
+        if ce_data:
+            return ce_data
+    elif _candle_engine:
+        bars = _candle_engine.bars_available(symbol, '1m')
+        if bars > 0:
+            logging.debug('[INDICATORS] %s: only %d/26 bars warmed — using yfinance', symbol, bars)
 
     # ── 2. Warm cache (full indicator dict, not a bulk prefetch stub) ──────────
     now = _time.time()
@@ -3574,6 +3633,25 @@ def _ai_log_entry(pid: int, symbol: str, action: str, score: float,
         )
 
 
+def _log_decision(pid: int, symbol: str, decision: str, score: float = 0,
+                  regime: str = '', reason: str = '', detail: str = '',
+                  quality_score: float = None, size_mult: float = None,
+                  signal_json: str = None):
+    """Log every AI decision — both ACCEPT and REJECT — to ai_decisions table."""
+    try:
+        with _get_db() as conn:
+            conn.execute(
+                '''INSERT INTO ai_decisions
+                   (portfolio_id, symbol, decision, score, regime, reason, detail,
+                    quality_score, size_mult, signal_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                (pid, symbol or '', decision, score or 0, regime or '', reason or '',
+                 (detail or '')[:200], quality_score, size_mult, signal_json)
+            )
+    except Exception:
+        pass
+
+
 def _score_to_pct(score: float) -> float:
     """Scale position size to signal conviction. High-score trades get more capital."""
     if score >= 7.0: return 0.12
@@ -4040,6 +4118,65 @@ def _seed_daily_candles(symbols: list) -> None:
             print(f'[SEED] {sym}: {len(df)} bars')
         except Exception as e:
             print(f'[SEED] {sym}: {e}')
+
+
+def _seed_intraday_candles(symbols: list) -> None:
+    """Seed CandleEngine 1m history from intraday REST candles so indicators
+    are warmed up immediately after restart (no waiting for 26+ live ticks).
+
+    Crypto: Coinbase REST (free, US-accessible, no key)
+    Others: yfinance 1m intraday
+    """
+    if not _candle_engine:
+        return
+    from candle_engine import _OHLCV
+    import urllib.request, json as _json_seed
+
+    def _seed_symbol(sym):
+        try:
+            bars = []
+            if sym.endswith('-USD'):
+                # Coinbase REST candles: granularity=60 (1 minute), up to 300 bars
+                cb_sym = sym  # BTC-USD, ETH-USD etc. — Coinbase format matches
+                url = f'https://api.exchange.coinbase.com/products/{cb_sym}/candles?granularity=60'
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    data = _json_seed.loads(r.read())
+                # Coinbase returns [[time, low, high, open, close, volume], ...] newest first
+                for row in reversed(data):
+                    ts, lo, hi, op, cl, vol = float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
+                    if cl > 0:
+                        bars.append(_OHLCV(open=op, high=hi, low=lo, close=cl, volume=vol, ts=ts))
+            else:
+                # yfinance 1m intraday (equities, forex, futures)
+                import yfinance as yf
+                hist = yf.Ticker(sym).history(period='1d', interval='1m')
+                if not hist.empty:
+                    for ts_idx, row in hist.iterrows():
+                        bar_ts = ts_idx.timestamp() if hasattr(ts_idx, 'timestamp') else float(ts_idx)
+                        cl = float(row.get('Close', 0) or 0)
+                        if cl > 0:
+                            bars.append(_OHLCV(
+                                open=float(row.get('Open', cl)),
+                                high=float(row.get('High', cl)),
+                                low=float(row.get('Low', cl)),
+                                close=cl,
+                                volume=float(row.get('Volume', 0) or 0),
+                                ts=bar_ts,
+                            ))
+
+            if bars:
+                with _candle_engine._lock:
+                    _candle_engine._history[sym]['1m'].extend(bars)
+                print(f'[SEED_1M] {sym}: {len(bars)} intraday bars loaded')
+        except Exception as e:
+            print(f'[SEED_1M] {sym} failed: {e}')
+
+    # Seed in parallel (quick, non-blocking)
+    import threading
+    threads = [threading.Thread(target=_seed_symbol, args=(s,), daemon=True) for s in symbols]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout=15)
 
 
 def _market_is_open() -> bool:
@@ -4582,6 +4719,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                 # Skip long entries in regimes with poor 30-day history
                 if qualifies_long and detail['market_state'] in history_ctx['cautious_regimes']:
                     qualifies_long = False
+                    _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
+                                  'cautious_regime', 'regime has <35% win rate in history')
 
                 # Compute quality preview for every symbol (not just qualifying ones)
                 # Uses lightweight assumptions for liquidity (avoids slow per-symbol API calls)
@@ -4666,6 +4805,9 @@ def _ai_run_portfolio(pid: int) -> dict:
                 summary['errors'].append(
                     f"skip {c['symbol']}: quality {quality['score']:.0f}/{quality['threshold']} below threshold"
                 )
+                _log_decision(pid, c['symbol'], 'REJECT', c.get('score', 0),
+                              c.get('detail', {}).get('market_state', ''),
+                              'quality_gate', f"quality {quality['score']:.0f}/{quality['threshold']}")
                 continue
 
             # ── RL engine: get recommended action for this market state ────────
@@ -4740,6 +4882,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                 heat = _compute_portfolio_heat(pid, equity)
                 if heat >= MAX_PORTFOLIO_HEAT:
                     summary['skipped'].append(f'{c["symbol"]}: heat {heat:.1%}')
+                    _log_decision(pid, c['symbol'], 'REJECT', c.get('score', 0),
+                                  '', 'portfolio_heat', f'heat {heat:.1%}')
                     continue
                 heat_room = (MAX_PORTFOLIO_HEAT - heat) * equity
                 trade_heat = raw_shares * stop_dist
@@ -4755,6 +4899,8 @@ def _ai_run_portfolio(pid: int) -> dict:
                 cluster_exp = _compute_cluster_exposure(c['symbol'], held, pid, equity, held_prices)
                 if cluster_exp >= MAX_CLUSTER_EXPOSURE:
                     summary['skipped'].append(f'{c["symbol"]}: correlated cluster {cluster_exp:.1%}')
+                    _log_decision(pid, c['symbol'], 'REJECT', c.get('score', 0),
+                                  '', 'correlation', f'cluster {cluster_exp:.1%}')
                     continue
                 cluster_room = max(0.0, (MAX_CLUSTER_EXPOSURE - cluster_exp) * equity)
                 position_value = min(position_value, cluster_room)
@@ -4784,6 +4930,9 @@ def _ai_run_portfolio(pid: int) -> dict:
             conf = c.get('confidence', 50)
             if conf < 35:
                 summary['skipped'].append(f"{c['symbol']}: low confidence ({conf})")
+                _log_decision(pid, c['symbol'], 'REJECT', c.get('score', 0),
+                              c.get('detail', {}).get('market_state', ''),
+                              'confidence_gate', f'confidence {conf}/35')
                 continue
 
             # ── Circuit breaker check ─────────────────────────────────────────
@@ -4798,6 +4947,9 @@ def _ai_run_portfolio(pid: int) -> dict:
                     summary['errors'].append(
                         f"skip {c['symbol']}: circuit breaker — {breaker['reason']}"
                     )
+                    _log_decision(pid, c['symbol'], 'REJECT', c.get('score', 0),
+                                  c.get('detail', {}).get('market_state', ''),
+                                  'circuit_breaker', breaker.get('reason', ''))
                     continue
                 position_value *= breaker['size_mult']
             except Exception:
@@ -4850,6 +5002,16 @@ def _ai_run_portfolio(pid: int) -> dict:
                     })
                     _ai_log_entry(pid, c['symbol'], 'BUY', c['score'], fill, shares,
                                   f"score {c['score']:+.1f} | {c['detail']['summary'][:80]}")
+                    import json as _json_d
+                    _log_decision(pid, c['symbol'], 'ACCEPT', c.get('score', 0),
+                                  c.get('detail', {}).get('market_state', ''),
+                                  'opened', f"long at ${fill:.2f}",
+                                  quality_score=quality.get('score') if 'quality' in dir() else None,
+                                  size_mult=c.get('quality_size_mult'),
+                                  signal_json=_json_d.dumps({
+                                      'confidence': c.get('confidence', 0),
+                                      'atr_pct': c.get('atr_pct', 0),
+                                  }))
                 else:  # short
                     fill = _apply_slippage(c['price'], 'sell', atr_val, c.get('volume_ratio', 1.0))
                     _sim_short(c['symbol'], shares, fill, pid)
@@ -4862,6 +5024,16 @@ def _ai_run_portfolio(pid: int) -> dict:
                     })
                     _ai_log_entry(pid, c['symbol'], 'SHORT', c['score'], fill, shares,
                                   f"score {c['score']:+.1f} | bearish short | {c['detail']['summary'][:80]}")
+                    import json as _json_d
+                    _log_decision(pid, c['symbol'], 'ACCEPT', c.get('score', 0),
+                                  c.get('detail', {}).get('market_state', ''),
+                                  'opened', f"short at ${fill:.2f}",
+                                  quality_score=quality.get('score') if 'quality' in dir() else None,
+                                  size_mult=c.get('quality_size_mult'),
+                                  signal_json=_json_d.dumps({
+                                      'confidence': c.get('confidence', 0),
+                                      'atr_pct': c.get('atr_pct', 0),
+                                  }))
                 n_pos    += 1
                 available -= alloc
             except Exception as e:
@@ -5745,6 +5917,12 @@ if __name__ == '__main__':
 
     # Seed daily candles for MTF analysis (runs in background, ~30s)
     _seed_symbols = list(set(CRYPTO_SYMBOLS) | {'SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'TSLA', 'META', 'GOOGL', 'AMZN', 'JPM'})
+
+    # Seed intraday 1m bars FIRST so indicators are warmed up immediately
+    _seed_1m_syms = [s for s in _seed_symbols if s.endswith('-USD') or not s.endswith('=F')]
+    threading.Thread(target=_seed_intraday_candles, args=(_seed_1m_syms,), daemon=True).start()
+    print(f'[TradeSimulator] Seeding intraday candles for {len(_seed_1m_syms)} symbols...')
+
     threading.Thread(target=_seed_daily_candles, args=(_seed_symbols,), daemon=True).start()
     print(f'[TradeSimulator] Seeding daily candles for {len(_seed_symbols)} symbols in background...')
 

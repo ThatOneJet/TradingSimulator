@@ -43,6 +43,7 @@ class _OHLCV:
     vwap_num: float = 0.0   # cumulative price*volume
     vwap_den: float = 0.0   # cumulative volume
     tick_count: int = 0
+    closed: bool = False
 
 
 def _ema(values: list[float], period: int) -> list[float]:
@@ -272,6 +273,17 @@ class CandleEngine:
             bars = list(hist)
             return [b.close for b in bars[-n:]]
 
+    def bars_available(self, symbol: str, interval: str = '1m') -> int:
+        """Return number of closed bars available for (symbol, interval)."""
+        with self._lock:
+            hist = self._history.get(symbol, {}).get(interval)
+            return len(hist) if hist else 0
+
+    def is_warmed_up(self, symbol: str, interval: str = '1m', min_bars: int = 26) -> bool:
+        """Return True if enough bars exist for reliable indicator computation.
+        MACD needs 26 bars minimum; use 26 as the default gate."""
+        return self.bars_available(symbol, interval) >= min_bars
+
     def _on_tick(self, channel: str, data: dict) -> None:
         symbol = data.get('symbol')
         price  = data.get('price')
@@ -285,6 +297,12 @@ class CandleEngine:
             ts    = float(ts)
         except (TypeError, ValueError):
             return
+        # Timestamp sanity: reject future timestamps or timestamps >1h old
+        _now = time.time()
+        if ts > _now + 300:    # more than 5 min in future
+            ts = _now
+        elif ts < _now - 3600: # more than 1 hour old
+            ts = _now
 
         closed_bars = []
         with self._lock:
@@ -302,6 +320,10 @@ class CandleEngine:
     def _publish_closed(self, symbol: str, interval: str, bar: _OHLCV) -> None:
         with self._lock:
             history = self._history[symbol][interval]
+            bars_count = len(history)
+            if bars_count < 26:
+                log.debug("[CANDLE] %s %s: only %d bars — indicators unreliable (need 26+)",
+                          symbol, interval, bars_count)
             indicators = _compute_indicators(history)
 
         if not indicators:

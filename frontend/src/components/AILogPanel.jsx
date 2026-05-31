@@ -521,6 +521,7 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
   const [reviewTab,   setReviewTab]   = useState('scans')  // 'scans' | '30d' | 'trades'
   const [tradeHist,   setTradeHist]   = useState(null)
   const [tradeLoad,   setTradeLoad]   = useState(false)
+  const [decisions,   setDecisions]   = useState(null)
   const prevCountRef = useRef(0)
 
   useEffect(() => {
@@ -529,6 +530,13 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
     api.get(`/portfolios/${portfolioId}/history/review`)
       .then(r => { setReview(r.data); setReviewLoad(false) })
       .catch(() => setReviewLoad(false))
+  }, [reviewTab, portfolioId])
+
+  useEffect(() => {
+    if (reviewTab !== '30d' || !portfolioId) return
+    api.get(`/portfolios/${portfolioId}/decisions/summary?days=7`)
+      .then(r => setDecisions(r.data))
+      .catch(() => {})
   }, [reviewTab, portfolioId])
 
   useEffect(() => {
@@ -802,6 +810,88 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
                           </div>
                         )
                       })}
+                  </div>
+                )}
+
+                {/* Decision & Rejection Breakdown */}
+                {decisions && (
+                  <div style={{ marginTop: 14 }}>
+                    {/* Header + accept rate */}
+                    <div style={{ fontSize: 9, color: 'var(--t-4)', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 6 }}>
+                      Decision Log — 7 Days
+                    </div>
+                    <div style={{ display: 'flex', gap: 10, marginBottom: 8 }}>
+                      <div style={{ flex: 1, background: 'rgba(74,222,128,0.07)', borderRadius: 5, padding: '6px 8px', textAlign: 'center' }}>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: '#4ade80', fontFamily: 'var(--font-mono)' }}>{decisions.accepts}</div>
+                        <div style={{ fontSize: 8, color: 'var(--t-4)' }}>accepted</div>
+                      </div>
+                      <div style={{ flex: 1, background: 'rgba(255,71,111,0.07)', borderRadius: 5, padding: '6px 8px', textAlign: 'center' }}>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: '#ff476f', fontFamily: 'var(--font-mono)' }}>{decisions.rejects}</div>
+                        <div style={{ fontSize: 8, color: 'var(--t-4)' }}>rejected</div>
+                      </div>
+                      <div style={{ flex: 1, background: 'rgba(140,170,220,0.06)', borderRadius: 5, padding: '6px 8px', textAlign: 'center' }}>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--t-2)', fontFamily: 'var(--font-mono)' }}>{decisions.accept_rate}%</div>
+                        <div style={{ fontSize: 8, color: 'var(--t-4)' }}>accept rate</div>
+                      </div>
+                    </div>
+
+                    {/* Rejection reason breakdown — horizontal bars */}
+                    {Object.keys(decisions.by_reason).length > 0 && (
+                      <div style={{ marginBottom: 10 }}>
+                        <div style={{ fontSize: 8.5, color: 'var(--t-4)', marginBottom: 5 }}>Why trades were rejected:</div>
+                        {Object.entries(decisions.by_reason)
+                          .sort((a,b) => b[1].count - a[1].count)
+                          .map(([reason, stats]) => {
+                            const reasonColor = reason === 'quality_gate' ? '#ff476f'
+                              : reason === 'portfolio_heat' ? '#fb923c'
+                              : reason === 'cautious_regime' ? '#f5b342'
+                              : reason === 'circuit_breaker' ? '#a78bfa'
+                              : reason === 'no_data' ? '#6b7689'
+                              : '#8899aa'
+                            return (
+                              <div key={reason} style={{ marginBottom: 4 }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                                  <span style={{ fontSize: 8.5, color: 'var(--t-3)', fontFamily: 'var(--font-mono)' }}>
+                                    {reason.replace(/_/g, ' ')}
+                                  </span>
+                                  <span style={{ fontSize: 8.5, color: reasonColor, fontWeight: 700, fontFamily: 'var(--font-mono)' }}>
+                                    {stats.count} ({stats.pct}%)
+                                  </span>
+                                </div>
+                                <div style={{ height: 4, background: 'rgba(140,170,220,0.08)', borderRadius: 2 }}>
+                                  <div style={{ width: `${stats.pct}%`, height: '100%', background: reasonColor, borderRadius: 2, opacity: 0.7, transition: 'width 0.4s' }} />
+                                </div>
+                              </div>
+                            )
+                          })}
+                      </div>
+                    )}
+
+                    {/* Diagnostic hint */}
+                    {decisions.by_reason['quality_gate']?.pct > 50 && (
+                      <div style={{ fontSize: 8.5, color: '#f5b342', background: 'rgba(245,179,66,0.08)', borderRadius: 4, padding: '4px 8px', marginBottom: 6 }}>
+                        ⚠ Quality gate blocking {decisions.by_reason['quality_gate'].pct}% of candidates — consider lowering threshold or reviewing setup quality
+                      </div>
+                    )}
+                    {decisions.by_reason['no_data']?.pct > 20 && (
+                      <div style={{ fontSize: 8.5, color: '#ff476f', background: 'rgba(255,71,111,0.08)', borderRadius: 4, padding: '4px 8px', marginBottom: 6 }}>
+                        ⚠ {decisions.by_reason['no_data'].pct}% of candidates have no data — possible data pipeline issue
+                      </div>
+                    )}
+
+                    {/* Top rejected symbols */}
+                    {decisions.top_rejected_symbols?.length > 0 && (
+                      <div>
+                        <div style={{ fontSize: 8.5, color: 'var(--t-4)', marginBottom: 4 }}>Most rejected:</div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                          {decisions.top_rejected_symbols.slice(0,6).map(s => (
+                            <span key={s.symbol} style={{ fontSize: 8, fontFamily: 'var(--font-mono)', color: '#ff476f', background: 'rgba(255,71,111,0.08)', borderRadius: 3, padding: '1px 5px' }}>
+                              {s.symbol.replace('-USD','').replace('=X','').replace('=F','')} ×{s.count}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </>
