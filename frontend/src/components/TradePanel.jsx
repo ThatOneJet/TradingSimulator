@@ -55,8 +55,15 @@ function PortfolioCard({ account, onReset, portfolioId }) {
           </div>
         ) : (
           <div className="tp-metric">
-            <span className="tp-lbl">CASH</span>
-            <span className="tp-val mono">${fmt(account.cash)}</span>
+            <span className="tp-lbl" title={account.cash > (account.equity - (account.pnl_unrealized || 0)) ? 'Includes short sale proceeds held as collateral' : 'Available cash'}>
+              CASH {account.cash > 100001 ? '⚠' : ''}
+            </span>
+            <span className="tp-val mono" style={{ fontSize: account.cash > 110000 ? 11 : undefined }}>
+              ${fmt(account.cash)}
+              {account.cash > 100001 && (
+                <span style={{ display: 'block', fontSize: 8, color: 'var(--t-4)', fontWeight: 400 }}>incl. short proceeds</span>
+              )}
+            </span>
           </div>
         )}
         <div className="tp-metric">
@@ -125,8 +132,13 @@ function PositionCard({ pos, portfolioId, onOrderPlaced }) {
       </div>
       <div className="tp-metrics">
         <div className="tp-metric">
-          <span className="tp-lbl">SHARES</span>
-          <span className="tp-val mono">{pos.qty}</span>
+          <span className="tp-lbl">
+            {pos.qty < 0 ? 'SHORT QTY' : 'SHARES'}
+          </span>
+          <span className="tp-val mono" style={{ color: pos.qty < 0 ? '#ff6a6a' : undefined }}>
+            {pos.qty < 0 && <span style={{ fontSize: 8, background: 'rgba(255,71,111,0.15)', color: '#ff476f', border: '1px solid rgba(255,71,111,0.3)', borderRadius: 3, padding: '1px 4px', marginRight: 5 }}>SHORT</span>}
+            {Math.abs(pos.qty).toFixed(4)}
+          </span>
         </div>
         <div className="tp-metric">
           <span className="tp-lbl">AVG COST</span>
