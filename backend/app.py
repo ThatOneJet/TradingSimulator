@@ -1929,6 +1929,88 @@ def get_quote(symbol):
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
+@app.route('/api/orderbook/<symbol>')
+def order_book(symbol):
+    """Level 2 order book depth.
+    Crypto (-USD): Coinbase REST public API — free, no key, up to 50 levels.
+    Others: Alpaca latest quote — best bid/ask only (IEX free tier limitation).
+    """
+    sym = symbol.upper()
+    try:
+        if sym.endswith('-USD'):
+            # Coinbase Level 2 order book — free, no auth required
+            import urllib.request as _ur
+            cb_sym = sym  # BTC-USD format matches Coinbase
+            url = f'https://api.exchange.coinbase.com/products/{cb_sym}/book?level=2'
+            req = _ur.Request(url, headers={'User-Agent': 'TradeSimulator/1.0'})
+            with _ur.urlopen(req, timeout=6) as r:
+                raw = __import__('json').loads(r.read())
+
+            # Top 20 levels each side, format: [price, size, num_orders]
+            bids = [[float(b[0]), float(b[1]), int(b[2])] for b in raw.get('bids', [])[:20]]
+            asks = [[float(a[0]), float(a[1]), int(a[2])] for a in raw.get('asks', [])[:20]]
+
+            # Calculate totals for depth bars
+            max_size = max(
+                max((b[1] for b in bids), default=0),
+                max((a[1] for a in asks), default=0)
+            )
+
+            best_bid = bids[0][0] if bids else 0
+            best_ask = asks[0][0] if asks else 0
+            spread    = best_ask - best_bid if best_bid and best_ask else 0
+            spread_pct = spread / best_bid * 100 if best_bid else 0
+            mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
+
+            # Total bid/ask liquidity in the top 20 levels
+            total_bid_size = sum(b[1] for b in bids)
+            total_ask_size = sum(a[1] for a in asks)
+
+            return jsonify({
+                'symbol': sym, 'source': 'coinbase', 'levels': 'full',
+                'bids': bids, 'asks': asks,
+                'best_bid': best_bid, 'best_ask': best_ask,
+                'spread': round(spread, 4), 'spread_pct': round(spread_pct, 4),
+                'mid_price': round(mid_price, 4),
+                'max_size': max_size,
+                'total_bid_liquidity': round(total_bid_size, 4),
+                'total_ask_liquidity': round(total_ask_size, 4),
+            })
+
+        else:
+            # Alpaca IEX — best bid/ask only (free tier)
+            price = _get_current_price(sym)
+            quote_data = _quote_yfinance(sym) if not KEYS_SET else None
+            bid = ask = price or 0
+            try:
+                if KEYS_SET:
+                    from alpaca.data.requests import StockLatestQuoteRequest as SLQR
+                    q = data_client.get_stock_latest_quote(SLQR(symbol_or_symbols=sym, feed='iex'))
+                    if sym in q:
+                        bid = float(q[sym].bid_price or 0)
+                        ask = float(q[sym].ask_price or 0)
+            except Exception:
+                bid = ask = price or 0
+
+            spread = ask - bid if bid and ask else 0
+            mid = (bid + ask) / 2 if bid and ask else bid
+
+            return jsonify({
+                'symbol': sym, 'source': 'alpaca_iex', 'levels': 'top_only',
+                'bids': [[bid, 0, 0]] if bid else [],
+                'asks': [[ask, 0, 0]] if ask else [],
+                'best_bid': bid, 'best_ask': ask,
+                'spread': round(spread, 4),
+                'spread_pct': round(spread / bid * 100, 4) if bid else 0,
+                'mid_price': round(mid, 4),
+                'max_size': 0,
+                'total_bid_liquidity': 0,
+                'total_ask_liquidity': 0,
+                'note': 'Alpaca IEX free tier — best bid/ask only. Upgrade to SIP for full depth.',
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # ── Markets: Futures / Forex / Options ───────────────────────────────────────
 
 _FUTURES_LIST = [

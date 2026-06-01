@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import api from '../api.js'
 
 function PortfolioCard({ account, onReset, portfolioId }) {
@@ -160,41 +160,158 @@ function PositionCard({ pos, portfolioId, onOrderPlaced }) {
 }
 
 function OrderBookCard({ symbol, quote }) {
-  const bid       = quote?.bid  ?? 0
-  const ask       = quote?.ask  ?? 0
-  const bidSz     = quote?.bid_size ?? 0
-  const askSz     = quote?.ask_size ?? 0
-  const spread    = ask - bid
-  const spreadPct = bid > 0 ? ((spread / bid) * 100).toFixed(3) : '—'
+  const [book, setBook] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const isCrypto = symbol?.endsWith('-USD')
+
+  useEffect(() => {
+    if (!symbol) return
+    let cancelled = false
+    const load = () => {
+      if (!cancelled) setLoading(true)
+      api.get(`/orderbook/${symbol}`)
+        .then(r => { if (!cancelled) { setBook(r.data); setLoading(false) } })
+        .catch(() => { if (!cancelled) setLoading(false) })
+    }
+    load()
+    // Refresh every 3s for crypto, 10s for equities
+    const id = setInterval(load, isCrypto ? 3000 : 10000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [symbol, isCrypto])
+
+  const bid = book?.best_bid || quote?.bid || 0
+  const ask = book?.best_ask || quote?.ask || 0
+  const spread = book?.spread || (ask - bid)
+  const spreadPct = book?.spread_pct || (bid > 0 ? (spread / bid * 100) : 0)
+  const maxSize = book?.max_size || 1
+
+  const fmtPrice = (p) => {
+    if (!p) return '—'
+    return p >= 100 ? p.toFixed(2) : p >= 1 ? p.toFixed(4) : p.toFixed(6)
+  }
+  const fmtSize = (s) => {
+    if (!s) return ''
+    if (s >= 1000) return `${(s/1000).toFixed(1)}K`
+    if (s >= 1) return s.toFixed(3)
+    return s.toFixed(6)
+  }
 
   return (
     <div className="tp-card tp-ob-card">
       <div className="tp-card-hd">
         Order Book
         <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--t-3)', fontWeight: 400 }}>{symbol}</span>
+        {loading && <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--t-4)' }}>…</span>}
+        {book?.source && !loading && (
+          <span style={{ marginLeft: 'auto', fontSize: 8, color: 'var(--t-4)' }}>
+            {book.source === 'coinbase' ? '● Coinbase L2' : '● IEX (1 level)'}
+          </span>
+        )}
       </div>
-      <div style={{ fontSize: 10, color: 'var(--t-3)', fontFamily: 'var(--font-mono)', marginBottom: 8 }}>
-        SPREAD&nbsp;
-        <span style={{ color: 'var(--cy)' }}>{spread > 0 ? `$${spread.toFixed(4)}` : '—'}</span>
-        <span style={{ color: 'var(--t-4)', marginLeft: 4 }}>({spreadPct}%)</span>
+
+      {/* Spread row */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, padding: '4px 0', borderBottom: '1px solid rgba(140,170,220,0.07)' }}>
+        <span style={{ fontSize: 9, color: 'var(--t-4)' }}>SPREAD</span>
+        <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--cy)' }}>
+          ${fmtPrice(spread)}
+          <span style={{ fontSize: 8, color: 'var(--t-4)', marginLeft: 4 }}>({spreadPct.toFixed(3)}%)</span>
+        </span>
       </div>
-      <table className="ob-table" style={{ width: '100%', tableLayout: 'fixed' }}>
-        <thead>
-          <tr><th>Price</th><th>Size</th><th>Side</th></tr>
-        </thead>
-        <tbody>
-          <tr className="ob-ask">
-            <td className="mono err">{ask > 0 ? ask.toFixed(2) : '—'}</td>
-            <td className="mono">{askSz || '—'}</td>
-            <td style={{ color: 'var(--err)', fontSize: 10, letterSpacing: '0.06em' }}>ASK</td>
-          </tr>
-          <tr className="ob-bid">
-            <td className="mono ok">{bid > 0 ? bid.toFixed(2) : '—'}</td>
-            <td className="mono">{bidSz || '—'}</td>
-            <td style={{ color: 'var(--ok)', fontSize: 10, letterSpacing: '0.06em' }}>BID</td>
-          </tr>
-        </tbody>
-      </table>
+
+      {/* Liquidity balance bar (crypto only) */}
+      {isCrypto && book?.total_bid_liquidity > 0 && (
+        <div style={{ marginBottom: 8 }}>
+          {(() => {
+            const totalLiq = book.total_bid_liquidity + book.total_ask_liquidity
+            const bidPct = totalLiq > 0 ? (book.total_bid_liquidity / totalLiq * 100) : 50
+            const askPct = 100 - bidPct
+            const bidDom = bidPct > 55
+            return (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 8, color: 'var(--t-4)', marginBottom: 3 }}>
+                  <span style={{ color: '#3ddc97' }}>Bids {bidPct.toFixed(0)}%</span>
+                  <span style={{ color: '#ff476f' }}>Asks {askPct.toFixed(0)}%</span>
+                </div>
+                <div style={{ display: 'flex', height: 5, borderRadius: 3, overflow: 'hidden' }}>
+                  <div style={{ width: `${bidPct}%`, background: '#3ddc97', opacity: 0.7 }} />
+                  <div style={{ width: `${askPct}%`, background: '#ff476f', opacity: 0.7 }} />
+                </div>
+                <div style={{ fontSize: 8, color: bidDom ? '#3ddc97' : '#ff476f', textAlign: 'center', marginTop: 2 }}>
+                  {bidDom ? '▲ Buy pressure dominates' : '▼ Sell pressure dominates'}
+                </div>
+              </>
+            )
+          })()}
+        </div>
+      )}
+
+      {/* Order book table */}
+      {book && book.asks?.length > 0 && (
+        <div>
+          {/* Column headers */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', padding: '2px 0', marginBottom: 2 }}>
+            <span style={{ fontSize: 8, color: 'var(--t-4)', fontFamily: 'var(--font-mono)' }}>PRICE</span>
+            <span style={{ fontSize: 8, color: 'var(--t-4)', fontFamily: 'var(--font-mono)', textAlign: 'right' }}>SIZE</span>
+          </div>
+
+          {/* Asks — show top 8, reversed so lowest ask is closest to spread */}
+          <div>
+            {[...(book.asks || [])].slice(0, 8).reverse().map((level, i) => {
+              const [price, size] = level
+              const barW = maxSize > 0 ? Math.min(100, size / maxSize * 100) : 0
+              return (
+                <div key={i} style={{ position: 'relative', display: 'grid', gridTemplateColumns: '1fr 1fr', padding: '1.5px 0', alignItems: 'center' }}>
+                  <div style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: `${barW}%`, background: 'rgba(255,71,111,0.12)', borderRadius: 2 }} />
+                  <span style={{ fontSize: 9.5, fontFamily: 'var(--font-mono)', color: '#ff476f', position: 'relative', zIndex: 1 }}>
+                    {fmtPrice(price)}
+                  </span>
+                  <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', color: 'var(--t-3)', textAlign: 'right', position: 'relative', zIndex: 1 }}>
+                    {fmtSize(size)}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Mid price divider */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '4px 0', padding: '3px 0', borderTop: '1px solid rgba(140,170,220,0.15)', borderBottom: '1px solid rgba(140,170,220,0.15)' }}>
+            <span style={{ fontSize: 11, fontWeight: 700, fontFamily: 'var(--font-mono)', color: 'var(--t-1)' }}>
+              ${fmtPrice(book.mid_price)}
+            </span>
+            <span style={{ fontSize: 8, color: 'var(--t-4)' }}>MID</span>
+          </div>
+
+          {/* Bids — top 8 */}
+          <div>
+            {(book.bids || []).slice(0, 8).map((level, i) => {
+              const [price, size] = level
+              const barW = maxSize > 0 ? Math.min(100, size / maxSize * 100) : 0
+              return (
+                <div key={i} style={{ position: 'relative', display: 'grid', gridTemplateColumns: '1fr 1fr', padding: '1.5px 0', alignItems: 'center' }}>
+                  <div style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: `${barW}%`, background: 'rgba(61,220,151,0.12)', borderRadius: 2 }} />
+                  <span style={{ fontSize: 9.5, fontFamily: 'var(--font-mono)', color: '#3ddc97', position: 'relative', zIndex: 1 }}>
+                    {fmtPrice(price)}
+                  </span>
+                  <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', color: 'var(--t-3)', textAlign: 'right', position: 'relative', zIndex: 1 }}>
+                    {fmtSize(size)}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Note for equity single-level */}
+          {book.note && (
+            <div style={{ fontSize: 8, color: 'var(--t-4)', marginTop: 6, lineHeight: 1.4, opacity: 0.7 }}>
+              {book.note}
+            </div>
+          )}
+        </div>
+      )}
+
+      {!book && !loading && (
+        <div style={{ fontSize: 9, color: 'var(--t-4)', textAlign: 'center', marginTop: 8 }}>No data</div>
+      )}
     </div>
   )
 }
