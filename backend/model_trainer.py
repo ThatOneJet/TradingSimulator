@@ -107,13 +107,13 @@ class ModelTrainer:
                 # Fetch closed sell/cover trades with a realised P&L
                 trades = conn.execute(
                     '''
-                    SELECT id, symbol, realized_pl, closed_at
+                    SELECT id, symbol, realized_pl, created_at as closed_at
                     FROM   sim_trades
                     WHERE  portfolio_id = ?
-                      AND  action       IN ('sell', 'cover')
+                      AND  side         IN ('sell', 'cover')
                       AND  realized_pl  IS NOT NULL
-                      AND  closed_at   >= ?
-                    ORDER  BY closed_at ASC
+                      AND  created_at  >= ?
+                    ORDER  BY created_at ASC
                     ''',
                     (pid, cutoff),
                 ).fetchall()
