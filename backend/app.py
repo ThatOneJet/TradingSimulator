@@ -4987,17 +4987,17 @@ def _ai_run_portfolio(pid: int) -> dict:
                 summary['scanned'] += 1
                 qualifies_long  = score >= BUY_THRESH
                 qualifies_short = score <= SHORT_THRESH
-                # Block shorts when price is clearly going UP — never fight the trend
+                # Block shorts when price is going UP or direction is unknown
                 _no_short_regimes = ('ranging', 'neutral', 'mild_uptrend', 'accumulation',
-                                     'oversold_extreme', 'trending_up', 'breakout')
+                                     'oversold_extreme', 'trending_up', 'breakout', 'news_driven')
                 if qualifies_short and detail['market_state'] in _no_short_regimes:
                     qualifies_short = False
                     _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
                                   'regime_no_short', f'no shorts in {detail["market_state"]} — sideways market')
 
-                # Never long into a downtrend, never short into an uptrend
+                # Never long into a downtrend, and avoid news-driven (direction unknown)
                 _no_long_regimes = ('breakout', 'trending_up', 'overbought_extreme', 'euphoric',
-                                    'distribution', 'trending_down', 'mild_downtrend')
+                                    'distribution', 'trending_down', 'mild_downtrend', 'news_driven')
                 if qualifies_long and detail['market_state'] in _no_long_regimes:
                     qualifies_long = False
                     _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
