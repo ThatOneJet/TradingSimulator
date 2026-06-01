@@ -92,6 +92,8 @@ export default function Chart({ symbol, timeframe, socket, overlays, quote, delt
         time: b.time, value: b.volume,
         color: b.close >= b.open ? 'rgba(38,217,127,0.25)' : 'rgba(255,77,77,0.25)',
       })))
+      // Always snap to latest tick after loading data
+      mainChartRef.current?.timeScale().scrollToRealTime()
       setLastUpdated(new Date())
       setRefreshFlash(true)
       setTimeout(() => setRefreshFlash(false), 800)
@@ -391,6 +393,29 @@ export default function Chart({ symbol, timeframe, socket, overlays, quote, delt
     : overlays?.has('RSI') ? 'RSI(14)'
     : 'Stoch(14,3)'
 
+  // Disable chart panning while Shift is held for zone drag
+  const handleKeyDown = useCallback((e) => {
+    if (e.key === 'Shift' && mainChartRef.current) {
+      mainChartRef.current.applyOptions({ handleScroll: false })
+    }
+  }, [])
+  const handleKeyUp = useCallback((e) => {
+    if (e.key === 'Shift' && mainChartRef.current) {
+      mainChartRef.current.applyOptions({ handleScroll: { mouseWheel: true, pressedMouseMove: true } })
+      // Snap back to latest tick after drag
+      mainChartRef.current.timeScale().scrollToRealTime()
+    }
+  }, [])
+
+  useEffect(() => {
+    window.addEventListener('keydown', handleKeyDown)
+    window.addEventListener('keyup', handleKeyUp)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('keyup', handleKeyUp)
+    }
+  }, [handleKeyDown, handleKeyUp])
+
   return (
     <div className="chart-stack">
       <div
@@ -398,12 +423,14 @@ export default function Chart({ symbol, timeframe, socket, overlays, quote, delt
         onMouseDown={(e) => {
           if (!e.shiftKey) return
           e.preventDefault()
+          e.stopPropagation()  // prevent chart from receiving this event
           const rect = e.currentTarget.getBoundingClientRect()
           setDragState({ startX: e.clientX - rect.left, startY: e.clientY - rect.top, endX: e.clientX - rect.left, endY: e.clientY - rect.top })
           setOrderBox(null)
         }}
         onMouseMove={(e) => {
           if (!dragState) return
+          e.preventDefault()
           const rect = e.currentTarget.getBoundingClientRect()
           setDragState(prev => ({ ...prev, endX: e.clientX - rect.left, endY: e.clientY - rect.top }))
         }}
@@ -420,8 +447,20 @@ export default function Chart({ symbol, timeframe, socket, overlays, quote, delt
             show: true,
           })
           setDragState(null)
+          // Re-enable scroll and snap to latest tick
+          if (mainChartRef.current) {
+            mainChartRef.current.applyOptions({ handleScroll: { mouseWheel: true, pressedMouseMove: true } })
+            mainChartRef.current.timeScale().scrollToRealTime()
+          }
         }}
-        onMouseLeave={() => setDragState(null)}
+        onMouseLeave={() => {
+          if (dragState) {
+            setDragState(null)
+            if (mainChartRef.current) {
+              mainChartRef.current.applyOptions({ handleScroll: { mouseWheel: true, pressedMouseMove: true } })
+            }
+          }
+        }}
       >
         <div ref={mainRef} className="chart-main" />
         <div ref={tooltipEl} className="chart-tooltip" />
