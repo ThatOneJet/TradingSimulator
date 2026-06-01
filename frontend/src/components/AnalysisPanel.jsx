@@ -1,7 +1,16 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, lazy, Suspense } from 'react'
 import api from '../api.js'
 import { computeDecision } from '../utils/tradeDecision.js'
 import AIThesisPanel from './AIThesisPanel.jsx'
+import RiskPanel from './RiskPanel'
+
+function RiskPanelInline({ symbol, portfolioId, price }) {
+  return (
+    <div style={{ padding: '4px 0' }}>
+      <RiskPanel symbol={symbol} portfolioId={portfolioId} price={price} />
+    </div>
+  )
+}
 
 function f(n, d = 2) { return (n == null || isNaN(n)) ? '—' : Number(n).toFixed(d) }
 
@@ -1505,6 +1514,9 @@ export default function AnalysisPanel({ symbol, quote, delta, portfolioId }) {
             <span style={{ position: 'absolute', top: 5, right: 4, width: 5, height: 5, borderRadius: '50%', background: '#f5b342' }} />
           )}
         </button>
+        <button className={`ap-tab${tab === 'risk' ? ' active' : ''}`} onClick={() => setTab('risk')}>
+          Risk
+        </button>
         <div className="ap-tab-indicators">
           {(loading || aiLoading) && <span className="ap-spinner" />}
           {data && price && !loading && <span className="ap-live-pip" title="Data ready" />}
@@ -1522,6 +1534,11 @@ export default function AnalysisPanel({ symbol, quote, delta, portfolioId }) {
       {tab === 'analysis' && <AnalysisTab data={data} price={price} symbol={symbol} brief={brief} portReg={portReg} />}
       {tab === 'ai'       && <AIDecisionTab data={data} price={price} />}
       {tab === 'intel'    && <AIIntelTab detail={aiDetail} aiLoading={aiLoading} aiError={aiError} />}
+      {tab === 'risk'     && (
+        <div className="ap-content">
+          <RiskPanelInline symbol={symbol} portfolioId={portfolioId} price={price} />
+        </div>
+      )}
 
     </div>
   )

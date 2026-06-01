@@ -158,7 +158,6 @@ export default function App() {
             { key: 'watch',    label: 'Watch'    },
             { key: 'analysis', label: 'Analysis' },
             { key: 'rankings', label: 'Rank'     },
-            { key: 'risk',     label: 'Risk'     },
             { key: 'aiscan',   label: 'AI Scan'  },
           ].map(t => (
             <button
@@ -192,18 +191,18 @@ export default function App() {
                 onPrioritySymbol={setSymbol}
               />
               <div style={{ borderTop: '1px solid rgba(140,170,220,0.08)' }}>
+                <Positions positions={positions} onRefresh={refresh} portfolioId={portfolioId} totalValue={account?.portfolio_value} />
+              </div>
+              <div style={{ borderTop: '1px solid rgba(140,170,220,0.08)' }}>
                 <SetupGuideWidget symbol={symbol} quote={quote} delta={delta} />
               </div>
             </>
           )}
           {leftTab === 'analysis' && (
-            <AnalysisPanel symbol={symbol} quote={quote} delta={delta} />
+            <AnalysisPanel symbol={symbol} quote={quote} delta={delta} portfolioId={portfolioId} price={midPrice} />
           )}
           {leftTab === 'rankings' && (
             <RankingsPanel portfolioId={portfolioId} onSelect={(sym) => { setSymbol(sym); setLeftTab('watch') }} />
-          )}
-          {leftTab === 'risk' && (
-            <RiskPanel symbol={symbol} portfolioId={portfolioId} price={midPrice} />
           )}
           {leftTab === 'aiscan' && (
             <AILogPanel portfolioId={portfolioId} isAiControlled={true} />
