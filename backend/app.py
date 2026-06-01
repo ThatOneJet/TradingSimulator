@@ -4724,8 +4724,8 @@ def _ai_run_portfolio(pid: int) -> dict:
     """One AI scan cycle: check existing positions, then scan a batch for buys."""
     MAX_POS      = 10   # max 10 positions — concentrate on quality
     CASH_RESERVE = 0.35    # keep 35% cash always — no more 50% in one trade
-    ATR_STOP_M   = 1.5
-    ATR_TGT_M    = 2.5
+    ATR_STOP_M   = 0.8    # tighter stops — was 1.5, letting losers bleed too long
+    ATR_TGT_M    = 2.0
     BATCH_SIZE   = 30   # raised from 25 — scan more symbols per cycle
     BUY_THRESH   = 3.5     # raised: overnight longs lost while shorts won — need higher long conviction
     SELL_THRESH  = -1.8    # exit sooner when signals turn bearish
@@ -4913,14 +4913,24 @@ def _ai_run_portfolio(pid: int) -> dict:
         # Portfolio regime — computed once after equity is known
         port_regime = _portfolio_regime(pid, equity)
 
-        # ── Portfolio P&L awareness: don't open new longs when bleeding ──────
+        # ── Portfolio P&L awareness + emergency unrealized loss gate ──────────
         state_initial = _sim_state(pid).get('initial_cash', 100000)
         portfolio_loss_pct = (state_initial - equity) / state_initial if state_initial > 0 else 0
-        if portfolio_loss_pct > 0.05:   # down >5% total → stop all new longs
-            BUY_THRESH = 99.0  # effectively disable new longs
+        if portfolio_loss_pct > 0.05:
+            BUY_THRESH = 99.0
             summary['skip_reason'] = summary.get('skip_reason') or 'portfolio_loss_protection'
-        elif portfolio_loss_pct > 0.03:  # down 3-5% → raise bar significantly
+        elif portfolio_loss_pct > 0.03:
             BUY_THRESH = max(BUY_THRESH, 5.0)
+
+        # Emergency: if open unrealized losses > 1.5% of equity, tighten all stops to near-current price
+        try:
+            unreal = sum(p.get('unrealized_pl', 0) or 0 for p in _sim_positions_with_prices(pid))
+            unreal_pct = abs(unreal) / equity if equity > 0 and unreal < 0 else 0
+            if unreal_pct > 0.015:  # losing more than 1.5% on open positions
+                ATR_STOP_M = 0.3   # emergency tighten — get out faster
+                BUY_THRESH = 99.0  # no new entries while bleeding
+        except Exception:
+            pass
 
         # FIX: reserve is a % of CASH, not equity
         available = cash - cash * CASH_RESERVE
