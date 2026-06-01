@@ -295,14 +295,21 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="overlay-group">
-                {['SMA20', 'SMA50', 'BB', 'VWAP', 'Proj'].map(o => (
-                  <button key={o} className={`tf-btn${overlays.has(o) ? ' active' : ''}`} onClick={() => toggleOverlay(o)}>{o}</button>
-                ))}
-                <span className="overlay-divider" />
-                {['MACD', 'RSI', 'Stoch'].map(o => (
-                  <button key={o} className={`tf-btn indicator-btn${overlays.has(o) ? ' active' : ''}`} onClick={() => toggleOverlay(o)}>{o}</button>
-                ))}
+              <div className="overlay-group" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                {/* Quick trade buttons — full order in Analysis tab */}
+                <button
+                  onClick={() => setLeftTab('analysis')}
+                  style={{ padding: '3px 12px', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 11, fontWeight: 700, letterSpacing: '0.04em', background: 'rgba(61,220,151,0.15)', color: '#3ddc97', border: '1px solid rgba(61,220,151,0.3)' }}
+                  title="Go long — open Analysis tab for full order entry or Shift+drag on chart">
+                  ▲ LONG
+                </button>
+                <button
+                  onClick={() => setLeftTab('analysis')}
+                  style={{ padding: '3px 12px', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 11, fontWeight: 700, letterSpacing: '0.04em', background: 'rgba(255,71,111,0.15)', color: '#ff476f', border: '1px solid rgba(255,71,111,0.3)' }}
+                  title="Go short — open Analysis tab for full order entry or Shift+drag on chart">
+                  ▼ SHORT
+                </button>
+                <span style={{ fontSize: 8, color: 'var(--t-4)', marginLeft: 4 }}>or Shift+drag chart</span>
               </div>
             </div>
 
