@@ -4344,17 +4344,18 @@ def _build_history_context(pid: int) -> dict:
             ctx['decay_detected']  = True
 
         # Classify regimes + store win rates for threshold adaptation
-        for regime, stats in by_regime.items():
-            if regime == '_total':
+        # Keys are now "regime | direction" e.g. "trending_down | short"
+        for regime_key, stats in by_regime.items():
+            if regime_key == '_total':
                 continue
             n  = stats.get('trades', 0)
             wr = stats.get('win_rate', 0.5)
-            ctx['regime_win_rates'][regime] = {'win_rate': wr, 'trades': n,
-                                               'avg_pl': stats.get('avg_pl', 0)}
+            ctx['regime_win_rates'][regime_key] = {'win_rate': wr, 'trades': n,
+                                                   'avg_pl': stats.get('avg_pl', 0)}
             if n >= 5 and wr < 0.35:
-                ctx['cautious_regimes'].add(regime)
+                ctx['cautious_regimes'].add(regime_key)
             elif n >= 5 and wr > 0.65:
-                ctx['strong_regimes'].add(regime)
+                ctx['strong_regimes'].add(regime_key)
 
         # Per-symbol historical performance (min 3 trades to be meaningful)
         try:
@@ -4785,6 +4786,15 @@ def _ai_run_portfolio(pid: int) -> dict:
                     _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
                                   'regime_no_short', f'no shorts in {detail["market_state"]} — sideways market')
 
+                # Data-proven: breakout and trending_up longs failing 100% — block them
+                # trending_down shorts are 81% win rate — that's the only edge right now
+                _no_long_regimes = ('breakout', 'trending_up', 'overbought_extreme', 'euphoric',
+                                    'distribution')
+                if qualifies_long and detail['market_state'] in _no_long_regimes:
+                    qualifies_long = False
+                    _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
+                                  'regime_no_long', f'longs blocked in {detail["market_state"]} — 0% win rate from data')
+
                 # Crypto macro filter: if BTC is trending down on 1h, block ALL crypto longs
                 isCrypto = lambda s: s.endswith('-USD')
                 # Micro-caps bounce off RSI oversold but don't sustain without BTC leadership
@@ -4808,11 +4818,17 @@ def _ai_run_portfolio(pid: int) -> dict:
                     except Exception:
                         pass
 
-                # Skip long entries in regimes with poor 30-day history
-                if qualifies_long and detail['market_state'] in history_ctx['cautious_regimes']:
+                # Skip entries in regime+direction combos with poor 30-day history
+                _long_key  = f"{detail['market_state']} | long"
+                _short_key = f"{detail['market_state']} | short"
+                if qualifies_long and _long_key in history_ctx['cautious_regimes']:
                     qualifies_long = False
                     _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
-                                  'cautious_regime', 'regime has <35% win rate in history')
+                                  'cautious_regime', f'{_long_key} has <35% win rate')
+                if qualifies_short and _short_key in history_ctx['cautious_regimes']:
+                    qualifies_short = False
+                    _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
+                                  'cautious_regime', f'{_short_key} has <35% win rate')
 
                 # Compute quality preview for every symbol (not just qualifying ones)
                 # Uses lightweight assumptions for liquidity (avoids slow per-symbol API calls)

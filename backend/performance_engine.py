@@ -85,7 +85,7 @@ class PerformanceEngine:
             open_action = 'BUY' if trade['side'] == 'sell' else 'SHORT'
             log_row = conn.execute(
                 """
-                SELECT score, reason, market_state, strategy, created_at
+                SELECT score, reason, market_state, strategy, action, created_at
                 FROM ai_log
                 WHERE portfolio_id = ?
                   AND symbol = ?
@@ -113,7 +113,11 @@ class PerformanceEngine:
             all_pl, all_wins, total = 0.0, 0, 0
             for pl, log_row in pairs:
                 regime = (log_row['market_state'] if log_row and log_row['market_state'] else 'unknown')
-                rows.append((pl, regime))
+                action = (log_row['action'] if log_row and log_row.get('action') else '')
+                direction = 'short' if action == 'SHORT' else 'long'
+                # Key includes direction: e.g. "trending_down | short"
+                key = f"{regime} | {direction}"
+                rows.append((pl, key))
                 all_pl += pl
                 all_wins += 1 if pl > 0 else 0
                 total += 1
