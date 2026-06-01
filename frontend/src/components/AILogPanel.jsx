@@ -788,17 +788,27 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
                         {Object.entries(review.by_regime)
                           .filter(([k]) => k !== '_total')
                           .sort((a, b) => (b[1].trades || 0) - (a[1].trades || 0))
-                          .map(([regime, stats]) => {
-                            const isCautious = review.adjustments?.cautious_regimes?.includes(regime)
-                            const isStrong   = review.adjustments?.strong_regimes?.includes(regime)
+                          .map(([regimeKey, stats]) => {
+                            // regimeKey format: "trending_down | short" or legacy "trending_down"
+                            const parts = regimeKey.split(' | ')
+                            const regimeName = parts[0] || regimeKey
+                            const direction  = parts[1] || ''
+                            const isCautious = review.adjustments?.cautious_regimes?.includes(regimeKey)
+                            const isStrong   = review.adjustments?.strong_regimes?.includes(regimeKey)
                             const wr = stats.win_rate || 0
                             const wrColor = wr > 0.6 ? '#4ade80' : wr < 0.4 ? '#ff6a6a' : 'var(--t-3)'
+                            const dirColor = direction === 'short' ? '#ff6a6a' : direction === 'long' ? '#4ade80' : 'var(--t-4)'
                             return (
-                              <tr key={regime} style={{ borderBottom: '1px solid rgba(140,170,220,0.05)' }}>
+                              <tr key={regimeKey} style={{ borderBottom: '1px solid rgba(140,170,220,0.05)' }}>
                                 <td style={{ fontSize: 9, color: 'var(--t-2)', padding: '3px 4px', fontFamily: 'var(--font-mono)' }}>
                                   {isCautious && <span style={{ color: '#ff6a6a', marginRight: 3 }}>⚠</span>}
                                   {isStrong   && <span style={{ color: '#4ade80', marginRight: 3 }}>✓</span>}
-                                  {regime.replace(/_/g, ' ')}
+                                  {regimeName.replace(/_/g, ' ')}
+                                  {direction && (
+                                    <span style={{ fontSize: 8, color: dirColor, marginLeft: 5, fontWeight: 700 }}>
+                                      {direction === 'short' ? '↓' : '↑'}
+                                    </span>
+                                  )}
                                 </td>
                                 <td style={{ fontSize: 9, color: 'var(--t-3)', padding: '3px 4px', fontFamily: 'var(--font-mono)', textAlign: 'right' }}>{stats.trades || 0}</td>
                                 <td style={{ fontSize: 9, color: wrColor, padding: '3px 4px', fontFamily: 'var(--font-mono)', textAlign: 'right', fontWeight: 700 }}>{(wr * 100).toFixed(0)}%</td>
