@@ -4277,11 +4277,11 @@ ASSET_CLASS_CAPS = {
     'futures': 0.25,
 }
 # Profit floor multiplier × ATR% per asset class (replaces fixed 1.5%)
-_PROFIT_FLOOR_ATR = {'crypto': 0.4, 'equity': 1.0, 'futures': 1.2, 'forex': 0.3}
-# Target: catch moves within 10 minutes. BTC 0.1% move in 10min = $8 on $8k position.
-# crypto: 0.4×ATR = ~0.12% floor (was 1.5×ATR = 4.5% — impossible in 10min)
-# equity: 1.0×ATR = ~0.5-1% (reasonable intraday)
-# forex: 0.3×ATR = ~0.15% (tight for small pip moves)
+_PROFIT_FLOOR_ATR = {'crypto': 0.5, 'equity': 1.0, 'futures': 1.2, 'forex': 0.4}
+# Target: $8 per position per 10 minutes = 0.1% on $8k position
+# crypto 0.5×ATR: 1m ATR for BTC ~0.2% → floor = 0.1% = $8 per trade ✓
+# equity 1.0×ATR: ~0.5% intraday move
+# forex 0.4×ATR: ~0.15% on small pip moves
 SINGLE_POS_CAPS = {
     'crypto':  0.08,   # raised: 4% → 8% per crypto ($8k on $100k) — need size for real profits
     'equity':  0.07,   # raised: 5% → 7% per stock position
