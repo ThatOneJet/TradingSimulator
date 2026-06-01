@@ -51,11 +51,21 @@ function makeTimeFmt(isDaily) {
   }
 }
 
-export default function Chart({ symbol, timeframe, socket, overlays }) {
+export default function Chart({ symbol, timeframe, socket, overlays, quote, delta }) {
   const mainRef    = useRef()
   const macdRef    = useRef()
   const oscRef     = useRef()
   const tooltipEl  = useRef()
+
+  const [dragState, setDragState] = useState(null) // {startX, startY, endX, endY}
+  const [orderBox,  setOrderBox]  = useState(null) // {topY, botY, leftX, rightX, show}
+
+  // Derive mid price from live quote or fallback delta
+  const midPrice = quote
+    ? (quote.bid + quote.ask) / 2
+    : delta?.bid
+      ? (Number(delta.bid) + Number(delta.ask || delta.bid)) / 2
+      : null
 
   const mainChartRef  = useRef()
   const candleRef     = useRef()
@@ -383,9 +393,115 @@ export default function Chart({ symbol, timeframe, socket, overlays }) {
 
   return (
     <div className="chart-stack">
-      <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+      <div
+        style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
+        onMouseDown={(e) => {
+          if (!e.shiftKey) return
+          e.preventDefault()
+          const rect = e.currentTarget.getBoundingClientRect()
+          setDragState({ startX: e.clientX - rect.left, startY: e.clientY - rect.top, endX: e.clientX - rect.left, endY: e.clientY - rect.top })
+          setOrderBox(null)
+        }}
+        onMouseMove={(e) => {
+          if (!dragState) return
+          const rect = e.currentTarget.getBoundingClientRect()
+          setDragState(prev => ({ ...prev, endX: e.clientX - rect.left, endY: e.clientY - rect.top }))
+        }}
+        onMouseUp={(e) => {
+          if (!dragState) return
+          const rect = e.currentTarget.getBoundingClientRect()
+          const endX = e.clientX - rect.left
+          const endY = e.clientY - rect.top
+          setOrderBox({
+            topY:  Math.min(dragState.startY, endY),
+            botY:  Math.max(dragState.startY, endY),
+            leftX: Math.min(dragState.startX, endX),
+            rightX: Math.max(dragState.startX, endX),
+            show: true,
+          })
+          setDragState(null)
+        }}
+        onMouseLeave={() => setDragState(null)}
+      >
         <div ref={mainRef} className="chart-main" />
         <div ref={tooltipEl} className="chart-tooltip" />
+
+        {/* Drag selection overlay */}
+        {dragState && (
+          <div style={{
+            position: 'absolute',
+            left:   Math.min(dragState.startX, dragState.endX),
+            top:    Math.min(dragState.startY, dragState.endY),
+            width:  Math.abs(dragState.endX - dragState.startX),
+            height: Math.abs(dragState.endY - dragState.startY),
+            border: '1px dashed rgba(74,217,255,0.6)',
+            background: 'rgba(74,217,255,0.08)',
+            pointerEvents: 'none',
+            zIndex: 10,
+          }} />
+        )}
+
+        {/* Order box after drag */}
+        {orderBox?.show && (() => {
+          const zoneHeight = orderBox.botY - orderBox.topY
+          const targetPrice = midPrice ? midPrice * (1 + zoneHeight / 400) : null
+          const stopPrice   = midPrice ? midPrice * (1 - zoneHeight / 400) : null
+          return (
+            <div style={{
+              position: 'absolute',
+              right: 16, top: orderBox.topY,
+              background: '#0e1320', border: '1px solid rgba(74,217,255,0.3)',
+              borderRadius: 8, padding: '10px 12px', zIndex: 20, minWidth: 200,
+              boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+            }}>
+              <div style={{ fontSize: 9, color: '#4ad9ff', letterSpacing: '0.08em', marginBottom: 8 }}>
+                ZONE SELECTED
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 10 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 9, color: 'var(--t-4)' }}>Top (target)</span>
+                  <span style={{ fontSize: 10, color: 'var(--ok)', fontFamily: 'var(--font-mono)' }}>
+                    {targetPrice ? `$${targetPrice.toFixed(2)}` : '—'}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 9, color: 'var(--t-4)' }}>Bottom (stop)</span>
+                  <span style={{ fontSize: 10, color: 'var(--err)', fontFamily: 'var(--font-mono)' }}>
+                    {stopPrice ? `$${stopPrice.toFixed(2)}` : '—'}
+                  </span>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button
+                  onClick={() => setOrderBox(null)}
+                  style={{ flex: 1, background: 'rgba(61,220,151,0.15)', border: '1px solid rgba(61,220,151,0.3)', color: '#3ddc97', borderRadius: 4, padding: '5px 0', fontSize: 10, cursor: 'pointer' }}
+                >
+                  LONG
+                </button>
+                <button
+                  onClick={() => setOrderBox(null)}
+                  style={{ flex: 1, background: 'rgba(255,71,111,0.15)', border: '1px solid rgba(255,71,111,0.3)', color: '#ff476f', borderRadius: 4, padding: '5px 0', fontSize: 10, cursor: 'pointer' }}
+                >
+                  SHORT
+                </button>
+                <button
+                  onClick={() => setOrderBox(null)}
+                  style={{ background: 'none', border: '1px solid rgba(140,170,220,0.2)', color: 'var(--t-4)', borderRadius: 4, padding: '5px 8px', fontSize: 10, cursor: 'pointer' }}
+                >
+                  ✕
+                </button>
+              </div>
+              <div style={{ fontSize: 8, color: 'var(--t-4)', marginTop: 6, lineHeight: 1.4 }}>
+                Shift+drag to select zone. Prices are approximate.
+              </div>
+            </div>
+          )
+        })()}
+
+        {/* Hint label */}
+        <div style={{ position: 'absolute', bottom: 40, right: 16, fontSize: 8, color: 'rgba(140,170,220,0.3)', pointerEvents: 'none' }}>
+          Shift+drag to set trade zone
+        </div>
       </div>
 
       {showMacd && (

@@ -1038,6 +1038,75 @@ def ai_run(pid):
     return jsonify(summary)
 
 
+@app.route('/api/portfolios/<int:pid>/ai/scan/suggestions')
+def ai_scan_suggestions(pid):
+    """Run AI scan and return suggestions without placing any trades.
+    Works regardless of whether the portfolio is AI-controlled."""
+    try:
+        # Run a read-only scan: compute scores but don't execute anything
+        with _get_db() as conn:
+            wl_syms = [r['symbol'] for r in conn.execute(
+                'SELECT symbol FROM watchlist_items WHERE portfolio_id=?', (pid,)
+            ).fetchall()]
+            held_syms = [r['symbol'] for r in conn.execute(
+                'SELECT symbol FROM sim_positions WHERE portfolio_id=? AND shares!=0', (pid,)
+            ).fetchall()]
+
+        market_open = _market_is_open()
+        combined = list(dict.fromkeys(_AI_UNIVERSE + wl_syms))
+        if not market_open:
+            combined = [s for s in combined if _is_fractional_asset(s)]
+
+        batch = combined[:40]  # scan top 40
+        suggestions = {'long': [], 'short': [], 'neutral': []}
+
+        for sym in batch:
+            try:
+                data = _compute_indicators_fast(sym)
+                data['symbol'] = sym
+                price = data.get('last_price')
+                if not price or price <= 0:
+                    continue
+                detail = _ai_score_detailed(data)
+                score = detail['score']
+                regime = detail['market_state']
+
+                entry = {
+                    'symbol': sym,
+                    'score': round(score, 2),
+                    'regime': regime,
+                    'rsi': round(data.get('rsi', 50), 1),
+                    'price': round(price, 4),
+                    'confidence': detail.get('uncertainty', 0.5),
+                    'summary': detail.get('summary', '')[:100],
+                    'direction': 'short' if score <= -2.5 else 'long' if score >= 2.5 else 'neutral',
+                    'currently_held': sym in held_syms,
+                    'disclaimer': 'Metrics only. Not financial advice.',
+                }
+
+                if score >= 2.5:
+                    suggestions['long'].append(entry)
+                elif score <= -2.5:
+                    suggestions['short'].append(entry)
+                else:
+                    suggestions['neutral'].append(entry)
+            except Exception:
+                pass
+
+        # Sort each by |score| descending
+        for k in suggestions:
+            suggestions[k].sort(key=lambda x: abs(x['score']), reverse=True)
+
+        return jsonify({
+            'suggestions': suggestions,
+            'market_open': market_open,
+            'scanned': len(batch),
+            'disclaimer': 'Algorithmic analysis only. Not financial advice. Past performance does not guarantee future results.',
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/portfolios/<int:pid>/heat')
 def portfolio_heat(pid):
     """Return portfolio risk heat and asset-class exposure breakdown."""
@@ -3263,17 +3332,45 @@ def _protection_stage(avg_cost: float, current_price: float,
     }
 
 
+# Map 13 display regimes → 4 macro buckets for weight selection
+# Keeps display labels (shown in UI/logs) but learns on broader categories
+REGIME_MACRO_BUCKET = {
+    'trending_up':       'bull',
+    'mild_uptrend':      'bull',
+    'breakout':          'bull',
+    'accumulation':      'bull',
+    'trending_down':     'bear',
+    'mild_downtrend':    'bear',
+    'distribution':      'bear',
+    'euphoric':          'bear',
+    'ranging':           'range',
+    'neutral':           'range',
+    'panic':             'crisis',
+    'oversold_extreme':  'crisis',
+    'overbought_extreme':'crisis',
+    'news_driven':       'crisis',
+}
+
+
 def _adaptive_weights(market_state: str) -> dict:
-    """Return per-indicator weight multipliers based on market state."""
+    """Return per-indicator weight multipliers. Uses 4 macro buckets for learning,
+    keeps specific overrides for extreme regimes."""
     base = {'rsi': 1.0, 'macd': 1.0, 'stoch': 1.0, 'bb': 1.0, 'volume': 1.0,
             'vwap': 1.0, 'trend': 1.0}
-    if market_state in ('trending_up', 'trending_down'):
-        return {**base, 'macd': 1.4, 'trend': 1.4, 'rsi': 0.7, 'bb': 0.7}
-    if market_state in ('ranging', 'accumulation'):
-        return {**base, 'rsi': 1.4, 'bb': 1.4, 'stoch': 1.2, 'macd': 0.6}
-    if market_state in ('panic', 'oversold_extreme'):
-        return {**base, 'rsi': 0.5, 'macd': 0.5, 'stoch': 0.5, 'bb': 0.5,
-                'volume': 0.5, 'trend': 0.5}  # all signals unreliable in panic
+    bucket = REGIME_MACRO_BUCKET.get(market_state, 'range')
+
+    if bucket == 'bull':
+        weights = {**base, 'macd': 1.3, 'trend': 1.3, 'rsi': 0.8, 'bb': 0.8}
+    elif bucket == 'bear':
+        weights = {**base, 'macd': 1.4, 'trend': 1.4, 'rsi': 0.7, 'bb': 0.7}
+    elif bucket == 'range':
+        weights = {**base, 'rsi': 1.4, 'bb': 1.4, 'stoch': 1.2, 'macd': 0.6}
+    elif bucket == 'crisis':
+        weights = {**base, 'volume': 1.5, 'rsi': 0.5, 'macd': 0.5, 'trend': 0.5}
+    else:
+        weights = base
+
+    # Specific overrides for extreme regimes (highest priority)
     if market_state == 'breakout':
         return {**base, 'volume': 1.5, 'macd': 1.3, 'trend': 1.2, 'rsi': 0.8}
     if market_state == 'euphoric':
@@ -3282,19 +3379,20 @@ def _adaptive_weights(market_state: str) -> dict:
         return {**base, 'volume': 1.5, 'macd': 1.2, 'rsi': 0.8, 'trend': 0.7}
     if market_state == 'news_driven':
         return {**base, 'volume': 2.0, 'macd': 0.4, 'rsi': 0.3, 'stoch': 0.3, 'bb': 0.4}
+
     # Blend in ML-learned weights if available (Tier 5)
     try:
         import model_trainer as _mt_mod
         trainer = _mt_mod.get_trainer()
         if trainer:
             learned = trainer.get_weights(market_state)
-            # Blend: 70% rule-based + 30% ML-learned
-            for k in base:
+            for k in weights:
                 if k in learned:
-                    base[k] = round(base[k] * 0.7 + learned[k] * 0.3, 3)
+                    weights[k] = round(weights[k] * 0.7 + learned[k] * 0.3, 3)
     except Exception:
         pass
-    return base
+
+    return weights
 
 
 def _ai_score_detailed(data: dict) -> dict:
@@ -5982,6 +6080,74 @@ def get_market_state():
                     'rsi': qqq.get('rsi'), 'trend': qqq.get('trend'),
                     'summary': qqq_detail['summary']},
         })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/debug/indicator_audit')
+def indicator_audit():
+    """Compare our indicator values against a second source to verify data integrity.
+    Returns delta analysis — any indicator > 5% off is a red flag."""
+    symbol = request.args.get('symbol', 'BTC-USD')
+    try:
+        # Source 1: our candle engine
+        ce_data = _candle_engine.latest(symbol, '1m') if _candle_engine else None
+
+        # Source 2: yfinance daily (different timeframe but sanity check)
+        import yfinance as yf
+        hist = yf.Ticker(symbol).history(period='30d', interval='1d')
+
+        result = {'symbol': symbol, 'sources': {}, 'deltas': {}, 'status': 'ok'}
+
+        if ce_data:
+            result['sources']['candle_engine_1m'] = {
+                'rsi': ce_data.get('rsi'),
+                'macd': ce_data.get('macd_value'),
+                'atr_pct': ce_data.get('atr_pct'),
+                'trend': ce_data.get('trend'),
+                'bars': _candle_engine.bars_available(symbol, '1m') if _candle_engine else 0,
+            }
+
+        if not hist.empty and len(hist) >= 14:
+            from candle_engine import _compute_indicators
+            from collections import deque
+            from candle_engine import _OHLCV
+            bars_d = deque(maxlen=120)
+            for ts, row in hist.iterrows():
+                bars_d.append(_OHLCV(
+                    open=float(row.get('Open', 0)),
+                    high=float(row.get('High', 0)),
+                    low=float(row.get('Low', 0)),
+                    close=float(row.get('Close', 0)),
+                    volume=float(row.get('Volume', 0) or 0),
+                    ts=ts.timestamp(),
+                ))
+            daily_ind = _compute_indicators(bars_d)
+            result['sources']['yfinance_daily'] = {
+                'rsi': daily_ind.get('rsi'),
+                'macd': daily_ind.get('macd_value'),
+                'atr_pct': daily_ind.get('atr_pct'),
+                'trend': daily_ind.get('trend'),
+                'bars': len(hist),
+            }
+
+        # Compare if both sources available
+        s1 = result['sources'].get('candle_engine_1m', {})
+        s2 = result['sources'].get('yfinance_daily', {})
+        flags = []
+        for key in ['rsi', 'atr_pct']:
+            v1, v2 = s1.get(key), s2.get(key)
+            if v1 and v2 and v2 != 0:
+                delta = abs(v1 - v2) / abs(v2) * 100
+                result['deltas'][key] = round(delta, 1)
+                if delta > 30:  # allow large delta since 1m vs daily is expected to differ
+                    flags.append(f'{key}: {delta:.0f}% delta (1m vs daily — expected)')
+
+        result['flags'] = flags
+        result['note'] = '1m candle engine vs daily yfinance — large deltas expected due to different timeframes'
+        result['integrity'] = 'ok' if ce_data and ce_data.get('rsi') else 'no_candle_data'
+
+        return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

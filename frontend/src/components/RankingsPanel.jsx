@@ -85,9 +85,14 @@ export default function RankingsPanel({ portfolioId = 1, onSelect }) {
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <div style={{ width: 6, height: 6, borderRadius: '50%', background: '#b39dff', boxShadow: '0 0 5px #b39dff' }} />
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: 700, letterSpacing: '0.1em', color: 'var(--t-2)', textTransform: 'uppercase' }}>
-            Asset Rankings
-          </span>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: 700, letterSpacing: '0.1em', color: 'var(--t-2)', textTransform: 'uppercase' }}>
+              Asset Rankings
+            </span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 7.5, color: '#b39dff', letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+              Profitability Assessment
+            </span>
+          </div>
           {rankings.length > 0 && (
             <span style={{ fontSize: 8, color: 'var(--t-4)', fontFamily: 'var(--font-mono)' }}>
               {rankings.length} symbols
@@ -113,6 +118,22 @@ export default function RankingsPanel({ portfolioId = 1, onSelect }) {
           >
             {loading ? '…' : '↻'}
           </button>
+        </div>
+      </div>
+
+      {/* Disclaimer */}
+      <div style={{
+        padding: '5px 12px',
+        borderBottom: '1px solid rgba(140,170,220,0.06)',
+        flexShrink: 0,
+      }}>
+        <div style={{
+          fontSize: 8.5, color: '#f5b342', background: 'rgba(245,179,66,0.07)',
+          border: '1px solid rgba(245,179,66,0.2)', borderRadius: 4,
+          padding: '5px 10px', lineHeight: 1.5,
+        }}>
+          ⚠ Algorithmic signals only. These are metrics, not financial advice.
+          Past performance does not guarantee future results.
         </div>
       </div>
 
@@ -157,7 +178,7 @@ export default function RankingsPanel({ portfolioId = 1, onSelect }) {
               onMouseEnter={e => e.currentTarget.style.background = 'rgba(140,170,220,0.05)'}
               onMouseLeave={e => e.currentTarget.style.background = isTop ? 'rgba(61,220,151,0.03)' : 'transparent'}
             >
-              {/* Row 1: rank + symbol + tags | score + regime */}
+              {/* Row 1: rank + symbol + tags | direction + score + regime */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 7 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                   <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: isTop ? '#b39dff' : 'var(--t-4)', fontWeight: isTop ? 700 : 400, minWidth: 14 }}>
@@ -176,6 +197,22 @@ export default function RankingsPanel({ portfolioId = 1, onSelect }) {
                   )}
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {(() => {
+                    const direction = item.score > 1 ? 'long' : item.score < -1 ? 'short' : 'neutral'
+                    const dirColor  = direction === 'long' ? '#3ddc97' : direction === 'short' ? '#ff476f' : '#f5b342'
+                    const dirLabel  = direction === 'long' ? 'LONG ↑' : direction === 'short' ? 'SHORT ↓' : 'NEUTRAL'
+                    return (
+                      <span style={{
+                        fontSize: 8, fontWeight: 700, letterSpacing: '0.06em',
+                        color: dirColor, background: `${dirColor}18`,
+                        border: `1px solid ${dirColor}44`,
+                        borderRadius: 3, padding: '1px 5px',
+                        fontFamily: 'var(--font-mono)', lineHeight: 1.5,
+                      }}>
+                        {dirLabel}
+                      </span>
+                    )
+                  })()}
                   <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13, fontWeight: 800, color: scoreColor }}>
                     {item.score > 0 ? '+' : ''}{f(item.score, 1)}
                   </span>

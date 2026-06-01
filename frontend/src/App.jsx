@@ -46,7 +46,7 @@ export default function App() {
   const [railOpen,    setRailOpen]    = useState(false)
   const [widgetsOpen, setWidgetsOpen] = useState(true)
   const [railTab,     setRailTab]     = useState('chart')
-  const [leftTab,     setLeftTab]     = useState('watch') // 'watch'|'analysis'|'risk'|'rankings'
+  const [leftTab,     setLeftTab]     = useState('watch') // 'watch'|'analysis'|'risk'|'rankings'|'aiscan'
   const [rightTab,    setRightTab]    = useState('trade') // 'trade'|'options'|'log'
 
   // ── Projection data (fetched on symbol change, shared across panels) ──────
@@ -159,6 +159,7 @@ export default function App() {
             { key: 'analysis', label: 'Analysis' },
             { key: 'rankings', label: 'Rank'     },
             { key: 'risk',     label: 'Risk'     },
+            { key: 'aiscan',   label: 'AI Scan'  },
           ].map(t => (
             <button
               key={t.key}
@@ -191,9 +192,6 @@ export default function App() {
                 onPrioritySymbol={setSymbol}
               />
               <div style={{ borderTop: '1px solid rgba(140,170,220,0.08)' }}>
-                <Positions positions={positions} onRefresh={refresh} portfolioId={portfolioId} totalValue={account?.portfolio_value} />
-              </div>
-              <div style={{ borderTop: '1px solid rgba(140,170,220,0.08)' }}>
                 <SetupGuideWidget symbol={symbol} quote={quote} delta={delta} />
               </div>
             </>
@@ -206,6 +204,9 @@ export default function App() {
           )}
           {leftTab === 'risk' && (
             <RiskPanel symbol={symbol} portfolioId={portfolioId} price={midPrice} />
+          )}
+          {leftTab === 'aiscan' && (
+            <AILogPanel portfolioId={portfolioId} isAiControlled={true} />
           )}
         </div>
 
@@ -333,7 +334,7 @@ export default function App() {
             )}
 
             <div className="ch-body">
-              <Chart symbol={symbol} timeframe={timeframe} socket={socket} overlays={overlays} />
+              <Chart symbol={symbol} timeframe={timeframe} socket={socket} overlays={overlays} quote={quote} delta={delta} />
 
               {/* Right panel — Trade | Options | Log tabs */}
               <div style={{ display: 'flex', flexDirection: 'column', width: '240px', flexShrink: 0, borderLeft: '1px solid rgba(140,170,220,0.08)', overflow: 'hidden' }}>
