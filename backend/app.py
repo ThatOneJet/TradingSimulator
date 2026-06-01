@@ -4995,10 +4995,9 @@ def _ai_run_portfolio(pid: int) -> dict:
                     _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
                                   'regime_no_short', f'no shorts in {detail["market_state"]} — sideways market')
 
-                # Data-proven: breakout and trending_up longs failing 100% — block them
-                # trending_down shorts are 81% win rate — that's the only edge right now
+                # Never long into a downtrend, never short into an uptrend
                 _no_long_regimes = ('breakout', 'trending_up', 'overbought_extreme', 'euphoric',
-                                    'distribution')
+                                    'distribution', 'trending_down', 'mild_downtrend')
                 if qualifies_long and detail['market_state'] in _no_long_regimes:
                     qualifies_long = False
                     _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
