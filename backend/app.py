@@ -2053,6 +2053,35 @@ def _get_market_quotes(instruments: list) -> list:
                            'change_pct': 0.0, 'high': 0.0, 'low': 0.0})
     return result
 
+_CRYPTO_LIST = [
+    {'symbol': 'BTC-USD',  'display': 'BTC/USD',  'name': 'Bitcoin'},
+    {'symbol': 'ETH-USD',  'display': 'ETH/USD',  'name': 'Ethereum'},
+    {'symbol': 'SOL-USD',  'display': 'SOL/USD',  'name': 'Solana'},
+    {'symbol': 'BNB-USD',  'display': 'BNB/USD',  'name': 'BNB'},
+    {'symbol': 'XRP-USD',  'display': 'XRP/USD',  'name': 'XRP'},
+    {'symbol': 'ADA-USD',  'display': 'ADA/USD',  'name': 'Cardano'},
+    {'symbol': 'AVAX-USD', 'display': 'AVAX/USD', 'name': 'Avalanche'},
+    {'symbol': 'DOGE-USD', 'display': 'DOGE/USD', 'name': 'Dogecoin'},
+    {'symbol': 'LINK-USD', 'display': 'LINK/USD', 'name': 'Chainlink'},
+    {'symbol': 'ATOM-USD', 'display': 'ATOM/USD', 'name': 'Cosmos'},
+    {'symbol': 'AAVE-USD', 'display': 'AAVE/USD', 'name': 'Aave'},
+    {'symbol': 'LTC-USD',  'display': 'LTC/USD',  'name': 'Litecoin'},
+    {'symbol': 'BCH-USD',  'display': 'BCH/USD',  'name': 'Bitcoin Cash'},
+    {'symbol': 'XLM-USD',  'display': 'XLM/USD',  'name': 'Stellar'},
+    {'symbol': 'TRX-USD',  'display': 'TRX/USD',  'name': 'TRON'},
+]
+
+@app.route('/api/markets/crypto')
+def get_crypto():
+    now = _time.time()
+    if 'crypto' in _markets_cache:
+        data, ts = _markets_cache['crypto']
+        if now - ts < _MARKETS_TTL:
+            return jsonify(data)
+    data = _get_market_quotes(_CRYPTO_LIST)
+    _markets_cache['crypto'] = (data, now)
+    return jsonify(data)
+
 @app.route('/api/markets/futures')
 def get_futures():
     now = _time.time()

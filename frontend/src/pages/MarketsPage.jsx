@@ -283,13 +283,14 @@ function OptionsChain({ defaultSymbol }) {
 // ── Main MarketsPage ──────────────────────────────────────────────────────────
 
 const SECTIONS = [
+  { key: 'crypto',  label: 'Crypto'  },
   { key: 'futures', label: 'Futures' },
   { key: 'forex',   label: 'Forex'   },
   { key: 'options', label: 'Options' },
 ]
 
 export default function MarketsPage({ onSelectSymbol, symbol }) {
-  const [active, setActive] = useState('futures')
+  const [active, setActive] = useState('crypto')
 
   function handleChart(sym) {
     onSelectSymbol?.(sym)
@@ -319,6 +320,14 @@ export default function MarketsPage({ onSelectSymbol, symbol }) {
       </div>
 
       {/* ── Content ── */}
+      {active === 'crypto' && (
+        <TileGrid
+          endpoint="/markets/crypto"
+          onChart={handleChart}
+          label="Crypto — 24/7 · click any tile to open chart"
+        />
+      )}
+
       {active === 'futures' && (
         <TileGrid
           endpoint="/markets/futures"
