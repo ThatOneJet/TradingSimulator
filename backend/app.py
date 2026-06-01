@@ -4277,15 +4277,16 @@ ASSET_CLASS_CAPS = {
     'futures': 0.25,
 }
 # Profit floor multiplier × ATR% per asset class (replaces fixed 1.5%)
-_PROFIT_FLOOR_ATR = {'crypto': 1.5, 'equity': 1.8, 'futures': 2.0, 'forex': 1.0}
-# Raised — avg win was +$3 on $3-5k positions (0.06%) which is noise.
-# New targets require ~0.3-0.5% move before taking profit.
-# Max single position size per asset class (as % of equity)
+_PROFIT_FLOOR_ATR = {'crypto': 0.4, 'equity': 1.0, 'futures': 1.2, 'forex': 0.3}
+# Target: catch moves within 10 minutes. BTC 0.1% move in 10min = $8 on $8k position.
+# crypto: 0.4×ATR = ~0.12% floor (was 1.5×ATR = 4.5% — impossible in 10min)
+# equity: 1.0×ATR = ~0.5-1% (reasonable intraday)
+# forex: 0.3×ATR = ~0.15% (tight for small pip moves)
 SINGLE_POS_CAPS = {
-    'crypto':  0.04,   # max 4% per crypto position ($4k on $100k)
-    'equity':  0.05,   # max 5% per stock position ($5k on $100k)
-    'forex':   0.04,   # max 4% per forex position
-    'futures': 0.03,   # max 3% — futures excluded from sim anyway
+    'crypto':  0.08,   # raised: 4% → 8% per crypto ($8k on $100k) — need size for real profits
+    'equity':  0.07,   # raised: 5% → 7% per stock position
+    'forex':   0.05,   # raised: 4% → 5% per forex position
+    'futures': 0.03,   # futures excluded from sim anyway
 }
 MAX_PORTFOLIO_HEAT = 0.05   # max 5% of equity at risk simultaneously
 MAX_CLUSTER_EXPOSURE = 0.07 # max 7% of equity in any correlated cluster
@@ -5170,8 +5171,8 @@ def _ai_run_portfolio(pid: int) -> dict:
 
             # ── 1. Risk-per-trade sizing ──────────────────────────────────────
             # Risk 1.5%–2.5% of equity per trade — was 0.5–1.0%, was leaving $90k idle
-            RISK_PER_TRADE     = 0.005   # back to 0.5% — was causing 50% single position
-            MAX_RISK_PER_TRADE = 0.008   # max 0.8% per trade
+            RISK_PER_TRADE     = 0.010   # 1.0% risk per trade — need real size for real profits
+            MAX_RISK_PER_TRADE = 0.015   # 1.5% on high-conviction signals
             score_factor = min(1.0, max(0.0, (abs(c['score']) - BUY_THRESH) / max(5.0 - BUY_THRESH, 1)))
             rule_risk_pct = RISK_PER_TRADE + score_factor * (MAX_RISK_PER_TRADE - RISK_PER_TRADE)
             # Blend 70% rule-based + 30% RL-recommended risk
