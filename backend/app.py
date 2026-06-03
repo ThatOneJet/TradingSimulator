@@ -1543,25 +1543,18 @@ def _execute_arb(pid: int, opp: dict) -> int:
     return arb_id
 
 
+# Shared cache populated ONLY by the background arb worker. The endpoint never
+# performs network I/O — it serves this snapshot instantly so external exchange
+# latency can never starve the WSGI server or stall the dashboard.
+_arb_scan_cache = {
+    'opportunities': [], 'scanned_at': 0,
+    'sources': ['coinbase', 'kraken'], 'count': 0, 'executable': 0,
+}
+
 @app.route('/api/arbitrage/opportunities')
 def arbitrage_opportunities():
-    """Live arbitrage opportunities detected from real exchange feeds (Coinbase, Kraken)."""
-    try:
-        import arbitrage_engine as _arb
-        eng = _arb.get_engine()
-        if eng is None:
-            eng = _arb.init_engine()
-        notional = request.args.get('notional', type=float)
-        opps = eng.scan(notional)
-        return jsonify({
-            'opportunities': opps,
-            'scanned_at': time.time(),
-            'sources': ['coinbase', 'kraken'],
-            'count': len(opps),
-            'executable': sum(1 for o in opps if o.get('executable')),
-        })
-    except Exception as e:
-        return jsonify({'error': str(e), 'opportunities': []}), 500
+    """Latest arbitrage opportunities (served from the background worker cache)."""
+    return jsonify(_arb_scan_cache)
 
 
 @app.route('/api/portfolios/<int:pid>/arbitrage/trades')
@@ -5679,11 +5672,31 @@ threading.Thread(target=_ai_worker, daemon=True, name='ai-trader').start()
 
 # ── Arbitrage worker ──────────────────────────────────────────────────────────
 
-_ARB_INTERVAL = 20   # seconds between arbitrage scans
+_ARB_INTERVAL = 25   # seconds between arbitrage scans
+
+
+def _rescale_arb(opp: dict, notional: float) -> dict:
+    """Linearly rescale a cached opportunity (priced at the engine default notional)
+    to a portfolio's actual notional. Profit and every running balance scale by the
+    ratio; prices and fee percentages are unchanged."""
+    import copy
+    base = opp.get('start_value') or 1
+    factor = notional / base if base else 1.0
+    o = copy.deepcopy(opp)
+    o['start_value'] = round(notional, 2)
+    o['end_value']   = round(opp['end_value'] * factor, 2)
+    o['profit']      = round(opp['profit'] * factor, 2)
+    for leg in o.get('path', []):
+        leg['value_before'] = round(leg['value_before'] * factor, 2)
+        leg['value_after']  = round(leg['value_after'] * factor, 2)
+    return o
+
 
 def _arb_worker():
-    """Daemon thread: scan real exchange feeds and auto-execute profitable arbitrage
-    for portfolios that have it enabled. Pure paper sandbox — profit credited to cash."""
+    """Daemon thread: ONE scan of real exchange feeds per cycle into a shared cache,
+    then auto-execute profitable opportunities for each enabled portfolio (rescaled to
+    its cash). The HTTP endpoints only ever read the cache, never the network — so
+    exchange latency can never stall the dashboard. Pure paper sandbox."""
     _time.sleep(12)   # let startup + feeds settle
     try:
         import arbitrage_engine as _arb
@@ -5693,26 +5706,38 @@ def _arb_worker():
     except Exception as e:
         print(f'[TradeSimulator] ArbitrageEngine init failed: {e}')
         return
+    eng = _arb.get_engine()
     while True:
         try:
-            with _get_db() as conn:
-                rows = conn.execute(
-                    'SELECT id FROM portfolios WHERE arb_enabled=1'
-                ).fetchall()
-            if rows:
-                eng = _arb.get_engine()
+            # ── One scan per cycle (reference notional), update shared cache ──
+            opps = eng.scan(eng.default_notional)
+            _arb_scan_cache.update({
+                'opportunities': opps,
+                'scanned_at': time.time(),
+                'sources': ['coinbase', 'kraken'],
+                'count': len(opps),
+                'executable': sum(1 for o in opps if o.get('executable')),
+            })
+            executable = [o for o in opps if o.get('executable')]
+
+            # ── Execute for enabled portfolios, sized to each portfolio's cash ──
+            if executable:
+                with _get_db() as conn:
+                    rows = conn.execute(
+                        'SELECT id FROM portfolios WHERE arb_enabled=1'
+                    ).fetchall()
                 for row in rows:
                     pid = row['id']
                     try:
-                        # Size each opportunity to available cash (cap at engine default)
                         state = _sim_state(pid)
                         cash  = state.get('cash', 0) or 0
                         notional = min(eng.default_notional, max(0, cash * 0.5))
                         if notional < 100:
                             continue
-                        opps = eng.scan(notional)
-                        executed = [o for o in opps if o.get('executable')]
-                        for opp in executed[:3]:   # cap executions per cycle
+                        for base_opp in executable[:3]:   # cap executions per cycle
+                            opp = _rescale_arb(base_opp, notional)
+                            if opp['profit'] <= 0:
+                                continue
                             arb_id = _execute_arb(pid, opp)
                             print(f'[ARB] pid={pid} {opp["type"]} {opp.get("asset","")} '
                                   f'profit=${opp["profit"]:.2f} ({opp["profit_pct"]:.3f}%) id={arb_id}')

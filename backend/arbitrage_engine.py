@@ -86,7 +86,7 @@ class ArbitrageEngine:
 
     # ── Feed access ────────────────────────────────────────────────────────────
 
-    def _http_json(self, url: str, timeout: float = 6.0):
+    def _http_json(self, url: str, timeout: float = 4.0):
         req = urllib.request.Request(url, headers={'User-Agent': 'TradeSimulator/1.0'})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
