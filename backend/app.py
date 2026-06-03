@@ -5067,8 +5067,9 @@ def _ai_run_portfolio(pid: int) -> dict:
                 qualifies_long  = score >= BUY_THRESH
                 qualifies_short = score <= SHORT_THRESH
                 # Block shorts when price is going UP or direction is unknown
-                # accumulation removed: longs in accumulation had 3% win rate (74 trades) — allow shorts instead
-                _no_short_regimes = ('ranging', 'neutral', 'mild_uptrend',
+                # accumulation: longs had 3% win rate → blocked. No shorts data either → also blocked.
+                # Skip accumulation in both directions until data proves one side works.
+                _no_short_regimes = ('ranging', 'neutral', 'mild_uptrend', 'accumulation',
                                      'oversold_extreme', 'trending_up', 'breakout', 'news_driven')
                 if qualifies_short and detail['market_state'] in _no_short_regimes:
                     qualifies_short = False
@@ -5084,10 +5085,9 @@ def _ai_run_portfolio(pid: int) -> dict:
                     _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
                                   'regime_no_long', f'longs blocked in {detail["market_state"]}')
 
-                # Crypto macro filter: if BTC is trending down on 1h, block ALL crypto longs
+                # Crypto macro filter: BTC 1h trend gates all altcoin direction
                 isCrypto = lambda s: s.endswith('-USD')
-                # Micro-caps bounce off RSI oversold but don't sustain without BTC leadership
-                if qualifies_long and isCrypto(sym):
+                if isCrypto(sym) and (qualifies_long or qualifies_short):
                     try:
                         _btc_data = _candle_engine.latest('BTC-USD', '1h') if _candle_engine else None
                         if not _btc_data:
@@ -5100,10 +5100,16 @@ def _ai_run_portfolio(pid: int) -> dict:
                                 _btc_trend = 'neutral'
                         else:
                             _btc_trend = _btc_data.get('trend', 'sideways')
-                        if _btc_trend == 'down':
+                        # Don't long into a falling BTC market
+                        if _btc_trend == 'down' and qualifies_long:
                             qualifies_long = False
                             _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
-                                          'btc_macro', f'BTC 1h trending down — no crypto longs')
+                                          'btc_macro', 'BTC 1h trending down — no crypto longs')
+                        # Don't short into a rising BTC market — BTC carries all alts up
+                        if _btc_trend == 'up' and qualifies_short:
+                            qualifies_short = False
+                            _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
+                                          'btc_macro', 'BTC 1h trending up — no crypto shorts')
                     except Exception:
                         pass
 
