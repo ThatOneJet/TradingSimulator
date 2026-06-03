@@ -112,7 +112,7 @@ class PerformanceEngine:
             rows = []
             all_pl, all_wins, total = 0.0, 0, 0
             for pl, log_row in pairs:
-                regime = (log_row['market_state'] if log_row and log_row['market_state'] else 'unknown')
+                regime = (log_row['market_state'] if log_row and log_row['market_state'] else 'neutral')
                 action = (log_row['action'] if log_row and log_row['action'] else '') if log_row else ''
                 direction = 'short' if action == 'SHORT' else 'long'
                 # Key includes direction: e.g. "trending_down | short"
@@ -316,7 +316,7 @@ class PerformanceEngine:
 
             groups = defaultdict(list)
             for row in rows:
-                regime = row['market_state'] or 'unknown'
+                regime = row['market_state'] or 'neutral'
                 reason = (row['reason'] or '').lower()
                 # Extract dominant signal from reason text
                 signal = 'neutral'

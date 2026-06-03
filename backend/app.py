@@ -1183,6 +1183,20 @@ def portfolio_breakers(pid):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/portfolios/<int:pid>/circuit-breaker/reset', methods=['POST'])
+def reset_circuit_breaker(pid):
+    """Reset the consecutive-loss pause for a portfolio so the AI can resume immediately."""
+    try:
+        import circuit_breakers as _cb_mod
+        cb = _cb_mod.get()
+        if cb is None:
+            return jsonify({'status': 'not_initialized'})
+        cb.reset_pause(pid)
+        return jsonify({'status': 'reset', 'portfolio_id': pid})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/breadth')
 def market_breadth():
     """Current market breadth snapshot."""
