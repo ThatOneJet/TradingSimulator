@@ -1463,21 +1463,29 @@ def portfolio_history_review(pid):
     try:
         from performance_engine import PerformanceEngine
         pe  = PerformanceEngine(DB_PATH)
-        ctx = _build_history_context(pid)
-        return jsonify({
+        # Core stats first — these must always render the 30D Review even if the
+        # adaptive-context builder hiccups.
+        payload = {
             'by_regime':    pe.by_regime(pid, 30),
             'decay':        pe.decay_check(pid, 7, 30),
             'attribution':  pe.signal_attribution(pid, 30),
             'equity_curve': pe.equity_curve(pid, 30),
-            'adjustments':  {
-                'buy_thresh_raised': ctx['buy_thresh_adj'] > 0,
+            'adjustments':  {},
+            'summary':      '',
+        }
+        try:
+            ctx = _build_history_context(pid)
+            payload['adjustments'] = {
+                'buy_thresh_raised':  ctx['buy_thresh_adj'] > 0,
                 'sell_thresh_raised': ctx['sell_thresh_adj'] > 0,
-                'cautious_regimes': list(ctx['cautious_regimes']),
-                'strong_regimes':   list(ctx['strong_regimes']),
-                'decay_detected':   ctx['decay_detected'],
-            },
-            'summary': ctx['summary'],
-        })
+                'cautious_regimes':   list(ctx['cautious_regimes']),
+                'strong_regimes':     list(ctx['strong_regimes']),
+                'decay_detected':     ctx['decay_detected'],
+            }
+            payload['summary'] = ctx['summary']
+        except Exception as ctx_err:
+            log.debug('[REVIEW] history context failed for pid=%s: %s', pid, ctx_err)
+        return jsonify(payload)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -2137,6 +2145,9 @@ def get_quote(symbol):
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
+_orderbook_cache = {}   # sym -> (payload_dict, ts) — short TTL to avoid blocking the
+                        # eventlet hub with a synchronous Coinbase call on every poll
+
 @app.route('/api/orderbook/<symbol>')
 def order_book(symbol):
     """Level 2 order book depth.
@@ -2144,6 +2155,12 @@ def order_book(symbol):
     Others: Alpaca latest quote — best bid/ask only (IEX free tier limitation).
     """
     sym = symbol.upper()
+    # Serve a recent cached snapshot if fresh (≤4s) — the panel polls every 3s and
+    # the eventlet WSGI server is single-threaded, so an uncached blocking fetch on
+    # every poll would freeze all other requests.
+    _cached = _orderbook_cache.get(sym)
+    if _cached and _time.time() - _cached[1] < 4.0:
+        return jsonify(_cached[0])
     try:
         if sym.endswith('-USD'):
             # Coinbase Level 2 order book — free, no auth required
@@ -2151,7 +2168,7 @@ def order_book(symbol):
             cb_sym = sym  # BTC-USD format matches Coinbase
             url = f'https://api.exchange.coinbase.com/products/{cb_sym}/book?level=2'
             req = _ur.Request(url, headers={'User-Agent': 'TradeSimulator/1.0'})
-            with _ur.urlopen(req, timeout=6) as r:
+            with _ur.urlopen(req, timeout=3) as r:
                 raw = __import__('json').loads(r.read())
 
             # Top 20 levels each side, format: [price, size, num_orders]
@@ -2174,7 +2191,7 @@ def order_book(symbol):
             total_bid_size = sum(b[1] for b in bids)
             total_ask_size = sum(a[1] for a in asks)
 
-            return jsonify({
+            _payload = {
                 'symbol': sym, 'source': 'coinbase', 'levels': 'full',
                 'bids': bids, 'asks': asks,
                 'best_bid': best_bid, 'best_ask': best_ask,
@@ -2183,7 +2200,9 @@ def order_book(symbol):
                 'max_size': max_size,
                 'total_bid_liquidity': round(total_bid_size, 4),
                 'total_ask_liquidity': round(total_ask_size, 4),
-            })
+            }
+            _orderbook_cache[sym] = (_payload, _time.time())
+            return jsonify(_payload)
 
         else:
             # Alpaca IEX — best bid/ask only (free tier)
@@ -2203,7 +2222,7 @@ def order_book(symbol):
             spread = ask - bid if bid and ask else 0
             mid = (bid + ask) / 2 if bid and ask else bid
 
-            return jsonify({
+            _payload = {
                 'symbol': sym, 'source': 'alpaca_iex', 'levels': 'top_only',
                 'bids': [[bid, 0, 0]] if bid else [],
                 'asks': [[ask, 0, 0]] if ask else [],
@@ -2215,7 +2234,9 @@ def order_book(symbol):
                 'total_bid_liquidity': 0,
                 'total_ask_liquidity': 0,
                 'note': 'Alpaca IEX free tier — best bid/ask only. Upgrade to SIP for full depth.',
-            })
+            }
+            _orderbook_cache[sym] = (_payload, _time.time())
+            return jsonify(_payload)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -5672,7 +5693,7 @@ threading.Thread(target=_ai_worker, daemon=True, name='ai-trader').start()
 
 # ── Arbitrage worker ──────────────────────────────────────────────────────────
 
-_ARB_INTERVAL = 25   # seconds between arbitrage scans
+_ARB_INTERVAL = 35   # seconds between arbitrage scans (only runs when arb enabled)
 
 
 def _rescale_arb(opp: dict, notional: float) -> dict:
@@ -5709,11 +5730,22 @@ def _arb_worker():
     eng = _arb.get_engine()
     while True:
         try:
+            # Only touch the exchanges when at least one portfolio has arb enabled.
+            # This keeps Coinbase/Kraken load (and any rate-limiting that would slow
+            # the inline /orderbook handler) at exactly zero whenever arb is off.
+            with _get_db() as conn:
+                rows = conn.execute(
+                    'SELECT id FROM portfolios WHERE arb_enabled=1'
+                ).fetchall()
+            if not rows:
+                _time.sleep(_ARB_INTERVAL)
+                continue
+
             # ── One scan per cycle (reference notional), update shared cache ──
             opps = eng.scan(eng.default_notional)
             _arb_scan_cache.update({
                 'opportunities': opps,
-                'scanned_at': time.time(),
+                'scanned_at': _time.time(),
                 'sources': ['coinbase', 'kraken'],
                 'count': len(opps),
                 'executable': sum(1 for o in opps if o.get('executable')),
@@ -5722,10 +5754,6 @@ def _arb_worker():
 
             # ── Execute for enabled portfolios, sized to each portfolio's cash ──
             if executable:
-                with _get_db() as conn:
-                    rows = conn.execute(
-                        'SELECT id FROM portfolios WHERE arb_enabled=1'
-                    ).fetchall()
                 for row in rows:
                     pid = row['id']
                     try:

@@ -44,19 +44,15 @@ _FEES = {
     'kraken':   0.0002,   # 0.02% — Kraken Pro top VIP maker tier
 }
 
-# Assets to watch for cross-exchange (must exist as {ASSET}-USD on both venues)
-_CROSS_ASSETS = ['BTC', 'ETH', 'SOL', 'LTC', 'ADA', 'XRP', 'DOGE', 'AVAX', 'LINK', 'DOT']
+# Assets to watch for cross-exchange (must exist as {ASSET}-USD on both venues).
+# Kept deliberately small to bound exchange request volume per scan.
+_CROSS_ASSETS = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'LTC']
 
-# Triangular loops on Coinbase: (leg1 pair, leg2 cross pair, leg3 pair)
-# Each loop starts and ends in USD. Expressed as asset symbols; the engine
-# resolves the actual Coinbase product ids and trade directions.
+# Triangular loops on Coinbase: (leg1 asset, leg2 asset). Each loop is USD→a→b→USD.
 _TRIANGLES = [
     ('BTC', 'ETH'),   # USD→BTC→ETH→USD  (uses BTC-USD, ETH-BTC, ETH-USD)
-    ('BTC', 'SOL'),   # USD→BTC→SOL→USD
-    ('BTC', 'LTC'),
+    ('BTC', 'SOL'),
     ('ETH', 'SOL'),
-    ('BTC', 'XRP'),
-    ('BTC', 'ADA'),
 ]
 
 # Kraken pair naming quirks (BTC = XBT). Maps {ASSET}-USD → kraken pair code.
