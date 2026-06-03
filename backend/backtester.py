@@ -586,9 +586,9 @@ class BacktestEngine:
                 if new_stop > position.stop_price:
                     position.stop_price = round(new_stop, 4)
 
-                # Exit on sell signal
-                if score <= -2.5:
-                    exit_price = self.fill.sell_price(close, position.shares, max(volume, 1))
+                # Exit on sell signal — fill at next bar open (no look-ahead)
+                if score <= -2.5 and i + 1 < len(dates):
+                    exit_price = self.fill.sell_price(opens[i + 1], position.shares, max(volumes[i + 1], 1))
                     realized   = (exit_price - position.entry_price) * position.shares
                     equity    += realized
                     hold_days  = _date_diff(position.entry_date, date)
@@ -614,16 +614,23 @@ class BacktestEngine:
 
             else:
                 # No position — check for buy signal
-                if score >= 2.5:
-                    # Size: risk 2% of equity per trade, stop is 1.5× ATR below entry
-                    risk_dollars = equity * 0.02
+                if score >= 2.5 and i + 1 < len(dates):
+                    # Fill at NEXT bar's open to eliminate look-ahead bias
+                    # (signal fires at bar i close; earliest real fill = bar i+1 open)
+                    entry_price = self.fill.buy_price(opens[i + 1], 1, max(volumes[i + 1], 1))
+
+                    # Sizing matches live engine: 1% risk per trade, score-based cap
+                    risk_dollars = equity * 0.01
                     stop_dist    = stop_m * atr
                     if stop_dist <= 0:
-                        stop_dist = close * 0.02
-                    entry_price = self.fill.buy_price(close, 1, max(volume, 1))
+                        stop_dist = entry_price * 0.02
                     shares_raw  = risk_dollars / stop_dist
-                    # Cap to 20% of equity per position
-                    max_shares  = (equity * 0.20) / entry_price if entry_price > 0 else 0
+                    # Score-based position cap (mirrors _score_to_pct in live engine)
+                    if score >= 7.0:   cap_pct = 0.12
+                    elif score >= 5.0: cap_pct = 0.10
+                    elif score >= 3.5: cap_pct = 0.07
+                    else:              cap_pct = 0.05
+                    max_shares  = (equity * cap_pct) / entry_price if entry_price > 0 else 0
                     shares      = round(min(shares_raw, max_shares), 4)
                     if shares <= 0 or entry_price <= 0:
                         equity_curve.append({'date': date, 'equity': round(equity, 4),

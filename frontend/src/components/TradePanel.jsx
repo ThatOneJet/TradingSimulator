@@ -1,12 +1,14 @@
 import { useState, useEffect } from 'react'
 import api from '../api.js'
+import ConfirmModal from './ConfirmModal.jsx'
 
 function PortfolioCard({ account, onReset, portfolioId }) {
-  const [resetting, setResetting] = useState(false)
-  const [msg, setMsg] = useState('')
+  const [resetting,   setResetting]   = useState(false)
+  const [msg,         setMsg]         = useState('')
+  const [resetModal,  setResetModal]  = useState(false)
 
   async function handleReset() {
-    if (!window.confirm('Reset account to $100,000 and clear all positions?')) return
+    setResetModal(false)
     setResetting(true)
     try {
       const r = await api.post('/account/reset', { portfolio_id: portfolioId || 1 })
@@ -36,11 +38,21 @@ function PortfolioCard({ account, onReset, portfolioId }) {
       <div className="tp-card-hd">
         {isReal ? 'Real Holdings' : 'Portfolio'}
         {!isReal && (
-          <button className="pf-reset-btn" onClick={handleReset} disabled={resetting}>
+          <button className="pf-reset-btn" onClick={() => setResetModal(true)} disabled={resetting}>
             {resetting ? '…' : 'Reset'}
           </button>
         )}
         {isReal && <span className="tp-badge-real">READ-ONLY</span>}
+        {resetModal && (
+          <ConfirmModal
+            message="Reset account to $100,000?"
+            detail="All positions will be cleared."
+            confirmLabel="Reset"
+            danger
+            onConfirm={handleReset}
+            onCancel={() => setResetModal(false)}
+          />
+        )}
       </div>
       <div className="tp-metrics">
         <div className="tp-metric">

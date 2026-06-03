@@ -158,6 +158,10 @@ def _init_db():
             conn.execute('ALTER TABLE sim_positions ADD COLUMN stop_price REAL')
         except Exception:
             pass
+        try:
+            conn.execute("ALTER TABLE sim_positions ADD COLUMN created_at TEXT")
+        except Exception:
+            pass
 
         # Signal history — tracks per-symbol state for "what changed?" detection
         conn.execute('''
@@ -393,7 +397,7 @@ def _apply_slippage(price, side, atr_val, volume_ratio=1.0):
     slip = base_slip * noise
     return round(price + slip, 4) if side == 'buy' else round(price - slip, 4)
 
-def _sim_buy(symbol: str, qty: float, price: float, portfolio_id: int = 1):
+def _sim_buy(symbol: str, qty: float, price: float, portfolio_id: int = 1, record: bool = True):
     cost = qty * price
     with _get_db() as conn:
         state = conn.execute('SELECT cash FROM sim_state WHERE portfolio_id = ?', (portfolio_id,)).fetchone()
@@ -420,7 +424,7 @@ def _sim_buy(symbol: str, qty: float, price: float, portfolio_id: int = 1):
             )
         else:
             conn.execute(
-                'INSERT INTO sim_positions (symbol, shares, avg_cost, realized_pl, portfolio_id) VALUES (?,?,?,0,?)',
+                "INSERT INTO sim_positions (symbol, shares, avg_cost, realized_pl, portfolio_id, created_at) VALUES (?,?,?,0,?,datetime('now'))",
                 (symbol, qty, price, portfolio_id)
             )
         # Auto-add to watchlist so positions always appear in the watchlist
@@ -429,12 +433,13 @@ def _sim_buy(symbol: str, qty: float, price: float, portfolio_id: int = 1):
             (portfolio_id, symbol)
         )
         # Record in trade history so AI buys appear alongside manual trades
-        conn.execute(
-            'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-            (symbol, 'buy', qty, price, qty, 'filled', 'market', 0, portfolio_id, price, 0)
-        )
+        if record:
+            conn.execute(
+                'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                (symbol, 'buy', qty, price, qty, 'filled', 'market', 0, portfolio_id, price, 0)
+            )
 
-def _sim_sell(symbol: str, qty: float, price: float, portfolio_id: int = 1) -> float:
+def _sim_sell(symbol: str, qty: float, price: float, portfolio_id: int = 1, record: bool = True) -> float:
     with _get_db() as conn:
         pos = conn.execute(
             'SELECT shares, avg_cost FROM sim_positions WHERE symbol = ? AND portfolio_id = ?',
@@ -458,13 +463,14 @@ def _sim_sell(symbol: str, qty: float, price: float, portfolio_id: int = 1) -> f
                 (new_shares, realized_pl, symbol, portfolio_id)
             )
         # Record in trade history
-        conn.execute(
-            'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-            (symbol, 'sell', qty, price, qty, 'filled', 'market', realized_pl, portfolio_id, price, 0)
-        )
+        if record:
+            conn.execute(
+                'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                (symbol, 'sell', qty, price, qty, 'filled', 'market', realized_pl, portfolio_id, price, 0)
+            )
         return realized_pl
 
-def _sim_short(symbol: str, qty: float, price: float, portfolio_id: int = 1):
+def _sim_short(symbol: str, qty: float, price: float, portfolio_id: int = 1, record: bool = True):
     """Open a short position — credits proceeds to cash, stores negative shares."""
     proceeds = qty * price
     with _get_db() as conn:
@@ -499,13 +505,14 @@ def _sim_short(symbol: str, qty: float, price: float, portfolio_id: int = 1):
                 (symbol, -qty, price, portfolio_id)
             )
         conn.execute('INSERT OR IGNORE INTO watchlist_items (portfolio_id, symbol) VALUES (?,?)', (portfolio_id, symbol))
-        conn.execute(
-            'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-            (symbol, 'short', qty, price, qty, 'filled', 'market', 0, portfolio_id, price, 0)
-        )
+        if record:
+            conn.execute(
+                'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                (symbol, 'short', qty, price, qty, 'filled', 'market', 0, portfolio_id, price, 0)
+            )
 
 
-def _sim_cover(symbol: str, qty: float, price: float, portfolio_id: int = 1) -> float:
+def _sim_cover(symbol: str, qty: float, price: float, portfolio_id: int = 1, record: bool = True) -> float:
     """Close (cover) a short position — debits cash to buy back shares."""
     with _get_db() as conn:
         pos = conn.execute(
@@ -532,10 +539,11 @@ def _sim_cover(symbol: str, qty: float, price: float, portfolio_id: int = 1) -> 
                 'UPDATE sim_positions SET shares = ?, realized_pl = realized_pl + ? WHERE symbol = ? AND portfolio_id = ?',
                 (remaining, realized_pl, symbol, portfolio_id)
             )
-        conn.execute(
-            'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-            (symbol, 'cover', qty, price, qty, 'filled', 'market', realized_pl, portfolio_id, price, 0)
-        )
+        if record:
+            conn.execute(
+                'INSERT INTO sim_trades (symbol, side, qty, price, filled_qty, status, order_type, realized_pl, portfolio_id, fill_price, slippage_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                (symbol, 'cover', qty, price, qty, 'filled', 'market', realized_pl, portfolio_id, price, 0)
+            )
         return realized_pl
 
 
@@ -1425,6 +1433,27 @@ def portfolio_history_review(pid):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/portfolios/<int:pid>/history/clear', methods=['DELETE'])
+def portfolio_history_clear(pid):
+    """Delete all 30D AI history for a portfolio. Restricted to srijoy@gmail.com."""
+    user_id = request.args.get('user_id', type=int)
+    with _get_db() as conn:
+        user = conn.execute('SELECT username FROM users WHERE id=?', (user_id,)).fetchone()
+    if not user or user['username'] != 'thatonejet':
+        return jsonify({'error': 'Not authorized'}), 403
+    cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
+    with _get_db() as conn:
+        conn.execute('DELETE FROM ai_log        WHERE portfolio_id=? AND created_at >= ?', (pid, cutoff))
+        conn.execute('DELETE FROM sim_trades     WHERE portfolio_id=? AND created_at >= ?', (pid, cutoff))
+        conn.execute('DELETE FROM ai_scan_runs   WHERE portfolio_id=? AND created_at >= ?', (pid, cutoff))
+        conn.execute('DELETE FROM ai_decisions   WHERE portfolio_id=? AND created_at >= ?', (pid, cutoff))
+        try:
+            conn.execute('DELETE FROM ai_rejections WHERE portfolio_id=? AND created_at >= ?', (pid, cutoff))
+        except Exception:
+            pass
+    return jsonify({'status': 'cleared', 'portfolio_id': pid})
+
+
 @app.route('/api/portfolios/<int:pid>/ev')
 def portfolio_ev(pid):
     """Expected Value per setup from 90-day trade history."""
@@ -1696,17 +1725,22 @@ def place_order():
         except Exception:
             _atr = fill_price * 0.01; _vr = 1.0
         slip_fill = _apply_slippage(fill_price, side, _atr, _vr)
+        # Clamp limit orders: never fill a buy above its limit or a sell below its limit
+        if otype == 'limit' and limit_price:
+            lp = float(limit_price)
+            if side == 'buy':   slip_fill = min(slip_fill, lp)
+            elif side == 'sell': slip_fill = max(slip_fill, lp)
         slippage_cost = round(abs(slip_fill - fill_price) * qty, 4)
         fill_price = slip_fill
 
         if side == 'buy':
-            _sim_buy(symbol, qty, fill_price, pid)
+            _sim_buy(symbol, qty, fill_price, pid, record=False)
         elif side == 'short':
-            _sim_short(symbol, qty, fill_price, pid)
+            _sim_short(symbol, qty, fill_price, pid, record=False)
         elif side == 'cover':
-            realized_pl = _sim_cover(symbol, qty, fill_price, pid)
+            realized_pl = _sim_cover(symbol, qty, fill_price, pid, record=False)
         else:
-            realized_pl = _sim_sell(symbol, qty, fill_price, pid)
+            realized_pl = _sim_sell(symbol, qty, fill_price, pid, record=False)
 
         with _get_db() as conn:
             cur = conn.execute(
@@ -3759,10 +3793,12 @@ def _ai_score_detailed(data: dict) -> dict:
     score = round(score, 2)
 
     # ── Uncertainty score ─────────────────────────────────────────────────────
+    def _sig_contrib(v):
+        return v.get('contribution', v.get('contrib', 0))
     bull_count = sum(1 for k, v in breakdown.items()
-                     if isinstance(v, dict) and v.get('contribution', 0) > 0)
+                     if isinstance(v, dict) and _sig_contrib(v) > 0)
     bear_count = sum(1 for k, v in breakdown.items()
-                     if isinstance(v, dict) and v.get('contribution', 0) < 0)
+                     if isinstance(v, dict) and _sig_contrib(v) < 0)
     conflicts = min(bull_count, bear_count)
     uncertainty = 0.25
     uncertainty += conflicts * 0.08          # conflicting signals add uncertainty
@@ -4756,7 +4792,7 @@ def _ai_run_portfolio(pid: int) -> dict:
         # Exits run regardless of market hours (stops/signals still evaluated)
         with _get_db() as conn:
             pos_rows = conn.execute(
-                'SELECT id, symbol, shares, avg_cost, stop_price FROM sim_positions WHERE portfolio_id=? AND shares!=0',
+                'SELECT id, symbol, shares, avg_cost, stop_price, created_at FROM sim_positions WHERE portfolio_id=? AND shares!=0',
                 (pid,)
             ).fetchall()
 
@@ -4788,9 +4824,22 @@ def _ai_run_portfolio(pid: int) -> dict:
                                          (trailing_stop, row['id']))
                     # Target: price falling tgt_m below entry
                     tgt_price    = entry_price - tgt_m * atr
-                    if tradeable and (score >= COVER_THRESH or price >= trailing_stop or price <= tgt_price):
+
+                    # Quota-based exit for shorts: $8 per position per 10 minutes
+                    _short_pl = (entry_price - price) * short_qty
+                    try:
+                        _opened = datetime.fromisoformat((row['created_at'] or '').replace('Z', ''))
+                        _mins_open = (datetime.utcnow() - _opened).total_seconds() / 60
+                    except Exception:
+                        _mins_open = 999
+                    s_quota_met   = _mins_open >= 10 and _short_pl >= 10.0
+                    s_quota_stale = _mins_open >= 20 and _short_pl < 3.0 and _short_pl > -8.0
+
+                    if tradeable and (score >= COVER_THRESH or price >= trailing_stop or price <= tgt_price or s_quota_met or s_quota_stale):
                         reason = ('cover_signal' if score >= COVER_THRESH
-                                  else 'stop_loss' if price >= trailing_stop
+                                  else 'stop_loss'    if price >= trailing_stop
+                                  else 'quota_met'    if s_quota_met
+                                  else 'quota_stale'  if s_quota_stale
                                   else 'take_profit')
                         fill = _apply_slippage(price, 'buy', atr, data.get('volume_ratio', 1.0))
                         _sim_cover(sym, short_qty, fill, pid)
@@ -4830,9 +4879,22 @@ def _ai_run_portfolio(pid: int) -> dict:
                     _atr_pct_v  = float(data.get('atr_pct', 2.0) or 2.0)
                     profit_floor = _pf_mult * _atr_pct_v / 100   # dynamic: e.g., crypto 0.8×3% = 2.4%
                     hit_profit_floor = profit_pct >= profit_floor
-                    if tradeable and (score <= SELL_THRESH or price <= trailing or price >= tgt or hit_profit_floor):
+
+                    # Quota-based exit: $8 per position per 10 minutes
+                    _unrealized_pl = (price - row['avg_cost']) * row['shares']
+                    try:
+                        _opened = datetime.fromisoformat((row['created_at'] or '').replace('Z', ''))
+                        _mins_open = (datetime.utcnow() - _opened).total_seconds() / 60
+                    except Exception:
+                        _mins_open = 999  # existing positions with no timestamp treated as stale
+                    quota_met   = _mins_open >= 10 and _unrealized_pl >= 10.0
+                    quota_stale = _mins_open >= 20 and _unrealized_pl < 3.0 and _unrealized_pl > -8.0
+
+                    if tradeable and (score <= SELL_THRESH or price <= trailing or price >= tgt or hit_profit_floor or quota_met or quota_stale):
                         reason = ('sell_signal'   if score <= SELL_THRESH
                                   else 'stop_loss'    if price <= trailing
+                                  else 'quota_met'    if quota_met
+                                  else 'quota_stale'  if quota_stale
                                   else 'profit_floor' if hit_profit_floor
                                   else 'take_profit')
                         fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0))
@@ -4877,6 +4939,10 @@ def _ai_run_portfolio(pid: int) -> dict:
                             trim_frac = _be.get_engine().trim_fraction(b_result['score'])
                             if trim_frac > 0:
                                 trim_shares = round(row['shares'] * trim_frac, 4)
+                                remaining_shares = row['shares'] - trim_shares
+                                # If remainder would be dust (< $10 value), close the full position
+                                if remaining_shares * price < 10.0:
+                                    trim_shares = row['shares']
                                 if trim_shares >= 0.001:
                                     fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0))
                                     _sim_sell(sym, trim_shares, fill, pid)
@@ -4999,20 +5065,22 @@ def _ai_run_portfolio(pid: int) -> dict:
                 qualifies_long  = score >= BUY_THRESH
                 qualifies_short = score <= SHORT_THRESH
                 # Block shorts when price is going UP or direction is unknown
-                _no_short_regimes = ('ranging', 'neutral', 'mild_uptrend', 'accumulation',
+                # accumulation removed: longs in accumulation had 3% win rate (74 trades) — allow shorts instead
+                _no_short_regimes = ('ranging', 'neutral', 'mild_uptrend',
                                      'oversold_extreme', 'trending_up', 'breakout', 'news_driven')
                 if qualifies_short and detail['market_state'] in _no_short_regimes:
                     qualifies_short = False
                     _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
                                   'regime_no_short', f'no shorts in {detail["market_state"]} — sideways market')
 
-                # Never long into a downtrend, and avoid news-driven (direction unknown)
+                # accumulation added: longs in accumulation had 3% win rate (74 trades) — blocked
                 _no_long_regimes = ('breakout', 'trending_up', 'overbought_extreme', 'euphoric',
-                                    'distribution', 'trending_down', 'mild_downtrend', 'news_driven')
+                                    'distribution', 'trending_down', 'mild_downtrend', 'news_driven',
+                                    'accumulation')
                 if qualifies_long and detail['market_state'] in _no_long_regimes:
                     qualifies_long = False
                     _log_decision(pid, sym, 'REJECT', score, detail['market_state'],
-                                  'regime_no_long', f'longs blocked in {detail["market_state"]} — 0% win rate from data')
+                                  'regime_no_long', f'longs blocked in {detail["market_state"]}')
 
                 # Crypto macro filter: if BTC is trending down on 1h, block ALL crypto longs
                 isCrypto = lambda s: s.endswith('-USD')
@@ -5144,7 +5212,17 @@ def _ai_run_portfolio(pid: int) -> dict:
             rl_risk_pct   = 0.005
             try:
                 import rl_engine as _rl_mod
-                if _rl_mod.get_engine():
+                _closed_count = 0
+                try:
+                    with _get_db() as _rc:
+                        _closed_count = (_rc.execute(
+                            "SELECT COUNT(*) FROM sim_trades WHERE portfolio_id=? AND side IN ('sell','cover')",
+                            (pid,)
+                        ).fetchone() or [0])[0]
+                except Exception:
+                    pass
+                # RL needs 500+ real closed trades before its Q-table has meaningful data
+                if _rl_mod.get_engine() and _closed_count >= 500:
                     mtf_b  = c.get('detail', {}).get('mtf_bias', {}).get('bias', 'neutral')
                     swing_b = 'undefined'
                     try:
@@ -5160,7 +5238,6 @@ def _ai_run_portfolio(pid: int) -> dict:
                     )
                     rl_state_key  = rl_action.get('state_key', '')
                     rl_action_key = f"{rl_action.get('strategy','momentum')}|{rl_action.get('size_tier','medium')}|{rl_action.get('timing','immediate')}"
-                    # RL size override: blend RL risk_pct with base sizing
                     rl_risk_pct = rl_action.get('risk_pct', 0.005)
             except Exception:
                 rl_risk_pct = 0.005

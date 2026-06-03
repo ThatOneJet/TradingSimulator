@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import api from '../api.js'
+import ConfirmModal from './ConfirmModal.jsx'
 
 const PRESET_COLORS = ['#ff6a1a', '#3ddc97', '#4ad9ff', '#f5b342', '#ff476f', '#b06aff']
 
@@ -342,6 +343,9 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
   const [ctxMenu, setCtxMenu]       = useState(null)
   const [renaming, setRenaming]     = useState(null)   // {id, name}
   const [renameVal, setRenameVal]   = useState('')
+  const [confirmDel,   setConfirmDel]   = useState(null)  // portfolio to delete
+  const [confirmReset, setConfirmReset] = useState(null)  // portfolio to reset
+  const [errorMsg,     setErrorMsg]     = useState('')
 
   const loadAll = useCallback(async () => {
     if (!userId) return
@@ -399,18 +403,16 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
   }
 
   async function handleDelete(id) {
-    const port = portfolios.find(p => p.id === id)
-    if (!window.confirm(`Delete portfolio "${port?.name}"? This cannot be undone.`)) return
     try {
       await api.delete(`/portfolios/${id}`)
       const remaining = portfolios.filter(p => p.id !== id)
       await loadAll()
-      if (portfolioId === id && remaining.length > 0) {
-        onSwitch(remaining[0].id)
-      }
+      if (portfolioId === id && remaining.length > 0) onSwitch(remaining[0].id)
     } catch (err) {
       console.error('PortfolioTabs: delete failed', err)
-      alert(err?.response?.data?.error || 'Failed to delete portfolio.')
+      setErrorMsg(err?.response?.data?.error || 'Failed to delete portfolio.')
+    } finally {
+      setConfirmDel(null)
     }
   }
 
@@ -429,13 +431,14 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
   }
 
   const handleResetBalance = async (portfolio) => {
-    if (!window.confirm(`Reset "${portfolio.name}" balance to $100,000? All positions and trade history will be cleared.`)) return
     try {
       await api.post(`/portfolios/${portfolio.id}/reset`)
       await loadAll()
       setCtxMenu(null)
     } catch (err) {
       console.error('Reset failed', err)
+    } finally {
+      setConfirmReset(null)
     }
   }
 
@@ -630,7 +633,7 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
           </div>
           {/* Reset Balance */}
           <div
-            onClick={() => handleResetBalance(ctxMenu.portfolio)}
+            onClick={() => { setConfirmReset(ctxMenu.portfolio); setCtxMenu(null) }}
             style={{ padding: '8px 14px', cursor: 'pointer', color: '#aab4c5' }}
             onMouseEnter={e => e.currentTarget.style.background = 'rgba(140,170,220,0.07)'}
             onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
@@ -640,7 +643,7 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
           {/* Delete — only for non-default portfolios */}
           {ctxMenu.portfolio.id !== 1 && (
             <div
-              onClick={() => { handleDelete(ctxMenu.portfolio.id); setCtxMenu(null) }}
+              onClick={() => { setConfirmDel(ctxMenu.portfolio); setCtxMenu(null) }}
               style={{ padding: '8px 14px', cursor: 'pointer', color: '#ff476f', borderTop: '1px solid rgba(140,170,220,0.08)', marginTop: '4px' }}
               onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,71,111,0.08)'}
               onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
@@ -649,6 +652,35 @@ export default function PortfolioTabs({ portfolioId, onSwitch, userId }) {
             </div>
           )}
         </div>
+      )}
+
+      {confirmDel && (
+        <ConfirmModal
+          message={`Delete "${confirmDel.name}"?`}
+          detail="This cannot be undone."
+          confirmLabel="Delete"
+          danger
+          onConfirm={() => handleDelete(confirmDel.id)}
+          onCancel={() => setConfirmDel(null)}
+        />
+      )}
+      {confirmReset && (
+        <ConfirmModal
+          message={`Reset "${confirmReset.name}" to $100,000?`}
+          detail="All positions and trade history will be cleared."
+          confirmLabel="Reset"
+          danger
+          onConfirm={() => handleResetBalance(confirmReset)}
+          onCancel={() => setConfirmReset(null)}
+        />
+      )}
+      {errorMsg && (
+        <ConfirmModal
+          message={errorMsg}
+          alertOnly
+          onConfirm={() => setErrorMsg('')}
+          onCancel={() => setErrorMsg('')}
+        />
       )}
     </div>
   )

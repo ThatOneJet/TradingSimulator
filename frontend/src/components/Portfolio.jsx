@@ -1,13 +1,15 @@
 import { useState } from 'react'
 import api from '../api.js'
+import ConfirmModal from './ConfirmModal.jsx'
 
 export default function Portfolio({ account, onReset, portfolioId }) {
-  const [resetting, setResetting] = useState(false)
-  const [msg,       setMsg]       = useState('')
+  const [resetting,    setResetting]    = useState(false)
+  const [msg,          setMsg]          = useState('')
+  const [resetModal,   setResetModal]   = useState(false)
 
   async function handleReset() {
-    if (!window.confirm('Reset account to $100,000 and clear all positions and trade history?')) return
     setResetting(true)
+    setResetModal(false)
     setMsg('')
     try {
       const r = await api.post('/account/reset', { portfolio_id: portfolioId || 1 })
@@ -38,9 +40,19 @@ export default function Portfolio({ account, onReset, portfolioId }) {
       <div className="widget-hd">
         {isReal ? 'Real Holdings' : 'Portfolio'}
         {!isReal && (
-          <button className="pf-reset-btn" onClick={handleReset} disabled={resetting} style={{ marginLeft: 'auto' }}>
+          <button className="pf-reset-btn" onClick={() => setResetModal(true)} disabled={resetting} style={{ marginLeft: 'auto' }}>
             {resetting ? '…' : 'Reset'}
           </button>
+        )}
+        {resetModal && (
+          <ConfirmModal
+            message="Reset account to $100,000?"
+            detail="All positions and trade history will be cleared."
+            confirmLabel="Reset"
+            danger
+            onConfirm={handleReset}
+            onCancel={() => setResetModal(false)}
+          />
         )}
         {isReal && (
           <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--ok)', fontFamily: 'var(--font-mono)', opacity: 0.8 }}>

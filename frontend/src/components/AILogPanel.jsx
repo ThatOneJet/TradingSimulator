@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import api from '../api.js'
+import ConfirmModal from './ConfirmModal.jsx'
 
 const MARKET_STATE_CFG = {
   panic:              { color: '#ff1a4e', label: 'PANIC'         },
@@ -511,11 +512,13 @@ function Chip({ label, color }) {
 
 // ── Main panel ────────────────────────────────────────────────────────────────
 
-export default function AILogPanel({ portfolioId, isAiControlled }) {
+export default function AILogPanel({ portfolioId, isAiControlled, user }) {
   const [runs,       setRuns]       = useState([])
   const [loading,    setLoading]    = useState(false)
   const [modal,      setModal]      = useState(null)   // run object for open modal
   const [flash,      setFlash]      = useState(false)
+  const [clearModal, setClearModal] = useState(false)
+  const [errModal,   setErrModal]   = useState('')
   const [review,      setReview]      = useState(null)
   const [reviewLoad,  setReviewLoad]  = useState(false)
   const [reviewTab,   setReviewTab]   = useState('scans')  // 'scans' | '30d' | 'trades'
@@ -580,6 +583,30 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
   return (
     <>
       {modal && <ScanModal run={modal} onClose={() => setModal(null)} />}
+      {clearModal && (
+        <ConfirmModal
+          message="Delete all 30D AI history for this portfolio?"
+          detail="Scan runs, trades, decisions and rejections will be permanently removed."
+          confirmLabel="Clear History"
+          danger
+          onConfirm={async () => {
+            setClearModal(false)
+            try {
+              await api.delete(`/portfolios/${portfolioId}/history/clear?user_id=${user.user_id}`)
+              setRuns([]); setReview(null); setTradeHist(null); setDecisions(null)
+            } catch { setErrModal('Failed to clear history.') }
+          }}
+          onCancel={() => setClearModal(false)}
+        />
+      )}
+      {errModal && (
+        <ConfirmModal
+          message={errModal}
+          alertOnly
+          onConfirm={() => setErrModal('')}
+          onCancel={() => setErrModal('')}
+        />
+      )}
 
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%', fontFamily: 'var(--font-sans)' }}>
 
@@ -609,11 +636,24 @@ export default function AILogPanel({ portfolioId, isAiControlled }) {
           </div>
 
           {/* Stats row */}
-          <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
             <StatPill label="Scans" value={runs.length} color="var(--t-3)" />
             <StatPill label="Bought" value={totalBought} color="#3ddc97" />
             <StatPill label="Sold"   value={totalSold}   color="#ff476f" />
             {lastRun && <StatPill label="Last scan" value={fmtTime(lastRun.created_at)} color="var(--t-4)" mono />}
+            {user?.username === 'thatonejet' && (
+              <button
+                onClick={() => setClearModal(true)}
+                style={{
+                  marginLeft: 'auto', padding: '2px 8px', border: '1px solid rgba(255,71,111,0.3)',
+                  borderRadius: 4, cursor: 'pointer', fontSize: 9, fontWeight: 700,
+                  background: 'rgba(255,71,111,0.08)', color: '#ff476f', fontFamily: 'var(--font-sans)',
+                }}
+                title="Delete 30D AI history (thatonejet only)"
+              >
+                Clear 30D
+              </button>
+            )}
           </div>
         </div>
 

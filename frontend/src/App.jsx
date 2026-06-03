@@ -23,6 +23,7 @@ import TradeBrief from './components/TradeBrief.jsx'
 import RankingsPanel from './components/RankingsPanel.jsx'
 import Settings from './pages/Settings.jsx'
 import NewsTicker from './components/NewsTicker.jsx'
+import ConfirmModal from './components/ConfirmModal.jsx'
 import api from './api.js'
 
 const socket = io('http://localhost:8765')
@@ -46,8 +47,8 @@ export default function App() {
   const [railOpen,    setRailOpen]    = useState(false)
   const [widgetsOpen, setWidgetsOpen] = useState(true)
   const [railTab,     setRailTab]     = useState('chart')
-  const [leftTab,     setLeftTab]     = useState('watch') // 'watch'|'analysis'|'risk'|'rankings'|'aiscan'
-  const [rightTab,    setRightTab]    = useState('trade') // 'trade'|'options'|'log'
+  const [leftTab,     setLeftTab]     = useState('watch') // 'watch'|'analysis'|'options'|'rankings'|'aiscan'
+  const [signOutModal, setSignOutModal] = useState(false)
 
   // ── Projection data (fetched on symbol change, shared across panels) ──────
   const [projectionData, setProjectionData] = useState(null)
@@ -157,6 +158,7 @@ export default function App() {
           {[
             { key: 'watch',    label: 'Watch'    },
             { key: 'analysis', label: 'Analysis' },
+            { key: 'options',  label: 'Options'  },
             { key: 'rankings', label: 'Rank'     },
             { key: 'aiscan',   label: 'AI Scan'  },
           ].map(t => (
@@ -194,6 +196,15 @@ export default function App() {
                 <Positions positions={positions} onRefresh={refresh} portfolioId={portfolioId} totalValue={account?.portfolio_value} />
               </div>
               <div style={{ borderTop: '1px solid rgba(140,170,220,0.08)' }}>
+                <TradePanel
+                  symbol={symbol}
+                  account={account}
+                  portfolioId={portfolioId}
+                  quote={quote}
+                  onReset={refresh}
+                />
+              </div>
+              <div style={{ borderTop: '1px solid rgba(140,170,220,0.08)' }}>
                 <SetupGuideWidget symbol={symbol} quote={quote} delta={delta} />
               </div>
             </>
@@ -201,11 +212,14 @@ export default function App() {
           {leftTab === 'analysis' && (
             <AnalysisPanel symbol={symbol} quote={quote} delta={delta} portfolioId={portfolioId} price={midPrice} />
           )}
+          {leftTab === 'options' && (
+            <OptionsPanel symbol={symbol} />
+          )}
           {leftTab === 'rankings' && (
             <RankingsPanel portfolioId={portfolioId} onSelect={(sym) => { setSymbol(sym); setLeftTab('watch') }} />
           )}
           {leftTab === 'aiscan' && (
-            <AILogPanel portfolioId={portfolioId} isAiControlled={true} />
+            <AILogPanel portfolioId={portfolioId} isAiControlled={true} user={user} />
           )}
         </div>
 
@@ -225,13 +239,17 @@ export default function App() {
           <button
             className="nav-foot-logout"
             title="Log out"
-            onClick={() => {
-              if (window.confirm('Sign out of TradeSimulator?')) {
-                localStorage.removeItem('ts_user')
-                window.location.reload()
-              }
-            }}
+            onClick={() => setSignOutModal(true)}
           >⏻</button>
+          {signOutModal && (
+            <ConfirmModal
+              message="Sign out of TradeSimulator?"
+              confirmLabel="Sign Out"
+              danger
+              onConfirm={() => { localStorage.removeItem('ts_user'); window.location.reload() }}
+              onCancel={() => setSignOutModal(false)}
+            />
+          )}
         </div>
       </aside>
 
@@ -341,67 +359,6 @@ export default function App() {
 
             <div className="ch-body">
               <Chart symbol={symbol} timeframe={timeframe} socket={socket} overlays={overlays} quote={quote} delta={delta} />
-
-              {/* Right panel — Trade | Options | Log tabs */}
-              <div style={{ display: 'flex', flexDirection: 'column', width: '240px', flexShrink: 0, borderLeft: '1px solid rgba(140,170,220,0.08)', overflow: 'hidden' }}>
-                {/* Tab bar */}
-                <div style={{ display: 'flex', flexShrink: 0, borderBottom: '1px solid rgba(140,170,220,0.08)', background: 'rgba(0,0,0,0.2)' }}>
-                  {[
-                    { key: 'trade',   label: 'Trade'   },
-                    { key: 'options', label: 'Options' },
-                    { key: 'log',     label: 'AI Scan', dot: account?.ai_controlled },
-                  ].map(t => (
-                    <button
-                      key={t.key}
-                      onClick={() => setRightTab(t.key)}
-                      style={{
-                        flex: 1, padding: '7px 0', border: 'none', cursor: 'pointer',
-                        background: rightTab === t.key ? 'rgba(179,157,255,0.1)' : 'transparent',
-                        color: rightTab === t.key ? '#b39dff' : '#475061',
-                        fontSize: '10px', fontWeight: rightTab === t.key ? 700 : 400,
-                        borderBottom: rightTab === t.key ? '2px solid #b39dff' : '2px solid transparent',
-                        fontFamily: 'var(--font-sans)', transition: 'color 0.15s',
-                        position: 'relative',
-                      }}
-                    >
-                      {t.label}
-                      {t.dot ? (
-                        <span style={{
-                          position: 'absolute', top: 5, right: 4,
-                          width: 5, height: 5, borderRadius: '50%',
-                          background: '#3ddc97',
-                          boxShadow: '0 0 4px #3ddc97',
-                          animation: 'aiPulse 2s infinite',
-                        }} />
-                      ) : null}
-                    </button>
-                  ))}
-                </div>
-
-                {/* Tab content */}
-                <div style={{ flex: 1, overflowY: rightTab === 'log' ? 'hidden' : 'auto', overflowX: 'hidden', display: 'flex', flexDirection: 'column' }}>
-                  {rightTab === 'trade' && (
-                    <TradePanel
-                      symbol={symbol}
-                      account={account}
-                      positions={positions}
-                      onOrderPlaced={refresh}
-                      portfolioId={portfolioId}
-                      quote={quote}
-                      onReset={refresh}
-                    />
-                  )}
-                  {rightTab === 'options' && (
-                    <OptionsPanel symbol={symbol} />
-                  )}
-                  {rightTab === 'log' && (
-                    <AILogPanel
-                      portfolioId={portfolioId}
-                      isAiControlled={!!account?.ai_controlled}
-                    />
-                  )}
-                </div>
-              </div>
             </div>
           </>
         )}

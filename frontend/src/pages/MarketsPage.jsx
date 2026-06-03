@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import api from '../api.js'
 import OptionProjectionWidget from '../components/OptionProjectionWidget'
+import ConfirmModal from '../components/ConfirmModal.jsx'
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
@@ -138,6 +139,7 @@ function OptionsChain({ defaultSymbol }) {
   const [loading,        setLoading]        = useState(false)
   const [error,          setError]          = useState('')
   const [selectedOption, setSelectedOption] = useState(null)
+  const [infoModal,      setInfoModal]      = useState('')
 
   const fetchChain = useCallback((symbol, exp) => {
     if (!symbol) return
@@ -214,13 +216,15 @@ function OptionsChain({ defaultSymbol }) {
         )}
       </div>
 
+      {infoModal && <ConfirmModal message={infoModal} alertOnly onConfirm={() => setInfoModal('')} onCancel={() => setInfoModal('')} />}
+
       {/* Projection widget renders ABOVE the table so it's always visible on click */}
       {selectedOption && (
         <OptionProjectionWidget
           option={selectedOption}
           underlyingPrice={spot}
           onClose={() => setSelectedOption(null)}
-          onAddToPortfolio={() => alert('Select a portfolio in the main view first, then use the Trade panel to add positions.')}
+          onAddToPortfolio={() => setInfoModal('Select a portfolio in the main view first, then use the Trade panel to add positions.')}
         />
       )}
 

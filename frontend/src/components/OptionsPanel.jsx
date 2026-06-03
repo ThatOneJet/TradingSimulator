@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import api from '../api.js'
 import OptionProjectionWidget from './OptionProjectionWidget'
+import ConfirmModal from './ConfirmModal.jsx'
 
 function fv(n, d = 2) { return n != null && n !== 0 ? Number(n).toFixed(d) : '—' }
 function fmtVol(n) {
@@ -17,6 +18,7 @@ export default function OptionsPanel({ symbol }) {
   const [loading,        setLoading]        = useState(false)
   const [error,          setError]          = useState('')
   const [selectedOption, setSelectedOption] = useState(null)
+  const [infoModal,      setInfoModal]      = useState('')
 
   const fetchChain = useCallback((sym, exp) => {
     if (!sym) return
@@ -37,6 +39,7 @@ export default function OptionsPanel({ symbol }) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', fontFamily: 'var(--font-sans)', fontSize: 11 }}>
+      {infoModal && <ConfirmModal message={infoModal} alertOnly onConfirm={() => setInfoModal('')} onCancel={() => setInfoModal('')} />}
 
       {/* Controls */}
       <div style={{ padding: '8px 10px', borderBottom: '1px solid rgba(140,170,220,0.08)', flexShrink: 0 }}>
@@ -87,7 +90,7 @@ export default function OptionsPanel({ symbol }) {
             option={selectedOption}
             underlyingPrice={spot}
             onClose={() => setSelectedOption(null)}
-            onAddToPortfolio={() => alert('Use the Trade panel to add positions.')}
+            onAddToPortfolio={() => setInfoModal('Use the Trade panel to add positions.')}
             compact
           />
         </div>
