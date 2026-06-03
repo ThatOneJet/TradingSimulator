@@ -1,3 +1,11 @@
+# Flask-SocketIO on eventlet REQUIRES the stdlib to be monkey-patched so blocking
+# network calls (yfinance, requests, urllib, websockets, the arb/exchange feeds)
+# yield cooperatively instead of freezing the single-threaded WSGI hub. Without
+# this, one slow handler stalls EVERY request and background scans appear frozen.
+# Must run before any other import that touches sockets/threading.
+import eventlet
+eventlet.monkey_patch()
+
 import os, threading, sqlite3, time as _time, json as _json, csv, io, hashlib, random, math, logging, warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)  # suppress Eventlet deprecation
 from datetime import datetime, timedelta
@@ -5674,7 +5682,15 @@ def _ai_worker():
                 ).fetchall()
             for row in rows:
                 try:
-                    result = _ai_run_portfolio(row['id'])
+                    # Hard cap each portfolio scan at 90s so a single hung network
+                    # call (during a flaky connection) can never permanently stall
+                    # the worker. eventlet.Timeout(t, False) returns instead of raising.
+                    result = None
+                    with eventlet.Timeout(90, False):
+                        result = _ai_run_portfolio(row['id'])
+                    if result is None:
+                        print(f'[AI] pid={row["id"]} scan timed out (>90s) — skipped')
+                        continue
                     if result['bought'] or result['sold'] or result['errors']:
                         print(f'[AI] pid={row["id"]} scanned={result["scanned"]} '
                               f'bought={[b["symbol"] for b in result["bought"]]} '
