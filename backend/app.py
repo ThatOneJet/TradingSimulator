@@ -4417,6 +4417,31 @@ def _compute_cluster_exposure(new_sym: str, held_syms: list, pid: int, equity: f
     return cluster_value / equity
 
 
+def _class_cluster_exposure(new_sym: str, pid: int, equity: float, held_prices: dict):
+    """Flat asset-class cluster: count and total exposure (fraction of equity) of all
+    currently-held positions in the SAME asset class as new_sym. Used only for the
+    inherently-correlated classes (crypto, forex). Returns (count, exposure_fraction)."""
+    if equity <= 0:
+        return 0, 0.0
+    ac = _get_asset_class(new_sym)
+    count = 0
+    value = 0.0
+    with _get_db() as conn:
+        rows = conn.execute(
+            'SELECT symbol, shares FROM sim_positions WHERE portfolio_id=? AND shares!=0',
+            (pid,)
+        ).fetchall()
+    for r in rows:
+        if r['symbol'] == new_sym:
+            continue
+        if _get_asset_class(r['symbol']) != ac:
+            continue
+        price = held_prices.get(r['symbol']) or _get_current_price(r['symbol'])
+        count += 1
+        value += abs(r['shares']) * (price or 0)
+    return count, value / equity
+
+
 def _compute_corr_factor(new_sym: str, held_syms: list) -> float:
     """Return 0.5 if new symbol is highly correlated (r>0.7) with any held position."""
     if not _candle_engine or not held_syms:
@@ -4528,7 +4553,14 @@ SINGLE_POS_CAPS = {
     'futures': 0.03,   # futures excluded from sim anyway
 }
 MAX_PORTFOLIO_HEAT = 0.05   # max 5% of equity at risk simultaneously
-MAX_CLUSTER_EXPOSURE = 0.07 # max 7% of equity in any correlated cluster
+MAX_CLUSTER_EXPOSURE = 0.07 # max 7% of equity in any correlated cluster (equity/futures, dynamic)
+
+# Hard, flat cluster caps for inherently-correlated asset classes. Replaces the
+# dynamic 20-bar correlation check for crypto/FX, which let the all-short
+# LINK/LTC/AAVE book through. Every -USD coin is treated as ONE cluster; every
+# =X pair as ONE cluster — capped by both position count and total exposure.
+CLUSTER_MAX_POSITIONS = {'crypto': 2, 'forex': 2}
+CLUSTER_MAX_EXPOSURE  = {'crypto': 0.08, 'forex': 0.05}
 
 # Futures contract multipliers (price × multiplier = notional value)
 FUTURES_MULTIPLIERS = {
@@ -5483,16 +5515,31 @@ def _ai_run_portfolio(pid: int) -> dict:
             except Exception:
                 pass
 
-            # ── 6. Correlated cluster cap ─────────────────────────────────────
+            # ── 6. Cluster cap ────────────────────────────────────────────────
+            # Crypto & FX: hard flat rule (whole class = one cluster). Equity &
+            # futures: keep the dynamic 20-bar correlation check.
             try:
-                cluster_exp = _compute_cluster_exposure(c['symbol'], held, pid, equity, held_prices)
-                if cluster_exp >= MAX_CLUSTER_EXPOSURE:
-                    summary['skipped'].append(f'{c["symbol"]}: correlated cluster {cluster_exp:.1%}')
-                    _log_decision(pid, c['symbol'], 'REJECT', c.get('score', 0),
-                                  '', 'correlation', f'cluster {cluster_exp:.1%}')
-                    continue
-                cluster_room = max(0.0, (MAX_CLUSTER_EXPOSURE - cluster_exp) * equity)
-                position_value = min(position_value, cluster_room)
+                _ac = _get_asset_class(c['symbol'])
+                if _ac in CLUSTER_MAX_EXPOSURE:
+                    _cnt, _exp = _class_cluster_exposure(c['symbol'], pid, equity, held_prices)
+                    if _cnt >= CLUSTER_MAX_POSITIONS[_ac] or _exp >= CLUSTER_MAX_EXPOSURE[_ac]:
+                        summary['skipped'].append(
+                            f'{c["symbol"]}: {_ac} cluster cap ({_cnt} pos, {_exp:.1%})')
+                        _log_decision(pid, c['symbol'], 'REJECT', c.get('score', 0),
+                                      '', 'correlation',
+                                      f'{_ac} cluster: {_cnt} positions, {_exp:.1%} exposure')
+                        continue
+                    cluster_room = max(0.0, (CLUSTER_MAX_EXPOSURE[_ac] - _exp) * equity)
+                    position_value = min(position_value, cluster_room)
+                else:
+                    cluster_exp = _compute_cluster_exposure(c['symbol'], held, pid, equity, held_prices)
+                    if cluster_exp >= MAX_CLUSTER_EXPOSURE:
+                        summary['skipped'].append(f'{c["symbol"]}: correlated cluster {cluster_exp:.1%}')
+                        _log_decision(pid, c['symbol'], 'REJECT', c.get('score', 0),
+                                      '', 'correlation', f'cluster {cluster_exp:.1%}')
+                        continue
+                    cluster_room = max(0.0, (MAX_CLUSTER_EXPOSURE - cluster_exp) * equity)
+                    position_value = min(position_value, cluster_room)
             except Exception:
                 pass
 

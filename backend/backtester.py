@@ -454,7 +454,8 @@ class BacktestEngine:
         self.capital = initial_capital
 
     def run(self, symbol: str, start_date: str, end_date: str,
-            portfolio_size: float = None) -> BacktestResult:
+            portfolio_size: float = None,
+            entry_threshold: float = 2.5) -> BacktestResult:
         """
         Replay algorithm on historical daily OHLCV for symbol.
 
@@ -622,8 +623,9 @@ class BacktestEngine:
                     position = None
 
             else:
-                # No position — check for buy signal
-                if score >= 2.5 and i + 1 < len(dates):
+                # No position — check for buy signal (threshold is tunable for
+                # walk-forward optimisation; default mirrors the live BUY_THRESH)
+                if score >= entry_threshold and i + 1 < len(dates):
                     # Fill at NEXT bar's open to eliminate look-ahead bias
                     # (signal fires at bar i close; earliest real fill = bar i+1 open)
                     entry_price = self.fill.buy_price(opens[i + 1], 1, max(volumes[i + 1], 1), atr)
@@ -763,10 +765,15 @@ class BacktestEngine:
             if losses else float('inf')
         )
 
+        total_pl   = sum(t['realized_pl'] for t in trades)
+        expectancy = total_pl / len(trades) if trades else 0.0   # net P&L per trade (after costs)
+
         return {
             'total_trades':  len(trades),
             'win_rate':      round(len(wins) / len(trades), 3) if trades else 0,
             'total_return':  round(total_return, 4),
+            'total_pl':      round(total_pl, 2),
+            'expectancy':    round(expectancy, 2),
             'sharpe':        sharpe,
             'max_drawdown':  round(max_dd, 4),
             'profit_factor': round(profit_factor, 2),
@@ -1051,3 +1058,137 @@ def run_walk_forward(symbol: str, start: str, end: str,
     return walk_forward(symbol, start, end,
                         window_days=window_days, step_days=step_days,
                         capital=capital)
+
+
+# ── Train/Test walk-forward optimisation ────────────────────────────────────────
+# The honest measurement layer: TUNE one parameter (the entry threshold) on an
+# in-sample slice, then evaluate the chosen value on a later, never-touched
+# out-of-sample slice. The gap between the two (decay) is what tells you whether
+# an edge is real or fitted. Net expectancy per trade, profit factor and max
+# drawdown are reported for both slices.
+
+def _pooled_metrics(results: list) -> dict:
+    """Aggregate a list of BacktestResult into portfolio-level metrics by pooling
+    all trades and merging daily P&L across symbols into one equity curve."""
+    trades = []
+    for r in results:
+        trades.extend(r.trades or [])
+
+    if not trades:
+        return {'total_trades': 0, 'win_rate': 0.0, 'total_pl': 0.0, 'expectancy': 0.0,
+                'profit_factor': 0.0, 'avg_win': 0.0, 'avg_loss': 0.0,
+                'max_drawdown': 0.0, 'symbols_traded': 0}
+
+    wins   = [t for t in trades if t['realized_pl'] > 0]
+    losses = [t for t in trades if t['realized_pl'] <= 0]
+    total_pl = sum(t['realized_pl'] for t in trades)
+    gross_win  = sum(t['realized_pl'] for t in wins)
+    gross_loss = abs(sum(t['realized_pl'] for t in losses))
+
+    # Merge daily P&L across symbols by date → one portfolio equity curve → max DD
+    by_date = defaultdict(float)
+    base = 0.0
+    for r in results:
+        for e in (r.equity_curve or []):
+            by_date[e['date']] += e.get('daily_pl', 0.0) or 0.0
+    cum = 0.0; peak = 0.0; max_dd = 0.0
+    for d in sorted(by_date):
+        cum += by_date[d]
+        peak = max(peak, cum)
+        # drawdown measured in dollars off the running peak, normalised later
+        max_dd = max(max_dd, peak - cum)
+
+    return {
+        'total_trades':  len(trades),
+        'win_rate':      round(len(wins) / len(trades), 3),
+        'total_pl':      round(total_pl, 2),
+        'expectancy':    round(total_pl / len(trades), 2),     # net $/trade after costs
+        'profit_factor': round(gross_win / gross_loss, 2) if gross_loss > 0 else float('inf'),
+        'avg_win':       round(gross_win / len(wins), 2) if wins else 0.0,
+        'avg_loss':      round(-gross_loss / len(losses), 2) if losses else 0.0,
+        'max_drawdown':  round(max_dd, 2),
+        'symbols_traded': len({t['symbol'] for t in trades}),
+    }
+
+
+def walk_forward_optimize(symbols, train_start: str, train_end: str,
+                          test_start: str, test_end: str,
+                          thresholds=(2.0, 2.5, 3.0, 3.5, 4.0),
+                          capital: float = 100_000, min_trades: int = 15) -> dict:
+    """Tune the entry threshold in-sample, then measure it out-of-sample.
+
+    Args:
+        symbols:     list of tickers to pool into one portfolio test
+        train_start/train_end: in-sample slice for tuning (YYYY-MM-DD)
+        test_start/test_end:   out-of-sample slice for validation (must be LATER)
+        thresholds:  candidate entry score thresholds to sweep on the train slice
+        min_trades:  a threshold needs at least this many train trades to be eligible
+
+    Returns a JSON-native dict with the per-threshold train sweep, the chosen
+    threshold, in-sample vs out-of-sample metrics, and the decay between them.
+    """
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    symbols = [s.upper() for s in symbols]
+    engine = BacktestEngine(initial_capital=capital)
+
+    def _run_slice(start, end, thr):
+        results = []
+        for sym in symbols:
+            try:
+                results.append(engine.run(sym, start, end, portfolio_size=capital,
+                                          entry_threshold=thr))
+            except Exception as exc:
+                log.warning('[WFO] %s %s→%s thr=%.1f skipped: %s', sym, start, end, thr, exc)
+        return results
+
+    # ── 1. TRAIN: sweep thresholds, pool metrics ────────────────────────────────
+    train_sweep = {}
+    for thr in thresholds:
+        train_sweep[thr] = _pooled_metrics(_run_slice(train_start, train_end, thr))
+
+    # ── 2. Pick the threshold with best in-sample expectancy (PF tie-break) ──────
+    eligible = {t: m for t, m in train_sweep.items() if m['total_trades'] >= min_trades}
+    pool = eligible or train_sweep
+    best_thr = max(pool, key=lambda t: (pool[t]['expectancy'], pool[t]['profit_factor']))
+    is_metrics = train_sweep[best_thr]
+
+    # ── 3. TEST: evaluate the chosen threshold on the untouched slice ────────────
+    oos_metrics = _pooled_metrics(_run_slice(test_start, test_end, best_thr))
+
+    # ── 4. Decay: how much of the in-sample edge survives out-of-sample ──────────
+    def _ratio(a, b):
+        if b == 0:
+            return 0.0 if a == 0 else (float('inf') if a > 0 else float('-inf'))
+        return round(a / b, 3)
+
+    decay = {
+        'expectancy_ratio':    _ratio(oos_metrics['expectancy'], is_metrics['expectancy']),
+        'profit_factor_ratio': _ratio(oos_metrics['profit_factor'], is_metrics['profit_factor'])
+                               if is_metrics['profit_factor'] not in (0, float('inf')) else None,
+        'oos_expectancy_positive': oos_metrics['expectancy'] > 0,
+    }
+    # Verdict: an edge that holds OOS keeps most of its expectancy and stays positive.
+    if oos_metrics['total_trades'] < min_trades:
+        verdict = 'inconclusive — too few out-of-sample trades'
+    elif oos_metrics['expectancy'] <= 0:
+        verdict = 'no edge — out-of-sample expectancy is negative (likely overfit)'
+    elif decay['expectancy_ratio'] >= 0.6:
+        verdict = 'robust — edge largely survives out-of-sample'
+    else:
+        verdict = 'weak — edge decays substantially out-of-sample'
+
+    return {
+        'symbols':      symbols,
+        'train':        {'start': train_start, 'end': train_end},
+        'test':         {'start': test_start,  'end': test_end},
+        'thresholds':   list(thresholds),
+        'min_trades':   min_trades,
+        'train_sweep':  {str(t): m for t, m in train_sweep.items()},
+        'chosen_threshold': best_thr,
+        'chosen_from_eligible': bool(eligible),
+        'in_sample':    is_metrics,
+        'out_of_sample': oos_metrics,
+        'decay':        decay,
+        'verdict':      verdict,
+    }
