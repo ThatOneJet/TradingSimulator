@@ -592,7 +592,7 @@ export default function AILogPanel({ portfolioId, isAiControlled, user }) {
           onConfirm={async () => {
             setClearModal(false)
             try {
-              await api.delete(`/portfolios/${portfolioId}/history/clear?user_id=${user.user_id}`)
+              await api.delete(`/portfolios/${portfolioId}/history/clear`)
               setRuns([]); setReview(null); setTradeHist(null); setDecisions(null)
             } catch { setErrModal('Failed to clear history.') }
           }}

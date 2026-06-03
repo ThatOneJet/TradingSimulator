@@ -28,25 +28,24 @@ _BT_COMMISSION_MIN       = 1.00   # matches live engine _COMMISSION_MIN
 
 @dataclass
 class FillModel:
-    spread_bps:   float = 8.0    # matches live engine 8% ATR base slip converted to bps
-    slippage_bps: float = 2.0    # market impact in bps
-    latency_ms:   int   = 250    # simulated execution delay (unused in daily sim, noted)
+    latency_ms: int = 250  # simulated execution delay (unused in daily sim, noted)
 
     def _commission(self, size: float) -> float:
-        """Per-share commission cost, matching live engine."""
         return max(_BT_COMMISSION_MIN, size * _BT_COMMISSION_PER_SHARE) / max(size, 1)
 
-    def buy_price(self, mid: float, size: float, adv: float) -> float:
-        """Realistic fill for a buy: mid + half-spread + slippage + commission."""
-        spread = mid * self.spread_bps / 10000
-        impact = mid * self.slippage_bps / 10000 * min(1.0, size / max(adv * 0.001, 1))
-        return round(mid + spread / 2 + impact + self._commission(size), 4)
+    def _slip(self, atr: float) -> float:
+        # Matches live engine exactly: base_slip = atr * 0.08, midpoint of uniform(0.8,1.2)
+        return atr * 0.08
 
-    def sell_price(self, mid: float, size: float, adv: float) -> float:
-        """Realistic fill for a sell: mid - half-spread - slippage - commission."""
-        spread = mid * self.spread_bps / 10000
-        impact = mid * self.slippage_bps / 10000 * min(1.0, size / max(adv * 0.001, 1))
-        return round(mid - spread / 2 - impact - self._commission(size), 4)
+    def buy_price(self, mid: float, size: float, adv: float, atr: float = 0.0) -> float:
+        """Buy fill: mid + ATR-based slippage (matching live engine) + commission."""
+        slip = self._slip(atr) if atr > 0 else mid * 0.0008  # 8 bps fallback
+        return round(mid + slip + self._commission(size), 4)
+
+    def sell_price(self, mid: float, size: float, adv: float, atr: float = 0.0) -> float:
+        """Sell fill: mid - ATR-based slippage (matching live engine) - commission."""
+        slip = self._slip(atr) if atr > 0 else mid * 0.0008
+        return round(mid - slip - self._commission(size), 4)
 
 
 # ── Data classes ───────────────────────────────────────────────────────────────
@@ -493,6 +492,7 @@ class BacktestEngine:
         position     = None          # BacktestPosition or None
         trades       = []            # list of dicts
         equity_curve = []            # list of {date, equity, daily_pl}
+        prev_atr     = 0.0           # ATR from prior bar — used for intrabar stop/target fills
 
         log.info("[BACKTEST] %s  %d bars loaded, starting replay...", symbol, len(dates))
 
@@ -512,7 +512,7 @@ class BacktestEngine:
                 if low <= position.stop_price:
                     # If bar gapped through the stop (opened below it), fill at open — not at stop
                     fill_ref   = min(position.stop_price, opens[i])
-                    exit_price = self.fill.sell_price(fill_ref, position.shares, max(volume, 1))
+                    exit_price = self.fill.sell_price(fill_ref, position.shares, max(volume, 1), prev_atr)
                     realized   = (exit_price - position.entry_price) * position.shares
                     equity    += realized
                     hold_days  = _date_diff(position.entry_date, date)
@@ -540,7 +540,7 @@ class BacktestEngine:
                 elif high >= position.target:
                     # If bar gapped above target (opened above it), fill at open — we get the better price
                     fill_ref   = max(position.target, opens[i])
-                    exit_price = self.fill.sell_price(fill_ref, position.shares, max(volume, 1))
+                    exit_price = self.fill.sell_price(fill_ref, position.shares, max(volume, 1), prev_atr)
                     realized   = (exit_price - position.entry_price) * position.shares
                     equity    += realized
                     hold_days  = _date_diff(position.entry_date, date)
@@ -585,6 +585,7 @@ class BacktestEngine:
 
             score, regime = _score_bar(ind)
             atr = float(ind.get('atr') or (close * 0.02))
+            prev_atr = atr   # carry forward for next bar's intrabar stop/target fills
             stop_m, tgt_m = _regime_stop_multiplier(regime)
 
             # --- Position management ---
@@ -596,7 +597,7 @@ class BacktestEngine:
 
                 # Exit on sell signal — fill at next bar open (no look-ahead)
                 if score <= -2.5 and i + 1 < len(dates):
-                    exit_price = self.fill.sell_price(opens[i + 1], position.shares, max(volumes[i + 1], 1))
+                    exit_price = self.fill.sell_price(opens[i + 1], position.shares, max(volumes[i + 1], 1), atr)
                     realized   = (exit_price - position.entry_price) * position.shares
                     equity    += realized
                     hold_days  = _date_diff(position.entry_date, date)
@@ -625,7 +626,7 @@ class BacktestEngine:
                 if score >= 2.5 and i + 1 < len(dates):
                     # Fill at NEXT bar's open to eliminate look-ahead bias
                     # (signal fires at bar i close; earliest real fill = bar i+1 open)
-                    entry_price = self.fill.buy_price(opens[i + 1], 1, max(volumes[i + 1], 1))
+                    entry_price = self.fill.buy_price(opens[i + 1], 1, max(volumes[i + 1], 1), atr)
 
                     # Sizing matches live engine: 1% risk per trade, score-based cap
                     risk_dollars = equity * 0.01
@@ -679,7 +680,7 @@ class BacktestEngine:
             close      = closes[-1]
             date       = dates[-1]
             volume     = volumes[-1]
-            exit_price = self.fill.sell_price(close, position.shares, max(volume, 1))
+            exit_price = self.fill.sell_price(close, position.shares, max(volume, 1), prev_atr)
             realized   = (exit_price - position.entry_price) * position.shares
             equity    += realized
             hold_days  = _date_diff(position.entry_date, date)

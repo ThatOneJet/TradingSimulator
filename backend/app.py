@@ -1456,11 +1456,16 @@ def portfolio_history_review(pid):
 
 @app.route('/api/portfolios/<int:pid>/history/clear', methods=['DELETE'])
 def portfolio_history_clear(pid):
-    """Delete all 30D AI history for a portfolio. Restricted to thatonejet."""
-    user_id = request.args.get('user_id', type=int)
+    """Delete all 30D AI history for a portfolio. Restricted to thatonejet.
+    Auth: portfolio_id must belong to a user whose username is 'thatonejet'.
+    No client-supplied user identity — ownership is verified server-side only.
+    """
     with _get_db() as conn:
-        user = conn.execute('SELECT username FROM users WHERE id=?', (user_id,)).fetchone()
-    if not user or user['username'] != 'thatonejet':
+        row = conn.execute(
+            'SELECT u.username FROM portfolios p JOIN users u ON p.user_id=u.id WHERE p.id=?',
+            (pid,)
+        ).fetchone()
+    if not row or row['username'] != 'thatonejet':
         return jsonify({'error': 'Not authorized'}), 403
     cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
     with _get_db() as conn:
