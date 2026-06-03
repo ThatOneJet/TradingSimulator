@@ -389,13 +389,19 @@ def _sim_state(portfolio_id: int = 1) -> dict:
             row = conn.execute('SELECT * FROM sim_state WHERE portfolio_id = ?', (portfolio_id,)).fetchone()
         return dict(row)
 
-def _apply_slippage(price, side, atr_val, volume_ratio=1.0):
-    base_slip = atr_val * 0.05
+_COMMISSION_PER_SHARE = 0.005   # $0.005/share (Alpaca-like tiered rate)
+_COMMISSION_MIN       = 1.00    # $1 minimum per order
+
+def _apply_slippage(price, side, atr_val, volume_ratio=1.0, qty=1.0):
+    base_slip = atr_val * 0.08   # wider than 5% — more realistic half-spread
     if volume_ratio < 0.5:
         base_slip *= 2.0
-    noise = random.uniform(0.7, 1.3)
-    slip = base_slip * noise
-    return round(price + slip, 4) if side == 'buy' else round(price - slip, 4)
+    noise = random.uniform(0.8, 1.2)
+    slip  = base_slip * noise
+    # Add commission cost spread across per-share price
+    commission = max(_COMMISSION_MIN, qty * _COMMISSION_PER_SHARE) / max(qty, 1)
+    total_slip = slip + commission
+    return round(price + total_slip, 4) if side in ('buy', 'short') else round(price - total_slip, 4)
 
 def _sim_buy(symbol: str, qty: float, price: float, portfolio_id: int = 1, record: bool = True):
     cost = qty * price
@@ -1449,7 +1455,7 @@ def portfolio_history_review(pid):
 
 @app.route('/api/portfolios/<int:pid>/history/clear', methods=['DELETE'])
 def portfolio_history_clear(pid):
-    """Delete all 30D AI history for a portfolio. Restricted to srijoy@gmail.com."""
+    """Delete all 30D AI history for a portfolio. Restricted to thatonejet."""
     user_id = request.args.get('user_id', type=int)
     with _get_db() as conn:
         user = conn.execute('SELECT username FROM users WHERE id=?', (user_id,)).fetchone()
@@ -4839,21 +4845,9 @@ def _ai_run_portfolio(pid: int) -> dict:
                     # Target: price falling tgt_m below entry
                     tgt_price    = entry_price - tgt_m * atr
 
-                    # Quota-based exit for shorts: $8 per position per 10 minutes
-                    _short_pl = (entry_price - price) * short_qty
-                    try:
-                        _opened = datetime.fromisoformat((row['created_at'] or '').replace('Z', ''))
-                        _mins_open = (datetime.utcnow() - _opened).total_seconds() / 60
-                    except Exception:
-                        _mins_open = 999
-                    s_quota_met   = _mins_open >= 10 and _short_pl >= 10.0
-                    s_quota_stale = _mins_open >= 20 and _short_pl < 3.0 and _short_pl > -8.0
-
-                    if tradeable and (score >= COVER_THRESH or price >= trailing_stop or price <= tgt_price or s_quota_met or s_quota_stale):
+                    if tradeable and (score >= COVER_THRESH or price >= trailing_stop or price <= tgt_price):
                         reason = ('cover_signal' if score >= COVER_THRESH
                                   else 'stop_loss'    if price >= trailing_stop
-                                  else 'quota_met'    if s_quota_met
-                                  else 'quota_stale'  if s_quota_stale
                                   else 'take_profit')
                         fill = _apply_slippage(price, 'buy', atr, data.get('volume_ratio', 1.0))
                         _sim_cover(sym, short_qty, fill, pid)
@@ -4894,21 +4888,9 @@ def _ai_run_portfolio(pid: int) -> dict:
                     profit_floor = _pf_mult * _atr_pct_v / 100   # dynamic: e.g., crypto 0.8×3% = 2.4%
                     hit_profit_floor = profit_pct >= profit_floor
 
-                    # Quota-based exit: $8 per position per 10 minutes
-                    _unrealized_pl = (price - row['avg_cost']) * row['shares']
-                    try:
-                        _opened = datetime.fromisoformat((row['created_at'] or '').replace('Z', ''))
-                        _mins_open = (datetime.utcnow() - _opened).total_seconds() / 60
-                    except Exception:
-                        _mins_open = 999  # existing positions with no timestamp treated as stale
-                    quota_met   = _mins_open >= 10 and _unrealized_pl >= 10.0
-                    quota_stale = _mins_open >= 20 and _unrealized_pl < 3.0 and _unrealized_pl > -8.0
-
-                    if tradeable and (score <= SELL_THRESH or price <= trailing or price >= tgt or hit_profit_floor or quota_met or quota_stale):
+                    if tradeable and (score <= SELL_THRESH or price <= trailing or price >= tgt or hit_profit_floor):
                         reason = ('sell_signal'   if score <= SELL_THRESH
                                   else 'stop_loss'    if price <= trailing
-                                  else 'quota_met'    if quota_met
-                                  else 'quota_stale'  if quota_stale
                                   else 'profit_floor' if hit_profit_floor
                                   else 'take_profit')
                         fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0))

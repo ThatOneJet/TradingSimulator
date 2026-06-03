@@ -504,8 +504,9 @@ class BacktestEngine:
             if position is not None:
                 # Stop hit? (intraday low breaches stop)
                 if low <= position.stop_price:
-                    exit_price = self.fill.sell_price(position.stop_price, position.shares,
-                                                      max(volume, 1))
+                    # If bar gapped through the stop (opened below it), fill at open — not at stop
+                    fill_ref   = min(position.stop_price, opens[i])
+                    exit_price = self.fill.sell_price(fill_ref, position.shares, max(volume, 1))
                     realized   = (exit_price - position.entry_price) * position.shares
                     equity    += realized
                     hold_days  = _date_diff(position.entry_date, date)
@@ -531,8 +532,9 @@ class BacktestEngine:
 
                 # Target hit? (intraday high breaches target)
                 elif high >= position.target:
-                    exit_price = self.fill.sell_price(position.target, position.shares,
-                                                      max(volume, 1))
+                    # If bar gapped above target (opened above it), fill at open — we get the better price
+                    fill_ref   = max(position.target, opens[i])
+                    exit_price = self.fill.sell_price(fill_ref, position.shares, max(volume, 1))
                     realized   = (exit_price - position.entry_price) * position.shares
                     equity    += realized
                     hold_days  = _date_diff(position.entry_date, date)
