@@ -23,24 +23,30 @@ log = logging.getLogger(__name__)
 
 # ── Fill model ─────────────────────────────────────────────────────────────────
 
+_BT_COMMISSION_PER_SHARE = 0.005  # matches live engine _COMMISSION_PER_SHARE
+_BT_COMMISSION_MIN       = 1.00   # matches live engine _COMMISSION_MIN
+
 @dataclass
 class FillModel:
-    spread_bps:   float = 5.0    # bid-ask spread in basis points (0.05%)
+    spread_bps:   float = 8.0    # matches live engine 8% ATR base slip converted to bps
     slippage_bps: float = 2.0    # market impact in bps
     latency_ms:   int   = 250    # simulated execution delay (unused in daily sim, noted)
-    commission:   float = 0.0    # per-share commission (sim = 0)
+
+    def _commission(self, size: float) -> float:
+        """Per-share commission cost, matching live engine."""
+        return max(_BT_COMMISSION_MIN, size * _BT_COMMISSION_PER_SHARE) / max(size, 1)
 
     def buy_price(self, mid: float, size: float, adv: float) -> float:
-        """Realistic fill for a buy: mid + half-spread + slippage."""
+        """Realistic fill for a buy: mid + half-spread + slippage + commission."""
         spread = mid * self.spread_bps / 10000
         impact = mid * self.slippage_bps / 10000 * min(1.0, size / max(adv * 0.001, 1))
-        return round(mid + spread / 2 + impact, 4)
+        return round(mid + spread / 2 + impact + self._commission(size), 4)
 
     def sell_price(self, mid: float, size: float, adv: float) -> float:
-        """Realistic fill for a sell: mid - half-spread - slippage."""
+        """Realistic fill for a sell: mid - half-spread - slippage - commission."""
         spread = mid * self.spread_bps / 10000
         impact = mid * self.slippage_bps / 10000 * min(1.0, size / max(adv * 0.001, 1))
-        return round(mid - spread / 2 - impact, 4)
+        return round(mid - spread / 2 - impact - self._commission(size), 4)
 
 
 # ── Data classes ───────────────────────────────────────────────────────────────

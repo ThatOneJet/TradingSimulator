@@ -393,15 +393,16 @@ _COMMISSION_PER_SHARE = 0.005   # $0.005/share (Alpaca-like tiered rate)
 _COMMISSION_MIN       = 1.00    # $1 minimum per order
 
 def _apply_slippage(price, side, atr_val, volume_ratio=1.0, qty=1.0):
-    base_slip = atr_val * 0.08   # wider than 5% — more realistic half-spread
+    base_slip = atr_val * 0.08
     if volume_ratio < 0.5:
         base_slip *= 2.0
     noise = random.uniform(0.8, 1.2)
     slip  = base_slip * noise
-    # Add commission cost spread across per-share price
+    # Per-order commission spread into per-share cost
     commission = max(_COMMISSION_MIN, qty * _COMMISSION_PER_SHARE) / max(qty, 1)
     total_slip = slip + commission
-    return round(price + total_slip, 4) if side in ('buy', 'short') else round(price - total_slip, 4)
+    # buy + cover = pay the ask (price rises); sell + short = receive the bid (price falls)
+    return round(price + total_slip, 4) if side in ('buy', 'cover') else round(price - total_slip, 4)
 
 def _sim_buy(symbol: str, qty: float, price: float, portfolio_id: int = 1, record: bool = True):
     cost = qty * price
@@ -1744,7 +1745,7 @@ def place_order():
             _vr  = _ind.get('volume_ratio', 1.0) if _ind else 1.0
         except Exception:
             _atr = fill_price * 0.01; _vr = 1.0
-        slip_fill = _apply_slippage(fill_price, side, _atr, _vr)
+        slip_fill = _apply_slippage(fill_price, side, _atr, _vr, qty)
         # Clamp limit orders: never fill a buy above its limit or a sell below its limit
         if otype == 'limit' and limit_price:
             lp = float(limit_price)
@@ -4752,7 +4753,7 @@ def _check_single_position_exit(pid: int, symbol: str, data: dict) -> None:
             tgt   = entry - tgt_m * atr
             if score >= COVER_THRESH or price >= trail or price <= tgt:
                 reason = ('cover_signal' if score >= COVER_THRESH else 'stop_loss' if price >= trail else 'take_profit')
-                fill = _apply_slippage(price, 'buy', atr, data.get('volume_ratio', 1.0))
+                fill = _apply_slippage(price, 'buy', atr, data.get('volume_ratio', 1.0), abs(row['shares']))
                 _sim_cover(symbol, abs(row['shares']), fill, pid)
                 _ai_log_entry(pid, symbol, 'COVER', score, fill, abs(row['shares']), f'{reason} (event) | {detail["summary"][:60]}',
                              market_state=detail.get('market_state', ''))
@@ -4769,7 +4770,7 @@ def _check_single_position_exit(pid: int, symbol: str, data: dict) -> None:
             hit_floor = profit_pct >= PROFIT_FLOOR
             if score <= SELL_THRESH or price <= trail or price >= tgt or hit_floor:
                 reason = ('sell_signal' if score <= SELL_THRESH else 'stop_loss' if price <= trail else 'profit_floor' if hit_floor else 'take_profit')
-                fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0))
+                fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0), row['shares'])
                 _sim_sell(symbol, row['shares'], fill, pid)
                 _ai_log_entry(pid, symbol, 'SELL', score, fill, row['shares'], f'{reason} (event) | {detail["summary"][:60]}',
                              market_state=detail.get('market_state', ''))
@@ -4849,7 +4850,7 @@ def _ai_run_portfolio(pid: int) -> dict:
                         reason = ('cover_signal' if score >= COVER_THRESH
                                   else 'stop_loss'    if price >= trailing_stop
                                   else 'take_profit')
-                        fill = _apply_slippage(price, 'buy', atr, data.get('volume_ratio', 1.0))
+                        fill = _apply_slippage(price, 'buy', atr, data.get('volume_ratio', 1.0), short_qty)
                         _sim_cover(sym, short_qty, fill, pid)
                         try:
                             import circuit_breakers as _cb_mod
@@ -4893,7 +4894,7 @@ def _ai_run_portfolio(pid: int) -> dict:
                                   else 'stop_loss'    if price <= trailing
                                   else 'profit_floor' if hit_profit_floor
                                   else 'take_profit')
-                        fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0))
+                        fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0), row['shares'])
                         _sim_sell(sym, row['shares'], fill, pid)
                         try:
                             import circuit_breakers as _cb_mod
@@ -4940,7 +4941,7 @@ def _ai_run_portfolio(pid: int) -> dict:
                                 if remaining_shares * price < 10.0:
                                     trim_shares = row['shares']
                                 if trim_shares >= 0.001:
-                                    fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0))
+                                    fill = _apply_slippage(price, 'sell', atr, data.get('volume_ratio', 1.0), trim_shares)
                                     _sim_sell(sym, trim_shares, fill, pid)
                                     summary['sold'].append({
                                         'symbol': sym, 'price': round(fill, 2),
@@ -5376,7 +5377,7 @@ def _ai_run_portfolio(pid: int) -> dict:
                 side = c.get('side', 'long')
                 atr_val = c.get('atr') or c['price'] * 0.02
                 if side == 'long':
-                    fill = _apply_slippage(c['price'], 'buy', atr_val, c.get('volume_ratio', 1.0))
+                    fill = _apply_slippage(c['price'], 'buy', atr_val, c.get('volume_ratio', 1.0), shares)
                     _sim_buy(c['symbol'], shares, fill, pid)
                     init_stop = fill - stop_m * atr_val   # for longs
                     with _get_db() as conn:
@@ -5406,7 +5407,7 @@ def _ai_run_portfolio(pid: int) -> dict:
                                       'atr_pct': c.get('atr_pct', 0),
                                   }))
                 else:  # short
-                    fill = _apply_slippage(c['price'], 'sell', atr_val, c.get('volume_ratio', 1.0))
+                    fill = _apply_slippage(c['price'], 'sell', atr_val, c.get('volume_ratio', 1.0), shares)
                     _sim_short(c['symbol'], shares, fill, pid)
                     summary['shorted'].append({
                         'symbol': c['symbol'], 'price': round(fill, 2),
