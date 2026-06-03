@@ -19,6 +19,7 @@ import AnalysisPanel from './components/AnalysisPanel.jsx'
 import RiskPanel from './components/RiskPanel'
 import OptionsPanel from './components/OptionsPanel'
 import AILogPanel from './components/AILogPanel'
+import ArbitragePanel from './components/ArbitragePanel.jsx'
 import TradeBrief from './components/TradeBrief.jsx'
 import RankingsPanel from './components/RankingsPanel.jsx'
 import Settings from './pages/Settings.jsx'
@@ -161,6 +162,7 @@ export default function App() {
             { key: 'options',  label: 'Options'  },
             { key: 'rankings', label: 'Rank'     },
             { key: 'aiscan',   label: 'AI Scan'  },
+            { key: 'arb',      label: 'Arb'      },
           ].map(t => (
             <button
               key={t.key}
@@ -220,6 +222,9 @@ export default function App() {
           )}
           {leftTab === 'aiscan' && (
             <AILogPanel portfolioId={portfolioId} isAiControlled={true} user={user} />
+          )}
+          {leftTab === 'arb' && (
+            <ArbitragePanel portfolioId={portfolioId} />
           )}
         </div>
 

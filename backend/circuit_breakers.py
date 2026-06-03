@@ -26,8 +26,9 @@ BREAK_DISABLED = 'disabled'   # specific strategy disabled
 
 
 class CircuitBreakers:
-    CONSEC_LOSS_LIMIT  = 3      # consecutive losses before pause
-    CONSEC_PAUSE_HOURS = 24     # hours to pause after consecutive losses
+    CONSEC_LOSS_LIMIT    = 5    # consecutive losses before pause
+    CONSEC_PAUSE_MINUTES = 30   # minutes to pause after consecutive losses
+                                # (fast paper sandbox — was 24h, far too long)
     DD_REDUCED_PCT     = 0.08   # 8% drawdown → reduced mode
     DD_HALT_PCT        = 0.15   # 15% drawdown → full halt
     MIN_WIN_RATE       = 0.40   # below this → disable strategy+regime combo
@@ -133,12 +134,12 @@ class CircuitBreakers:
                     self._consec_losses[pid] = count
                     if count >= self.CONSEC_LOSS_LIMIT:
                         self._pause_until[pid] = (
-                            time.time() + self.CONSEC_PAUSE_HOURS * 3600
+                            time.time() + self.CONSEC_PAUSE_MINUTES * 60
                         )
                         self._consec_losses[pid] = 0
                         log.warning(
-                            '[CIRCUIT] pid=%d: %d consecutive losses — pausing %dh',
-                            pid, count, self.CONSEC_PAUSE_HOURS,
+                            '[CIRCUIT] pid=%d: %d consecutive losses — pausing %dm',
+                            pid, count, self.CONSEC_PAUSE_MINUTES,
                         )
         except Exception as e:
             log.exception('[CIRCUIT] record_trade_result error pid=%s: %s', pid, e)

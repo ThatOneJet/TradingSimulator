@@ -322,6 +322,34 @@ def _init_db():
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS ix_aid_pid ON ai_decisions(portfolio_id, created_at)')
 
+        # Arbitrage trade log — full leg-by-leg path stored as JSON
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS arb_trades (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id INTEGER NOT NULL,
+                arb_type     TEXT NOT NULL,
+                start_asset  TEXT NOT NULL,
+                end_asset    TEXT NOT NULL,
+                asset        TEXT,
+                start_value  REAL NOT NULL,
+                end_value    REAL NOT NULL,
+                profit       REAL NOT NULL,
+                profit_pct   REAL,
+                num_legs     INTEGER,
+                exchanges_json TEXT,
+                path_json    TEXT,
+                notes        TEXT,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS ix_arb_pid ON arb_trades(portfolio_id, created_at)')
+
+        # Per-portfolio toggle: does the arbitrage worker auto-execute for this portfolio?
+        try:
+            conn.execute('ALTER TABLE portfolios ADD COLUMN arb_enabled INTEGER DEFAULT 0')
+        except Exception:
+            pass
+
 _init_db()
 
 # in-memory watchlist
@@ -1478,6 +1506,133 @@ def portfolio_history_clear(pid):
         except Exception:
             pass
     return jsonify({'status': 'cleared', 'portfolio_id': pid})
+
+
+# ── Arbitrage (paper sandbox) ─────────────────────────────────────────────────
+
+def _execute_arb(pid: int, opp: dict) -> int:
+    """Record a (paper) arbitrage execution: credit profit to cash, log to P&L and
+    the arb path table. Returns the new arb_trades row id. Pure sandbox — no real
+    funds move; the opportunity was detected from real feeds."""
+    import json as _json
+    profit = float(opp.get('profit', 0) or 0)
+    label  = f"{opp.get('asset','')} {opp.get('type','')}"
+    with _get_db() as conn:
+        # Credit net profit to cash so it flows into equity / P&L like any trade
+        conn.execute('UPDATE sim_state SET cash = cash + ? WHERE portfolio_id = ?', (profit, pid))
+        cur = conn.execute(
+            '''INSERT INTO arb_trades
+               (portfolio_id, arb_type, start_asset, end_asset, asset, start_value,
+                end_value, profit, profit_pct, num_legs, exchanges_json, path_json, notes)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (pid, opp['type'], opp['start_asset'], opp['end_asset'], opp.get('asset',''),
+             opp['start_value'], opp['end_value'], profit, opp.get('profit_pct', 0),
+             opp.get('num_legs', 0), _json.dumps(opp.get('exchanges', [])),
+             _json.dumps(opp.get('path', [])), opp.get('notes', ''))
+        )
+        arb_id = cur.lastrowid
+        # Mirror into sim_trades so it appears in the standard Trade P&L view
+        conn.execute(
+            '''INSERT INTO sim_trades
+               (symbol, side, qty, price, filled_qty, status, order_type, realized_pl,
+                portfolio_id, fill_price, slippage_cost)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+            (label.strip(), 'arb', 1, opp['start_value'], 1, 'filled', 'arbitrage',
+             profit, pid, opp['end_value'], 0)
+        )
+    return arb_id
+
+
+@app.route('/api/arbitrage/opportunities')
+def arbitrage_opportunities():
+    """Live arbitrage opportunities detected from real exchange feeds (Coinbase, Kraken)."""
+    try:
+        import arbitrage_engine as _arb
+        eng = _arb.get_engine()
+        if eng is None:
+            eng = _arb.init_engine()
+        notional = request.args.get('notional', type=float)
+        opps = eng.scan(notional)
+        return jsonify({
+            'opportunities': opps,
+            'scanned_at': time.time(),
+            'sources': ['coinbase', 'kraken'],
+            'count': len(opps),
+            'executable': sum(1 for o in opps if o.get('executable')),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e), 'opportunities': []}), 500
+
+
+@app.route('/api/portfolios/<int:pid>/arbitrage/trades')
+def arbitrage_trades(pid):
+    """Executed arbitrage trades for a portfolio — summary only (start, dest, P&L)."""
+    try:
+        limit = int(request.args.get('limit', 50))
+        with _get_db() as conn:
+            rows = conn.execute(
+                '''SELECT id, arb_type, start_asset, end_asset, asset, start_value,
+                          end_value, profit, profit_pct, num_legs, exchanges_json, created_at
+                   FROM arb_trades WHERE portfolio_id=? ORDER BY id DESC LIMIT ?''',
+                (pid, limit)
+            ).fetchall()
+        import json as _json
+        out = [{
+            'id': r['id'], 'type': r['arb_type'],
+            'start_asset': r['start_asset'], 'end_asset': r['end_asset'],
+            'asset': r['asset'], 'start_value': r['start_value'], 'end_value': r['end_value'],
+            'profit': r['profit'], 'profit_pct': r['profit_pct'], 'num_legs': r['num_legs'],
+            'exchanges': _json.loads(r['exchanges_json'] or '[]'),
+            'created_at': r['created_at'],
+        } for r in rows]
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/arbitrage/trades/<int:trade_id>')
+def arbitrage_trade_detail(trade_id):
+    """Full leg-by-leg path for one executed arbitrage trade (modal view)."""
+    try:
+        with _get_db() as conn:
+            r = conn.execute('SELECT * FROM arb_trades WHERE id=?', (trade_id,)).fetchone()
+        if not r:
+            return jsonify({'error': 'not found'}), 404
+        import json as _json
+        return jsonify({
+            'id': r['id'], 'type': r['arb_type'],
+            'start_asset': r['start_asset'], 'end_asset': r['end_asset'], 'asset': r['asset'],
+            'start_value': r['start_value'], 'end_value': r['end_value'],
+            'profit': r['profit'], 'profit_pct': r['profit_pct'], 'num_legs': r['num_legs'],
+            'exchanges': _json.loads(r['exchanges_json'] or '[]'),
+            'path': _json.loads(r['path_json'] or '[]'),
+            'notes': r['notes'], 'created_at': r['created_at'],
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/portfolios/<int:pid>/arbitrage/toggle', methods=['POST'])
+def arbitrage_toggle(pid):
+    """Enable/disable auto-execution of arbitrage for a portfolio."""
+    try:
+        enabled = bool((request.json or {}).get('enabled', False))
+        with _get_db() as conn:
+            conn.execute('UPDATE portfolios SET arb_enabled=? WHERE id=?', (1 if enabled else 0, pid))
+        return jsonify({'status': 'updated', 'arb_enabled': enabled})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/portfolios/<int:pid>/arbitrage/status')
+def arbitrage_status(pid):
+    """Whether arbitrage auto-execution is enabled for a portfolio."""
+    try:
+        with _get_db() as conn:
+            r = conn.execute('SELECT arb_enabled FROM portfolios WHERE id=?', (pid,)).fetchone()
+        return jsonify({'arb_enabled': bool(r['arb_enabled']) if r else False})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/portfolios/<int:pid>/ev')
@@ -5520,6 +5675,54 @@ def _ai_worker():
         _time.sleep(_AI_INTERVAL)
 
 threading.Thread(target=_ai_worker, daemon=True, name='ai-trader').start()
+
+
+# ── Arbitrage worker ──────────────────────────────────────────────────────────
+
+_ARB_INTERVAL = 20   # seconds between arbitrage scans
+
+def _arb_worker():
+    """Daemon thread: scan real exchange feeds and auto-execute profitable arbitrage
+    for portfolios that have it enabled. Pure paper sandbox — profit credited to cash."""
+    _time.sleep(12)   # let startup + feeds settle
+    try:
+        import arbitrage_engine as _arb
+        if _arb.get_engine() is None:
+            _arb.init_engine()
+        print('[TradeSimulator] ArbitrageEngine initialized (Coinbase + Kraken feeds).')
+    except Exception as e:
+        print(f'[TradeSimulator] ArbitrageEngine init failed: {e}')
+        return
+    while True:
+        try:
+            with _get_db() as conn:
+                rows = conn.execute(
+                    'SELECT id FROM portfolios WHERE arb_enabled=1'
+                ).fetchall()
+            if rows:
+                eng = _arb.get_engine()
+                for row in rows:
+                    pid = row['id']
+                    try:
+                        # Size each opportunity to available cash (cap at engine default)
+                        state = _sim_state(pid)
+                        cash  = state.get('cash', 0) or 0
+                        notional = min(eng.default_notional, max(0, cash * 0.5))
+                        if notional < 100:
+                            continue
+                        opps = eng.scan(notional)
+                        executed = [o for o in opps if o.get('executable')]
+                        for opp in executed[:3]:   # cap executions per cycle
+                            arb_id = _execute_arb(pid, opp)
+                            print(f'[ARB] pid={pid} {opp["type"]} {opp.get("asset","")} '
+                                  f'profit=${opp["profit"]:.2f} ({opp["profit_pct"]:.3f}%) id={arb_id}')
+                    except Exception as e:
+                        print(f'[ARB] pid={pid} error: {e}')
+        except Exception as e:
+            print(f'[ARB] worker error: {e}')
+        _time.sleep(_ARB_INTERVAL)
+
+threading.Thread(target=_arb_worker, daemon=True, name='arb-trader').start()
 
 
 # ── Price projection ──────────────────────────────────────────────────────────
